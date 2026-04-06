@@ -359,6 +359,7 @@ type putItemRequest struct {
 	ConditionExpression       string            `json:"ConditionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -402,16 +403,19 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, err
 	}
 
+	resp := map[string]any{}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item)))
+
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
-		return map[string]any{}, nil
+		return resp, nil
 	}
 	if req.ReturnValues != "ALL_OLD" {
 		return nil, awserr.Validation("PutItem ReturnValues must be NONE or ALL_OLD")
 	}
 	if existed {
-		return map[string]any{"Attributes": current}, nil
+		resp["Attributes"] = current
 	}
-	return map[string]any{}, nil
+	return resp, nil
 }
 
 type getItemRequest struct {
@@ -419,6 +423,8 @@ type getItemRequest struct {
 	Key                      map[string]any    `json:"Key"`
 	ProjectionExpression     string            `json:"ProjectionExpression"`
 	ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
+	ConsistentRead           bool              `json:"ConsistentRead"`
+	ReturnConsumedCapacity   string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -448,7 +454,9 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	return map[string]any{"Item": projected}, nil
+	resp := map[string]any{"Item": projected}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead), 0)
+	return resp, nil
 }
 
 type deleteItemRequest struct {
@@ -458,6 +466,7 @@ type deleteItemRequest struct {
 	ConditionExpression       string            `json:"ConditionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -496,16 +505,19 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, err
 	}
 
+	resp := map[string]any{}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current)))
+
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
-		return map[string]any{}, nil
+		return resp, nil
 	}
 	if req.ReturnValues != "ALL_OLD" {
 		return nil, awserr.Validation("DeleteItem ReturnValues must be NONE or ALL_OLD")
 	}
 	if existed {
-		return map[string]any{"Attributes": current}, nil
+		resp["Attributes"] = current
 	}
-	return map[string]any{}, nil
+	return resp, nil
 }
 
 type updateItemRequest struct {
@@ -516,6 +528,7 @@ type updateItemRequest struct {
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
 	ConditionExpression       string            `json:"ConditionExpression"`
 	ReturnValues              string            `json:"ReturnValues"`
+	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -575,8 +588,11 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, err
 	}
 
+	resp := map[string]any{}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated)))
+
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
-		return map[string]any{}, nil
+		return resp, nil
 	}
 	attributes := map[string]any{}
 	switch req.ReturnValues {
@@ -603,9 +619,10 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	if len(attributes) == 0 {
-		return map[string]any{}, nil
+		return resp, nil
 	}
-	return map[string]any{"Attributes": attributes}, nil
+	resp["Attributes"] = attributes
+	return resp, nil
 }
 
 type queryRequest struct {
@@ -619,6 +636,8 @@ type queryRequest struct {
 	ScanIndexForward          *bool             `json:"ScanIndexForward"`
 	Limit                     int               `json:"Limit"`
 	ExclusiveStartKey         map[string]any    `json:"ExclusiveStartKey"`
+	ConsistentRead            bool              `json:"ConsistentRead"`
+	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
@@ -758,6 +777,11 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
+	var totalRead float64
+	for _, item := range filtered {
+		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
+	}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
 	}
@@ -772,6 +796,8 @@ type scanRequest struct {
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
 	Limit                     int               `json:"Limit"`
 	ExclusiveStartKey         map[string]any    `json:"ExclusiveStartKey"`
+	ConsistentRead            bool              `json:"ConsistentRead"`
+	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
@@ -827,6 +853,11 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
+	var totalRead float64
+	for _, item := range filtered {
+		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
+	}
+	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
 	}
@@ -835,7 +866,9 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 
 type batchGetItemRequest struct {
 	RequestItems map[string]struct {
-		Keys []map[string]any `json:"Keys"`
+		Keys                   []map[string]any `json:"Keys"`
+		ConsistentRead         bool             `json:"ConsistentRead"`
+		ReturnConsumedCapacity string           `json:"ReturnConsumedCapacity"`
 	} `json:"RequestItems"`
 }
 
@@ -878,7 +911,15 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		}
 		responses[tableName] = items
 	}
-	return map[string]any{"Responses": responses, "UnprocessedKeys": map[string]any{}}, nil
+	resp := map[string]any{"Responses": responses, "UnprocessedKeys": map[string]any{}}
+	for tableName, itemReq := range req.RequestItems {
+		if items, ok := responses[tableName]; ok {
+			for _, item := range items.([]map[string]any) {
+				addConsumedCapacity(resp, itemReq.ReturnConsumedCapacity, tableName, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead), 0)
+			}
+		}
+	}
+	return resp, nil
 }
 
 type batchWriteItemRequest struct {
@@ -890,6 +931,7 @@ type batchWriteItemRequest struct {
 			Key map[string]any `json:"Key"`
 		} `json:"DeleteRequest"`
 	} `json:"RequestItems"`
+	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -967,8 +1009,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 type transactGetRequest struct {
 	TransactItems []struct {
 		Get struct {
-			TableName string         `json:"TableName"`
-			Key       map[string]any `json:"Key"`
+			TableName              string         `json:"TableName"`
+			Key                    map[string]any `json:"Key"`
+			ReturnConsumedCapacity string         `json:"ReturnConsumedCapacity"`
 		} `json:"Get"`
 	} `json:"TransactItems"`
 }
@@ -1362,4 +1405,29 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 			"AttributeName":    t.TimeToLive.AttrName,
 		},
 	}, nil
+}
+
+func addConsumedCapacity(resp map[string]any, capacity string, tableName string, readUnits, writeUnits float64) {
+	if capacity == "" || capacity == "NONE" {
+		return
+	}
+	if resp["ConsumedCapacity"] == nil {
+		resp["ConsumedCapacity"] = []map[string]any{}
+	}
+	list := resp["ConsumedCapacity"].([]map[string]any)
+	entry := map[string]any{
+		"TableName": tableName,
+	}
+	if readUnits > 0 {
+		entry["ReadCapacityUnits"] = readUnits
+		entry["CapacityUnits"] = readUnits
+	}
+	if writeUnits > 0 {
+		entry["WriteCapacityUnits"] = writeUnits
+		entry["CapacityUnits"] = writeUnits
+	}
+	if readUnits > 0 && writeUnits > 0 {
+		entry["CapacityUnits"] = readUnits + writeUnits
+	}
+	resp["ConsumedCapacity"] = append(list, entry)
 }
