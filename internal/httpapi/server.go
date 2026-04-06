@@ -334,10 +334,12 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	if errors.Is(err, sql.ErrNoRows) {
+		existed = false
 		current = map[string]any{}
 	}
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
@@ -350,6 +352,16 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 
 	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, req.Item); err != nil {
 		return nil, err
+	}
+
+	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
+		return map[string]any{}, nil
+	}
+	if req.ReturnValues != "ALL_OLD" {
+		return nil, awserr.Validation("PutItem ReturnValues must be NONE or ALL_OLD")
+	}
+	if existed {
+		return map[string]any{"Attributes": current}, nil
 	}
 	return map[string]any{}, nil
 }
@@ -417,10 +429,12 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation(err.Error())
 	}
 	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	if errors.Is(err, sql.ErrNoRows) {
+		existed = false
 		current = map[string]any{}
 	}
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
@@ -432,6 +446,16 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	}
 	if err := s.store.DeleteItem(r.Context(), t.Name, pk, sk); err != nil {
 		return nil, err
+	}
+
+	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
+		return map[string]any{}, nil
+	}
+	if req.ReturnValues != "ALL_OLD" {
+		return nil, awserr.Validation("DeleteItem ReturnValues must be NONE or ALL_OLD")
+	}
+	if existed {
+		return map[string]any{"Attributes": current}, nil
 	}
 	return map[string]any{}, nil
 }
@@ -463,8 +487,11 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation(err.Error())
 	}
 	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	oldItem := map[string]any{}
+	itemExisted := true
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			itemExisted = false
 			current = map[string]any{t.HashKey: req.Key[t.HashKey]}
 			if t.RangeKey != "" {
 				current[t.RangeKey] = req.Key[t.RangeKey]
@@ -472,6 +499,9 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		} else {
 			return nil, err
 		}
+	}
+	if itemExisted {
+		oldItem = cloneItem(current)
 	}
 
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
@@ -494,10 +524,37 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, err
 	}
 
-	if req.ReturnValues == "ALL_NEW" {
-		return map[string]any{"Attributes": updated}, nil
+	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
+		return map[string]any{}, nil
 	}
-	return map[string]any{}, nil
+	attributes := map[string]any{}
+	switch req.ReturnValues {
+	case "ALL_OLD":
+		if itemExisted {
+			attributes = oldItem
+		}
+	case "UPDATED_OLD":
+		for attr := range plan.TouchedAttrs {
+			if v, ok := oldItem[attr]; ok {
+				attributes[attr] = v
+			}
+		}
+	case "ALL_NEW":
+		attributes = updated
+	case "UPDATED_NEW":
+		for attr := range plan.TouchedAttrs {
+			if v, ok := updated[attr]; ok {
+				attributes[attr] = v
+			}
+		}
+	default:
+		return nil, awserr.Validation("unsupported UpdateItem ReturnValues")
+	}
+
+	if len(attributes) == 0 {
+		return map[string]any{}, nil
+	}
+	return map[string]any{"Attributes": attributes}, nil
 }
 
 type queryRequest struct {
