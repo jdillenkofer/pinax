@@ -176,6 +176,10 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.batchGetItem(r, body)
 	case "BatchWriteItem":
 		return s.batchWriteItem(r, body)
+	case "TransactGetItems":
+		return s.transactGetItems(r, body)
+	case "TransactWriteItems":
+		return s.transactWriteItems(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -823,6 +827,14 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	totalKeys := 0
+	for _, itemReq := range req.RequestItems {
+		totalKeys += len(itemReq.Keys)
+	}
+	if totalKeys > 100 {
+		return nil, awserr.Validation("BatchGetItem supports at most 100 keys")
+	}
+
 	responses := map[string]any{}
 	for tableName, itemReq := range req.RequestItems {
 		t, err := s.store.GetTable(r.Context(), tableName)
@@ -869,6 +881,14 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, awserr.Validation(err.Error())
 	}
 
+	totalOps := 0
+	for _, ops := range req.RequestItems {
+		totalOps += len(ops)
+	}
+	if totalOps > 25 {
+		return nil, awserr.Validation("BatchWriteItem supports at most 25 operations")
+	}
+
 	tableNames := make([]string, 0, len(req.RequestItems))
 	for tableName := range req.RequestItems {
 		tableNames = append(tableNames, tableName)
@@ -908,6 +928,259 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	}
 
 	return map[string]any{"UnprocessedItems": map[string]any{}}, nil
+}
+
+type transactGetRequest struct {
+	TransactItems []struct {
+		Get struct {
+			TableName string         `json:"TableName"`
+			Key       map[string]any `json:"Key"`
+		} `json:"Get"`
+	} `json:"TransactItems"`
+}
+
+func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any, error) {
+	var req transactGetRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if len(req.TransactItems) == 0 {
+		return nil, awserr.Validation("TransactItems is required")
+	}
+	if len(req.TransactItems) > 25 {
+		return nil, awserr.Validation("TransactGetItems supports at most 25 items")
+	}
+
+	responses := make([]map[string]any, 0, len(req.TransactItems))
+	for _, txItem := range req.TransactItems {
+		g := txItem.Get
+		t, err := s.store.GetTable(r.Context(), g.TableName)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+			}
+			return nil, err
+		}
+		pk, sk, err := model.ExtractKey(t, g.Key)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		item, err := s.store.GetItem(r.Context(), g.TableName, pk, sk)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				responses = append(responses, map[string]any{})
+				continue
+			}
+			return nil, err
+		}
+		responses = append(responses, map[string]any{"Item": item})
+	}
+	return map[string]any{"Responses": responses}, nil
+}
+
+type transactWriteRequest struct {
+	TransactItems []struct {
+		Put struct {
+			TableName                 string            `json:"TableName"`
+			Item                      map[string]any    `json:"Item"`
+			ConditionExpression       string            `json:"ConditionExpression"`
+			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+		} `json:"Put"`
+		Delete struct {
+			TableName                 string            `json:"TableName"`
+			Key                       map[string]any    `json:"Key"`
+			ConditionExpression       string            `json:"ConditionExpression"`
+			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+		} `json:"Delete"`
+		Update struct {
+			TableName                 string            `json:"TableName"`
+			Key                       map[string]any    `json:"Key"`
+			UpdateExpression          string            `json:"UpdateExpression"`
+			ConditionExpression       string            `json:"ConditionExpression"`
+			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+		} `json:"Update"`
+		ConditionCheck struct {
+			TableName                 string            `json:"TableName"`
+			Key                       map[string]any    `json:"Key"`
+			ConditionExpression       string            `json:"ConditionExpression"`
+			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+		} `json:"ConditionCheck"`
+	} `json:"TransactItems"`
+}
+
+func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]any, error) {
+	var req transactWriteRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if len(req.TransactItems) == 0 {
+		return nil, awserr.Validation("TransactItems is required")
+	}
+	if len(req.TransactItems) > 25 {
+		return nil, awserr.Validation("TransactWriteItems supports at most 25 actions")
+	}
+
+	type stagedMutation struct {
+		table string
+		pk    string
+		sk    string
+		item  map[string]any
+		del   bool
+	}
+	staged := make([]stagedMutation, 0, len(req.TransactItems))
+
+	for _, txItem := range req.TransactItems {
+		if len(txItem.Put.Item) > 0 {
+			t, err := s.store.GetTable(r.Context(), txItem.Put.TableName)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+				}
+				return nil, err
+			}
+			pk, sk, err := model.ExtractItemKeys(t, txItem.Put.Item)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				current = map[string]any{}
+			}
+			ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if !ok {
+				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+			}
+			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: txItem.Put.Item})
+			continue
+		}
+
+		if len(txItem.Delete.Key) > 0 {
+			t, err := s.store.GetTable(r.Context(), txItem.Delete.TableName)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+				}
+				return nil, err
+			}
+			pk, sk, err := model.ExtractKey(t, txItem.Delete.Key)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				current = map[string]any{}
+			}
+			ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if !ok {
+				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+			}
+			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, del: true})
+			continue
+		}
+
+		if len(txItem.Update.Key) > 0 {
+			t, err := s.store.GetTable(r.Context(), txItem.Update.TableName)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+				}
+				return nil, err
+			}
+			pk, sk, err := model.ExtractKey(t, txItem.Update.Key)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					current = map[string]any{t.HashKey: txItem.Update.Key[t.HashKey]}
+					if t.RangeKey != "" {
+						current[t.RangeKey] = txItem.Update.Key[t.RangeKey]
+					}
+				} else {
+					return nil, err
+				}
+			}
+			ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if !ok {
+				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+			}
+			plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			updated, _, err := applyUpdatePlan(current, plan)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: updated})
+			continue
+		}
+
+		if len(txItem.ConditionCheck.Key) > 0 {
+			t, err := s.store.GetTable(r.Context(), txItem.ConditionCheck.TableName)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+				}
+				return nil, err
+			}
+			pk, sk, err := model.ExtractKey(t, txItem.ConditionCheck.Key)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				current = map[string]any{}
+			}
+			ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if !ok {
+				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+			}
+			continue
+		}
+
+		return nil, awserr.Validation("each transact item must contain one operation")
+	}
+
+	for _, m := range staged {
+		if m.del {
+			if err := s.store.DeleteItem(r.Context(), m.table, m.pk, m.sk); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := s.store.PutItem(r.Context(), m.table, m.pk, m.sk, m.item); err != nil {
+			return nil, err
+		}
+	}
+
+	return map[string]any{}, nil
 }
 
 func decode(body []byte, out any) error {
