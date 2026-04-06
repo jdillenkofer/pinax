@@ -310,6 +310,7 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 type putItemRequest struct {
 	TableName                 string            `json:"TableName"`
 	Item                      map[string]any    `json:"Item"`
+	ReturnValues              string            `json:"ReturnValues"`
 	ConditionExpression       string            `json:"ConditionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
@@ -354,8 +355,10 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 }
 
 type getItemRequest struct {
-	TableName string         `json:"TableName"`
-	Key       map[string]any `json:"Key"`
+	TableName                string            `json:"TableName"`
+	Key                      map[string]any    `json:"Key"`
+	ProjectionExpression     string            `json:"ProjectionExpression"`
+	ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
 }
 
 func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -381,12 +384,17 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 		}
 		return nil, err
 	}
-	return map[string]any{"Item": item}, nil
+	projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	return map[string]any{"Item": projected}, nil
 }
 
 type deleteItemRequest struct {
 	TableName                 string            `json:"TableName"`
 	Key                       map[string]any    `json:"Key"`
+	ReturnValues              string            `json:"ReturnValues"`
 	ConditionExpression       string            `json:"ConditionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
@@ -474,22 +482,20 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
 
-	sets, removes, err := parseUpdateExpression(req.UpdateExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+	plan, err := parseUpdateExpression(req.UpdateExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	for k, v := range sets {
-		current[k] = v
+	updated, _, err := applyUpdatePlan(current, plan)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
 	}
-	for _, k := range removes {
-		delete(current, k)
-	}
-	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, current); err != nil {
+	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, updated); err != nil {
 		return nil, err
 	}
 
 	if req.ReturnValues == "ALL_NEW" {
-		return map[string]any{"Attributes": current}, nil
+		return map[string]any{"Attributes": updated}, nil
 	}
 	return map[string]any{}, nil
 }
@@ -497,6 +503,8 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 type queryRequest struct {
 	TableName                 string            `json:"TableName"`
 	KeyConditionExpression    string            `json:"KeyConditionExpression"`
+	FilterExpression          string            `json:"FilterExpression"`
+	ProjectionExpression      string            `json:"ProjectionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
 	Limit                     int               `json:"Limit"`
@@ -565,7 +573,23 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, err
 	}
 
-	resp := map[string]any{"Items": items, "Count": len(items), "ScannedCount": len(items)}
+	filtered := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if !matches {
+			continue
+		}
+		projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		filtered = append(filtered, projected)
+	}
+
+	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": len(items)}
 	if t.RangeKey != "" && req.Limit > 0 && len(items) == req.Limit {
 		last := items[len(items)-1]
 		resp["LastEvaluatedKey"] = map[string]any{t.HashKey: last[t.HashKey], t.RangeKey: last[t.RangeKey]}
@@ -574,9 +598,13 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 }
 
 type scanRequest struct {
-	TableName         string         `json:"TableName"`
-	Limit             int            `json:"Limit"`
-	ExclusiveStartKey map[string]any `json:"ExclusiveStartKey"`
+	TableName                 string            `json:"TableName"`
+	FilterExpression          string            `json:"FilterExpression"`
+	ProjectionExpression      string            `json:"ProjectionExpression"`
+	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+	Limit                     int               `json:"Limit"`
+	ExclusiveStartKey         map[string]any    `json:"ExclusiveStartKey"`
 }
 
 func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
@@ -605,7 +633,23 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, err
 	}
 
-	resp := map[string]any{"Items": items, "Count": len(items), "ScannedCount": len(items)}
+	filtered := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if !matches {
+			continue
+		}
+		projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		filtered = append(filtered, projected)
+	}
+
+	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": len(items)}
 	if req.Limit > 0 && len(items) == req.Limit {
 		last := items[len(items)-1]
 		lek := map[string]any{t.HashKey: last[t.HashKey]}
@@ -764,56 +808,6 @@ func parseSingleEq(s string) (keyExprToken, error) {
 		return keyExprToken{}, fmt.Errorf("invalid key condition segment")
 	}
 	return keyExprToken{attr: a, value: v}, nil
-}
-
-func parseUpdateExpression(raw string, names map[string]string, values map[string]any) (map[string]any, []string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil, fmt.Errorf("UpdateExpression is required")
-	}
-
-	upper := strings.ToUpper(raw)
-	setIdx := strings.Index(upper, "SET ")
-	removeIdx := strings.Index(upper, "REMOVE ")
-
-	sets := map[string]any{}
-	removes := []string{}
-
-	if setIdx >= 0 {
-		setStart := setIdx + len("SET ")
-		setEnd := len(raw)
-		if removeIdx > setIdx {
-			setEnd = removeIdx
-		}
-		for _, assign := range strings.Split(raw[setStart:setEnd], ",") {
-			parts := strings.Split(assign, "=")
-			if len(parts) != 2 {
-				return nil, nil, fmt.Errorf("invalid SET clause")
-			}
-			left := resolveName(strings.TrimSpace(parts[0]), names)
-			right := strings.TrimSpace(parts[1])
-			v, ok := values[right]
-			if !ok {
-				return nil, nil, fmt.Errorf("missing expression attribute value %q", right)
-			}
-			sets[left] = v
-		}
-	}
-
-	if removeIdx >= 0 {
-		removeStart := removeIdx + len("REMOVE ")
-		for _, attr := range strings.Split(raw[removeStart:], ",") {
-			resolved := resolveName(strings.TrimSpace(attr), names)
-			if resolved != "" {
-				removes = append(removes, resolved)
-			}
-		}
-	}
-
-	if len(sets) == 0 && len(removes) == 0 {
-		return nil, nil, fmt.Errorf("only SET/REMOVE update expressions are supported")
-	}
-	return sets, removes, nil
 }
 
 func resolveName(v string, names map[string]string) string {
