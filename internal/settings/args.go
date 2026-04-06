@@ -67,6 +67,8 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 	trustForwardedHeadersAccessor := registerBoolFlag(serveCommand, "trustForwardedHeaders", defaultTrustForwardedHeaders, "trust client forwarding headers")
 	trustedProxyCIDRsAccessor := registerStringFlag(serveCommand, "trustedProxyCIDRs", "", "comma-separated trusted proxy CIDR ranges")
 	logLevelAccessor := registerStringFlag(serveCommand, "logLevel", "info", "the log level for the application")
+	ttlSweeperEnabledAccessor := registerBoolFlag(serveCommand, "ttlSweeperEnabled", false, "enable TTL sweeper background task")
+	ttlSweeperIntervalAccessor := registerIntFlag(serveCommand, "ttlSweeperInterval", defaultTTLSweeperInterval, "TTL sweeper interval in nanoseconds")
 
 	if err := serveCommand.Parse(cmdArgs); err != nil {
 		return nil, err
@@ -96,5 +98,7 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 		trustForwardedHeaders: trustForwardedHeadersAccessor(),
 		trustedProxyCIDRs:     trustedProxyCIDRs,
 		logLevel:              logLevelAccessor(),
+		ttlSweeperEnabled:     ttlSweeperEnabledAccessor(),
+		ttlSweeperInterval:    ttlSweeperIntervalAccessor(),
 	}, nil
 }

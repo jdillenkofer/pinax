@@ -110,10 +110,14 @@ func (s *Store) CreateTable(ctx context.Context, t model.Table) error {
 	if err != nil {
 		return err
 	}
+	ttlEnabled := 0
+	if t.TimeToLive.Enabled {
+		ttlEnabled = 1
+	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), t.CreatedAt)
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
 	if err != nil {
 		return err
 	}
@@ -125,11 +129,13 @@ func (s *Store) GetTable(ctx context.Context, name string) (model.Table, error) 
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
 	var gsiJSON string
+	var ttlEnabled int
+	var ttlAttr sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, created_at
+		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &t.CreatedAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
 	if err != nil {
 		return model.Table{}, err
 	}
@@ -140,6 +146,8 @@ func (s *Store) GetTable(ctx context.Context, name string) (model.Table, error) 
 			return model.Table{}, err
 		}
 	}
+	t.TimeToLive.Enabled = ttlEnabled == 1
+	t.TimeToLive.AttrName = ttlAttr.String
 	return t, nil
 }
 
@@ -317,4 +325,78 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+func (s *Store) UpdateTimeToLive(ctx context.Context, tableName string, ttl model.TimeToLive) error {
+	ttlEnabled := 0
+	if ttl.Enabled {
+		ttlEnabled = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ? WHERE name = ?
+	`, ttlEnabled, nullIfEmpty(ttl.AttrName), tableName)
+	return err
+}
+
+func (s *Store) GetExpiredItems(ctx context.Context, tableName string, ttlAttr string, before int64, limit int) ([]struct {
+	PK string
+	SK string
+}, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT pk, sk, item_json FROM items
+		WHERE table_name = ?
+		LIMIT ?
+	`, tableName, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var expired []struct {
+		PK string
+		SK string
+	}
+	for rows.Next() {
+		var pk, sk string
+		var raw []byte
+		if err := rows.Scan(&pk, &sk, &raw); err != nil {
+			return nil, err
+		}
+		item, err := decodeItem(raw)
+		if err != nil {
+			return nil, err
+		}
+		ttlVal, ok := item[ttlAttr]
+		if !ok {
+			continue
+		}
+		var ttlNum int64
+		switch v := ttlVal.(type) {
+		case float64:
+			ttlNum = int64(v)
+		case int64:
+			ttlNum = v
+		case int:
+			ttlNum = int64(v)
+		default:
+			continue
+		}
+		if ttlNum > 0 && ttlNum < before {
+			expired = append(expired, struct {
+				PK string
+				SK string
+			}{PK: pk, SK: sk})
+		}
+	}
+	return expired, rows.Err()
+}
+
+func (s *Store) DeleteExpiredItem(ctx context.Context, tableName, pk, sk string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
+	`, tableName, pk, sk)
+	return err
 }

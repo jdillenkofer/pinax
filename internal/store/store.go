@@ -18,4 +18,10 @@ type Store interface {
 	QueryByPK(ctx context.Context, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
 	QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]map[string]any, error)
 	Scan(ctx context.Context, tableName, startPK, startSK string, limit int) ([]map[string]any, error)
+	UpdateTimeToLive(ctx context.Context, tableName string, ttl model.TimeToLive) error
+	GetExpiredItems(ctx context.Context, tableName string, ttlAttr string, before int64, limit int) ([]struct {
+		PK string
+		SK string
+	}, error)
+	DeleteExpiredItem(ctx context.Context, tableName, pk, sk string) error
 }

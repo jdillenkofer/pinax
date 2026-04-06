@@ -17,6 +17,8 @@ const authorizerPathEnvKey = envKeyPrefix + "_AUTHORIZER_PATH"
 const trustForwardedHeadersEnvKey = envKeyPrefix + "_TRUST_FORWARDED_HEADERS"
 const trustedProxyCIDRsEnvKey = envKeyPrefix + "_TRUSTED_PROXY_CIDRS"
 const logLevelEnvKey = envKeyPrefix + "_LOG_LEVEL"
+const ttlSweeperEnabledEnvKey = envKeyPrefix + "_TTL_SWEEPER_ENABLED"
+const ttlSweeperIntervalEnvKey = envKeyPrefix + "_TTL_SWEEPER_INTERVAL"
 
 func getCredentialsFromEnv() []Credentials {
 	var credentials []Credentials
@@ -94,5 +96,7 @@ func loadSettingsFromEnv() (*Settings, error) {
 		trustForwardedHeaders: getBoolFromEnv(trustForwardedHeadersEnvKey),
 		trustedProxyCIDRs:     getStringSliceFromEnv(trustedProxyCIDRsEnvKey),
 		logLevel:              getStringFromEnv(logLevelEnvKey),
+		ttlSweeperEnabled:     getBoolFromEnv(ttlSweeperEnabledEnvKey),
+		ttlSweeperInterval:    getIntFromEnv(ttlSweeperIntervalEnvKey),
 	}, nil
 }

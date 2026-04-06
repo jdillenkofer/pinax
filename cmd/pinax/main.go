@@ -18,6 +18,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/settings"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/ttl"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -86,6 +87,13 @@ func main() {
 		slog.Warn("authentication disabled")
 	}
 	rootHandler = middleware.MakeRequestContextMiddleware(rootHandler)
+
+	var sweeper *ttl.Sweeper
+	if s.TTLSweeperEnabled() {
+		sweeper = ttl.NewSweeper(store, s.TTLSweeperInterval())
+		go sweeper.Start(context.Background())
+		slog.Info("TTL sweeper started", "interval", s.TTLSweeperInterval())
+	}
 
 	httpServer := &http.Server{
 		BaseContext:       func(net.Listener) context.Context { return context.Background() },

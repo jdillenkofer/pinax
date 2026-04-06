@@ -7,6 +7,11 @@ import (
 
 const NoSortKey = "__PINAX_NO_SORT_KEY__"
 
+type TimeToLive struct {
+	Enabled  bool
+	AttrName string
+}
+
 type Table struct {
 	Name      string
 	HashKey   string
@@ -15,6 +20,8 @@ type Table struct {
 	RangeType string
 	GSIs      []GlobalSecondaryIndex
 	CreatedAt int64
+
+	TimeToLive TimeToLive
 }
 
 type GlobalSecondaryIndex struct {
@@ -57,7 +64,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 		})
 	}
 
-	return map[string]any{
+	desc := map[string]any{
 		"AttributeDefinitions": t.AttributeDefinitions(),
 		"TableName":            t.Name,
 		"KeySchema":            t.KeySchema(),
@@ -73,6 +80,15 @@ func (t Table) Description(itemCount int64) map[string]any {
 		"BillingModeSummary":     map[string]any{"BillingMode": "PAY_PER_REQUEST"},
 		"GlobalSecondaryIndexes": gsis,
 	}
+
+	if t.TimeToLive.Enabled {
+		desc["TimeToLive"] = map[string]any{
+			"TimeToLiveStatus": "ENABLED",
+			"AttributeName":    t.TimeToLive.AttrName,
+		}
+	}
+
+	return desc
 }
 
 func (t Table) GetGSI(indexName string) (GlobalSecondaryIndex, bool) {

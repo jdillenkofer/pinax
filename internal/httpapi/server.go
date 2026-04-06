@@ -180,6 +180,10 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.transactGetItems(r, body)
 	case "TransactWriteItems":
 		return s.transactWriteItems(r, body)
+	case "UpdateTimeToLive":
+		return s.updateTimeToLive(r, body)
+	case "DescribeTimeToLive":
+		return s.describeTimeToLive(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -1261,4 +1265,86 @@ func firstNonEmpty(v string, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+type updateTimeToLiveRequest struct {
+	TableName               string `json:"TableName"`
+	TimeToLiveSpecification struct {
+		Enabled       bool   `json:"Enabled"`
+		AttributeName string `json:"AttributeName"`
+	} `json:"TimeToLiveSpecification"`
+}
+
+func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any, error) {
+	var req updateTimeToLiveRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if req.TableName == "" {
+		return nil, awserr.Validation("TableName is required")
+	}
+	if req.TimeToLiveSpecification.AttributeName == "" {
+		return nil, awserr.Validation("AttributeName is required")
+	}
+
+	t, err := s.store.GetTable(r.Context(), req.TableName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return nil, err
+	}
+
+	ttl := model.TimeToLive{
+		Enabled:  req.TimeToLiveSpecification.Enabled,
+		AttrName: req.TimeToLiveSpecification.AttributeName,
+	}
+	if err := s.store.UpdateTimeToLive(r.Context(), req.TableName, ttl); err != nil {
+		return nil, err
+	}
+
+	t.TimeToLive = ttl
+	status := "DISABLED"
+	if ttl.Enabled {
+		status = "ENABLED"
+	}
+	return map[string]any{
+		"TimeToLiveDescription": map[string]any{
+			"TimeToLiveStatus": status,
+			"AttributeName":    ttl.AttrName,
+		},
+	}, nil
+}
+
+type describeTimeToLiveRequest struct {
+	TableName string `json:"TableName"`
+}
+
+func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]any, error) {
+	var req describeTimeToLiveRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if req.TableName == "" {
+		return nil, awserr.Validation("TableName is required")
+	}
+
+	t, err := s.store.GetTable(r.Context(), req.TableName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return nil, err
+	}
+
+	status := "DISABLED"
+	if t.TimeToLive.Enabled {
+		status = "ENABLED"
+	}
+	return map[string]any{
+		"TimeToLiveDescription": map[string]any{
+			"TimeToLiveStatus": status,
+			"AttributeName":    t.TimeToLive.AttrName,
+		},
+	}, nil
 }

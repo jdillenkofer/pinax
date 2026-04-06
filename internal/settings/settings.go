@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -14,6 +15,7 @@ const defaultPort = 8000
 const defaultDBPath = "./pinax.db"
 const defaultAuthorizerPath = "./authorizer.lua"
 const defaultTrustForwardedHeaders = false
+const defaultTTLSweeperInterval = 5 * 60 * 1000000000 // 5 minutes in nanoseconds
 
 const mergableTagKey = "mergable"
 
@@ -33,6 +35,8 @@ type Settings struct {
 	trustForwardedHeaders *bool         `mergable:""`
 	trustedProxyCIDRs     []string      `mergable:""`
 	logLevel              *string       `mergable:""`
+	ttlSweeperEnabled     *bool         `mergable:""`
+	ttlSweeperInterval    *int          `mergable:""`
 }
 
 func valueOrDefault[V any](v *V, defaultValue V) V {
@@ -93,6 +97,14 @@ func (s *Settings) LogLevel() slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+func (s *Settings) TTLSweeperEnabled() bool {
+	return valueOrDefault(s.ttlSweeperEnabled, false)
+}
+
+func (s *Settings) TTLSweeperInterval() time.Duration {
+	return time.Duration(valueOrDefault(s.ttlSweeperInterval, defaultTTLSweeperInterval)) * time.Nanosecond
 }
 
 func getUnexportedField(field reflect.Value) interface{} {
