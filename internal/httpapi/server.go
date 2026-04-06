@@ -366,6 +366,9 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	if model.ItemTooLarge(req.Item) {
+		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+	}
 	t, err := s.store.GetTable(r.Context(), req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -564,6 +567,9 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	updated, _, err := applyUpdatePlan(current, plan)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if model.ItemTooLarge(updated) {
+		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
 	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, updated); err != nil {
 		return nil, err
@@ -922,6 +928,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				return nil, awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
 			}
 			if len(op.PutRequest.Item) > 0 {
+				if model.ItemTooLarge(op.PutRequest.Item) {
+					return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+				}
 				pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
 				if err != nil {
 					return nil, awserr.Validation(err.Error())
@@ -1086,6 +1095,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if !ok {
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
+			if model.ItemTooLarge(txItem.Put.Item) {
+				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+			}
 			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: txItem.Put.Item})
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
@@ -1167,6 +1179,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			updated, _, err := applyUpdatePlan(current, plan)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
+			}
+			if model.ItemTooLarge(updated) {
+				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 			}
 			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: updated})
 			target := t.Name + "|" + pk + "|" + sk
