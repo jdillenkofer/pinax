@@ -212,22 +212,30 @@ func (s *Store) DeleteItem(ctx context.Context, tableName, pk, sk string) error 
 	return err
 }
 
-func (s *Store) QueryByPK(ctx context.Context, tableName, pk, startSK string, limit int) ([]map[string]any, error) {
-	if limit <= 0 {
-		limit = 100
+func (s *Store) QueryByPK(ctx context.Context, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+	order := "ASC"
+	comp := ">"
+	if !scanForward {
+		order = "DESC"
+		comp = "<"
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	q := fmt.Sprintf(`
 		SELECT item_json FROM items
-		WHERE table_name = ? AND pk = ? AND sk > ?
-		ORDER BY sk ASC
-		LIMIT ?
-	`, tableName, pk, startSK, limit)
+		WHERE table_name = ? AND pk = ? AND sk %s ?
+		ORDER BY sk %s
+	`, comp, order)
+	args := []any{tableName, pk, startSK}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	items := make([]map[string]any, 0, limit)
+	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var raw []byte
 		if err := rows.Scan(&raw); err != nil {
@@ -254,21 +262,23 @@ func (s *Store) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]ma
 }
 
 func (s *Store) Scan(ctx context.Context, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := s.db.QueryContext(ctx, `
+	q := `
 		SELECT item_json FROM items
 		WHERE table_name = ? AND (pk > ? OR (pk = ? AND sk > ?))
 		ORDER BY pk ASC, sk ASC
-		LIMIT ?
-	`, tableName, startPK, startPK, startSK, limit)
+	`
+	args := []any{tableName, startPK, startPK, startSK}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	items := make([]map[string]any, 0, limit)
+	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var raw []byte
 		if err := rows.Scan(&raw); err != nil {

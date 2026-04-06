@@ -507,6 +507,7 @@ type queryRequest struct {
 	ProjectionExpression      string            `json:"ProjectionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+	ScanIndexForward          *bool             `json:"ScanIndexForward"`
 	Limit                     int               `json:"Limit"`
 	ExclusiveStartKey         map[string]any    `json:"ExclusiveStartKey"`
 }
@@ -540,12 +541,19 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 
+	scanForward := true
+	if req.ScanIndexForward != nil {
+		scanForward = *req.ScanIndexForward
+	}
+
 	startSK := ""
 	if len(req.ExclusiveStartKey) > 0 {
 		_, startSK, err = model.ExtractKey(t, req.ExclusiveStartKey)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
+	} else if !scanForward {
+		startSK = "~"
 	}
 
 	var items []map[string]any
@@ -553,46 +561,59 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		if t.RangeKey == "" {
 			items, err = s.store.QueryByPKSK(r.Context(), t.Name, pk, model.NoSortKey)
 		} else {
-			items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, req.Limit)
+			items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
 		}
 	} else {
 		if resolveName(skToken.attr, req.ExpressionAttributeNames) != t.RangeKey {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
-		sv, ok := req.ExpressionAttributeValues[skToken.value]
-		if !ok {
-			return nil, awserr.Validation("missing sort key expression value")
-		}
-		sk, err := model.SerializeKeyValue(sv)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		items, err = s.store.QueryByPKSK(r.Context(), t.Name, pk, sk)
+		items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	filtered := make([]map[string]any, 0, len(items))
+	limit := parseLimit(req.Limit)
+	count := 0
+	scanned := 0
+	filtered := make([]map[string]any, 0)
+	var lastScanned map[string]any
+
 	for _, item := range items {
+		if skToken != nil {
+			ok, err := sortConditionMatches(item, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if !ok {
+				continue
+			}
+		}
+
+		scanned++
+		lastScanned = keyFromItem(t, item)
+
 		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
-		if !matches {
-			continue
+		if matches {
+			projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			filtered = append(filtered, projected)
+			count++
 		}
-		projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
+
+		if limit > 0 && scanned >= limit {
+			break
 		}
-		filtered = append(filtered, projected)
 	}
 
-	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": len(items)}
-	if t.RangeKey != "" && req.Limit > 0 && len(items) == req.Limit {
-		last := items[len(items)-1]
-		resp["LastEvaluatedKey"] = map[string]any{t.HashKey: last[t.HashKey], t.RangeKey: last[t.RangeKey]}
+	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
+	if limit > 0 && scanned == limit && lastScanned != nil {
+		resp["LastEvaluatedKey"] = lastScanned
 	}
 	return resp, nil
 }
@@ -628,13 +649,19 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 			return nil, awserr.Validation(err.Error())
 		}
 	}
-	items, err := s.store.Scan(r.Context(), t.Name, startPK, startSK, req.Limit)
+	items, err := s.store.Scan(r.Context(), t.Name, startPK, startSK, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	filtered := make([]map[string]any, 0, len(items))
+	limit := parseLimit(req.Limit)
+	filtered := make([]map[string]any, 0)
+	scanned := 0
+	var lastScanned map[string]any
 	for _, item := range items {
+		scanned++
+		lastScanned = keyFromItem(t, item)
+
 		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
@@ -647,16 +674,15 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 			return nil, awserr.Validation(err.Error())
 		}
 		filtered = append(filtered, projected)
+
+		if limit > 0 && scanned >= limit {
+			break
+		}
 	}
 
-	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": len(items)}
-	if req.Limit > 0 && len(items) == req.Limit {
-		last := items[len(items)-1]
-		lek := map[string]any{t.HashKey: last[t.HashKey]}
-		if t.RangeKey != "" {
-			lek[t.RangeKey] = last[t.RangeKey]
-		}
-		resp["LastEvaluatedKey"] = lek
+	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
+	if limit > 0 && scanned == limit && lastScanned != nil {
+		resp["LastEvaluatedKey"] = lastScanned
 	}
 	return resp, nil
 }
@@ -767,47 +793,6 @@ func decode(body []byte, out any) error {
 		return fmt.Errorf("invalid request body: %w", err)
 	}
 	return nil
-}
-
-type keyExprToken struct {
-	attr  string
-	value string
-}
-
-func parseKeyCondition(s string) (pk keyExprToken, sk *keyExprToken, err error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return pk, nil, fmt.Errorf("KeyConditionExpression is required")
-	}
-	parts := strings.Split(s, "AND")
-	pk, err = parseSingleEq(parts[0])
-	if err != nil {
-		return pk, nil, err
-	}
-	if len(parts) > 1 {
-		tok, err := parseSingleEq(parts[1])
-		if err != nil {
-			return pk, nil, err
-		}
-		sk = &tok
-	}
-	if len(parts) > 2 {
-		return pk, nil, fmt.Errorf("only one optional sort key condition is supported")
-	}
-	return pk, sk, nil
-}
-
-func parseSingleEq(s string) (keyExprToken, error) {
-	parts := strings.Split(s, "=")
-	if len(parts) != 2 {
-		return keyExprToken{}, fmt.Errorf("only '=' key conditions are supported")
-	}
-	a := strings.TrimSpace(parts[0])
-	v := strings.TrimSpace(parts[1])
-	if a == "" || v == "" {
-		return keyExprToken{}, fmt.Errorf("invalid key condition segment")
-	}
-	return keyExprToken{attr: a, value: v}, nil
 }
 
 func resolveName(v string, names map[string]string) string {
