@@ -13,7 +13,17 @@ type Table struct {
 	HashType  string
 	RangeKey  string
 	RangeType string
+	GSIs      []GlobalSecondaryIndex
 	CreatedAt int64
+}
+
+type GlobalSecondaryIndex struct {
+	IndexName      string
+	HashKey        string
+	HashType       string
+	RangeKey       string
+	RangeType      string
+	ProjectionType string
 }
 
 func (t Table) AttributeDefinitions() []map[string]any {
@@ -33,6 +43,20 @@ func (t Table) KeySchema() []map[string]any {
 }
 
 func (t Table) Description(itemCount int64) map[string]any {
+	gsis := make([]map[string]any, 0, len(t.GSIs))
+	for _, g := range t.GSIs {
+		keySchema := []map[string]any{{"AttributeName": g.HashKey, "KeyType": "HASH"}}
+		if g.RangeKey != "" {
+			keySchema = append(keySchema, map[string]any{"AttributeName": g.RangeKey, "KeyType": "RANGE"})
+		}
+		gsis = append(gsis, map[string]any{
+			"IndexName":   g.IndexName,
+			"KeySchema":   keySchema,
+			"Projection":  map[string]any{"ProjectionType": g.ProjectionType},
+			"IndexStatus": "ACTIVE",
+		})
+	}
+
 	return map[string]any{
 		"AttributeDefinitions": t.AttributeDefinitions(),
 		"TableName":            t.Name,
@@ -46,8 +70,18 @@ func (t Table) Description(itemCount int64) map[string]any {
 			"ReadCapacityUnits":      0,
 			"WriteCapacityUnits":     0,
 		},
-		"BillingModeSummary": map[string]any{"BillingMode": "PAY_PER_REQUEST"},
+		"BillingModeSummary":     map[string]any{"BillingMode": "PAY_PER_REQUEST"},
+		"GlobalSecondaryIndexes": gsis,
 	}
+}
+
+func (t Table) GetGSI(indexName string) (GlobalSecondaryIndex, bool) {
+	for _, g := range t.GSIs {
+		if g.IndexName == indexName {
+			return g, true
+		}
+	}
+	return GlobalSecondaryIndex{}, false
 }
 
 func ExtractItemKeys(t Table, item map[string]any) (pk string, sk string, err error) {

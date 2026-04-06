@@ -191,6 +191,16 @@ type createTableRequest struct {
 		AttributeName string `json:"AttributeName"`
 		KeyType       string `json:"KeyType"`
 	} `json:"KeySchema"`
+	GlobalSecondaryIndexes []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType string `json:"ProjectionType"`
+		} `json:"Projection"`
+	} `json:"GlobalSecondaryIndexes"`
 }
 
 func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, error) {
@@ -234,6 +244,33 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		RangeKey:  rangeKey,
 		RangeType: attrType[rangeKey],
 		CreatedAt: time.Now().Unix(),
+	}
+
+	for _, g := range req.GlobalSecondaryIndexes {
+		var gHash string
+		var gRange string
+		for _, k := range g.KeySchema {
+			switch k.KeyType {
+			case "HASH":
+				gHash = k.AttributeName
+			case "RANGE":
+				gRange = k.AttributeName
+			}
+		}
+		if gHash == "" {
+			return nil, awserr.Validation("GSI KeySchema must include HASH key")
+		}
+		if g.IndexName == "" {
+			return nil, awserr.Validation("GSI IndexName is required")
+		}
+		t.GSIs = append(t.GSIs, model.GlobalSecondaryIndex{
+			IndexName:      g.IndexName,
+			HashKey:        gHash,
+			HashType:       attrType[gHash],
+			RangeKey:       gRange,
+			RangeType:      attrType[gRange],
+			ProjectionType: firstNonEmpty(g.Projection.ProjectionType, "ALL"),
+		})
 	}
 	if err := s.store.CreateTable(r.Context(), t); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -559,6 +596,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 
 type queryRequest struct {
 	TableName                 string            `json:"TableName"`
+	IndexName                 string            `json:"IndexName"`
 	KeyConditionExpression    string            `json:"KeyConditionExpression"`
 	FilterExpression          string            `json:"FilterExpression"`
 	ProjectionExpression      string            `json:"ProjectionExpression"`
@@ -585,8 +623,19 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	targetHashKey := t.HashKey
+	targetRangeKey := t.RangeKey
+	if strings.TrimSpace(req.IndexName) != "" {
+		gsi, ok := t.GetGSI(req.IndexName)
+		if !ok {
+			return nil, awserr.Validation("unknown index " + req.IndexName)
+		}
+		targetHashKey = gsi.HashKey
+		targetRangeKey = gsi.RangeKey
+	}
+
 	pkAttr := resolveName(pkToken.attr, req.ExpressionAttributeNames)
-	if pkAttr != t.HashKey {
+	if pkAttr != targetHashKey {
 		return nil, awserr.Validation("partition key condition must target HASH key")
 	}
 	pkValue, ok := req.ExpressionAttributeValues[pkToken.value]
@@ -615,19 +664,27 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 
 	var items []map[string]any
 	if skToken == nil {
-		if t.RangeKey == "" {
+		if targetRangeKey == "" {
 			items, err = s.store.QueryByPKSK(r.Context(), t.Name, pk, model.NoSortKey)
 		} else {
 			items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
 		}
 	} else {
-		if resolveName(skToken.attr, req.ExpressionAttributeNames) != t.RangeKey {
+		if resolveName(skToken.attr, req.ExpressionAttributeNames) != targetRangeKey {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
 		items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	if strings.TrimSpace(req.IndexName) != "" {
+		candidate, err := s.store.Scan(r.Context(), t.Name, "", "", 0)
+		if err != nil {
+			return nil, err
+		}
+		items = candidate
 	}
 
 	limit := parseLimit(req.Limit)
@@ -637,6 +694,17 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	var lastScanned map[string]any
 
 	for _, item := range items {
+		if strings.TrimSpace(req.IndexName) != "" {
+			raw, ok := item[targetHashKey]
+			if !ok {
+				continue
+			}
+			itemPK, err := model.SerializeKeyValue(raw)
+			if err != nil || itemPK != pk {
+				continue
+			}
+		}
+
 		if skToken != nil {
 			ok, err := sortConditionMatches(item, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 			if err != nil {
@@ -858,6 +926,13 @@ func resolveName(v string, names map[string]string) string {
 		if out, ok := names[v]; ok {
 			return out
 		}
+	}
+	return v
+}
+
+func firstNonEmpty(v string, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
 	}
 	return v
 }

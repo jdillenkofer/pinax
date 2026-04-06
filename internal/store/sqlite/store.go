@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -105,10 +106,14 @@ func applyDatabaseMigrations(db *sql.DB) error {
 }
 
 func (s *Store) CreateTable(ctx context.Context, t model.Table) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), t.CreatedAt)
+	gsiJSON, err := json.Marshal(t.GSIs)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), t.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -119,16 +124,22 @@ func (s *Store) GetTable(ctx context.Context, name string) (model.Table, error) 
 	var t model.Table
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
+	var gsiJSON string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, created_at
+		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, created_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &t.CreatedAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &t.CreatedAt)
 	if err != nil {
 		return model.Table{}, err
 	}
 	t.RangeKey = rangeKey.String
 	t.RangeType = rangeType.String
+	if strings.TrimSpace(gsiJSON) != "" {
+		if err := json.Unmarshal([]byte(gsiJSON), &t.GSIs); err != nil {
+			return model.Table{}, err
+		}
+	}
 	return t, nil
 }
 

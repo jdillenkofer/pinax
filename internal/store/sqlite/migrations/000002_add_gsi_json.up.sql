@@ -1,0 +1,1 @@
+ALTER TABLE tables ADD COLUMN gsi_json TEXT NOT NULL DEFAULT '[]';
