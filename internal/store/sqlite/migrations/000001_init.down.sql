@@ -1,0 +1,3 @@
+DROP INDEX IF EXISTS idx_items_table_pk;
+DROP TABLE IF EXISTS items;
+DROP TABLE IF EXISTS tables;
