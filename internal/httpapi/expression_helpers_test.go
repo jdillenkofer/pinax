@@ -49,3 +49,11 @@ func TestApplyProjection(t *testing.T) {
 		t.Fatalf("expected 2 projected attrs, got %d", len(projected))
 	}
 }
+
+func TestApplyProjectionMissingExpressionName(t *testing.T) {
+	item := map[string]any{"pk": map[string]any{"S": "u#1"}}
+	_, err := applyProjection(item, "#missing", map[string]string{})
+	if err == nil {
+		t.Fatal("expected missing expression name validation error")
+	}
+}

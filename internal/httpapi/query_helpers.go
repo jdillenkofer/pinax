@@ -125,7 +125,10 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 	if cond == nil {
 		return true, nil
 	}
-	attr := resolveName(cond.attr, names)
+	attr, err := resolveNameStrict(cond.attr, names)
+	if err != nil {
+		return false, err
+	}
 	raw, ok := item[attr]
 	if !ok {
 		return false, nil

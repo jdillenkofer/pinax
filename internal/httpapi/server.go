@@ -638,7 +638,10 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		targetRangeKey = gsi.RangeKey
 	}
 
-	pkAttr := resolveName(pkToken.attr, req.ExpressionAttributeNames)
+	pkAttr, err := resolveNameStrict(pkToken.attr, req.ExpressionAttributeNames)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 	if pkAttr != targetHashKey {
 		return nil, awserr.Validation("partition key condition must target HASH key")
 	}
@@ -674,7 +677,11 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 			items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
 		}
 	} else {
-		if resolveName(skToken.attr, req.ExpressionAttributeNames) != targetRangeKey {
+		skAttr, err := resolveNameStrict(skToken.attr, req.ExpressionAttributeNames)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if skAttr != targetRangeKey {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
 		items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
@@ -905,12 +912,21 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 			return nil, err
 		}
 
+		seenKeys := map[string]struct{}{}
 		for _, op := range ops {
+			if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
+				return nil, awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
+			}
 			if len(op.PutRequest.Item) > 0 {
 				pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
 				if err != nil {
 					return nil, awserr.Validation(err.Error())
 				}
+				k := tableName + "|" + pk + "|" + sk
+				if _, exists := seenKeys[k]; exists {
+					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
+				}
+				seenKeys[k] = struct{}{}
 				if err := s.store.PutItem(r.Context(), tableName, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
@@ -920,6 +936,11 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if err != nil {
 					return nil, awserr.Validation(err.Error())
 				}
+				k := tableName + "|" + pk + "|" + sk
+				if _, exists := seenKeys[k]; exists {
+					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
+				}
+				seenKeys[k] = struct{}{}
 				if err := s.store.DeleteItem(r.Context(), tableName, pk, sk); err != nil {
 					return nil, err
 				}
@@ -1032,6 +1053,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		del   bool
 	}
 	staged := make([]stagedMutation, 0, len(req.TransactItems))
+	seenTargets := map[string]struct{}{}
 
 	for _, txItem := range req.TransactItems {
 		if len(txItem.Put.Item) > 0 {
@@ -1061,6 +1083,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
 			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: txItem.Put.Item})
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
 			continue
 		}
 
@@ -1091,6 +1118,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
 			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, del: true})
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
 			continue
 		}
 
@@ -1133,6 +1165,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation(err.Error())
 			}
 			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: updated})
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
 			continue
 		}
 
@@ -1162,6 +1199,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if !ok {
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
 			continue
 		}
 
@@ -1201,6 +1243,17 @@ func resolveName(v string, names map[string]string) string {
 		}
 	}
 	return v
+}
+
+func resolveNameStrict(v string, names map[string]string) (string, error) {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "#") {
+		if out, ok := names[v]; ok {
+			return out, nil
+		}
+		return "", fmt.Errorf("missing expression name %q", v)
+	}
+	return v, nil
 }
 
 func firstNonEmpty(v string, fallback string) string {

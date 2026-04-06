@@ -63,7 +63,10 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 				if len(parts) != 2 {
 					return updatePlan{}, fmt.Errorf("invalid SET clause")
 				}
-				attr := resolveName(strings.TrimSpace(parts[0]), names)
+				attr, err := resolveNameStrict(strings.TrimSpace(parts[0]), names)
+				if err != nil {
+					return updatePlan{}, err
+				}
 				value, err := evalSetValue(strings.TrimSpace(parts[1]), attr, names, values)
 				if err != nil {
 					return updatePlan{}, err
@@ -74,7 +77,10 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 		case "REMOVE":
 			attrs := splitTopLevel(content, ',')
 			for _, attr := range attrs {
-				resolved := resolveName(strings.TrimSpace(attr), names)
+				resolved, err := resolveNameStrict(strings.TrimSpace(attr), names)
+				if err != nil {
+					return updatePlan{}, err
+				}
 				if resolved == "" {
 					continue
 				}
@@ -88,7 +94,10 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 				if len(fields) != 2 {
 					return updatePlan{}, fmt.Errorf("invalid ADD clause")
 				}
-				attr := resolveName(fields[0], names)
+				attr, err := resolveNameStrict(fields[0], names)
+				if err != nil {
+					return updatePlan{}, err
+				}
 				v, ok := values[fields[1]]
 				if !ok {
 					return updatePlan{}, fmt.Errorf("missing expression attribute value %q", fields[1])
@@ -112,7 +121,10 @@ func evalSetValue(raw string, attrName string, names map[string]string, values m
 		if err != nil {
 			return nil, err
 		}
-		target := resolveName(arg1, names)
+		target, err := resolveNameStrict(arg1, names)
+		if err != nil {
+			return nil, err
+		}
 		if target == "" {
 			return nil, fmt.Errorf("invalid if_not_exists target")
 		}
@@ -128,7 +140,11 @@ func evalSetValue(raw string, attrName string, names map[string]string, values m
 		if len(parts) == 2 {
 			left := strings.TrimSpace(parts[0])
 			right := strings.TrimSpace(parts[1])
-			if resolveName(left, names) == attrName {
+			resolvedLeft, err := resolveNameStrict(left, names)
+			if err != nil {
+				return nil, err
+			}
+			if resolvedLeft == attrName {
 				v, ok := values[right]
 				if !ok {
 					return nil, fmt.Errorf("missing expression attribute value %q", right)
@@ -219,7 +235,10 @@ func applyProjection(item map[string]any, projectionExpression string, names map
 	}
 	out := map[string]any{}
 	for _, token := range splitTopLevel(projectionExpression, ',') {
-		attr := resolveName(strings.TrimSpace(token), names)
+		attr, err := resolveNameStrict(strings.TrimSpace(token), names)
+		if err != nil {
+			return nil, err
+		}
 		if attr == "" {
 			continue
 		}

@@ -76,3 +76,58 @@ func TestBatchWriteLimitValidation(t *testing.T) {
 		t.Fatal("expected batch write validation error")
 	}
 }
+
+func TestBatchWriteDuplicateKeysValidation(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bw2"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wr := []types.WriteRequest{
+		{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "k1"}}}},
+		{DeleteRequest: &types.DeleteRequest{Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "k1"}}}},
+	}
+	_, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{"bw2": wr}})
+	if err == nil {
+		t.Fatal("expected duplicate key validation error")
+	}
+}
+
+func TestTransactWriteDuplicateTargetValidation(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("tx2"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: aws.String("tx2"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}}},
+		{Delete: &types.Delete{TableName: aws.String("tx2"), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}}},
+	}})
+	if err == nil {
+		t.Fatal("expected duplicate target validation error")
+	}
+}
