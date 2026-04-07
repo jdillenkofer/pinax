@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS idx_items_ttl;
+ALTER TABLE items DROP COLUMN ttl;

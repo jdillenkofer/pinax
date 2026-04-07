@@ -31,6 +31,10 @@ func New(db *sql.DB) (*Store, error) {
 	return s, nil
 }
 
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 func (s *Store) setupDatabase() error {
 	s.db.SetMaxOpenConns(1)
 	s.db.SetMaxIdleConns(1)
@@ -105,7 +109,7 @@ func applyDatabaseMigrations(db *sql.DB) error {
 	return nil
 }
 
-func (s *Store) CreateTable(ctx context.Context, t model.Table) error {
+func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) error {
 	gsiJSON, err := json.Marshal(t.GSIs)
 	if err != nil {
 		return err
@@ -114,7 +118,7 @@ func (s *Store) CreateTable(ctx context.Context, t model.Table) error {
 	if t.TimeToLive.Enabled {
 		ttlEnabled = 1
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
@@ -124,14 +128,14 @@ func (s *Store) CreateTable(ctx context.Context, t model.Table) error {
 	return nil
 }
 
-func (s *Store) GetTable(ctx context.Context, name string) (model.Table, error) {
+func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Table, error) {
 	var t model.Table
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
 	var gsiJSON string
 	var ttlEnabled int
 	var ttlAttr sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute
 		FROM tables
 		WHERE name = ?
@@ -151,11 +155,11 @@ func (s *Store) GetTable(ctx context.Context, name string) (model.Table, error) 
 	return t, nil
 }
 
-func (s *Store) ListTables(ctx context.Context, start string, limit int) ([]string, error) {
+func (s *Store) ListTables(ctx context.Context, tx *sql.Tx, start string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT name FROM tables
 		WHERE name > ?
 		ORDER BY name ASC
@@ -177,8 +181,8 @@ func (s *Store) ListTables(ctx context.Context, start string, limit int) ([]stri
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteTable(ctx context.Context, name string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM tables WHERE name = ?`, name)
+func (s *Store) DeleteTable(ctx context.Context, tx *sql.Tx, name string) error {
+	res, err := tx.ExecContext(ctx, `DELETE FROM tables WHERE name = ?`, name)
 	if err != nil {
 		return err
 	}
@@ -192,15 +196,15 @@ func (s *Store) DeleteTable(ctx context.Context, name string) error {
 	return nil
 }
 
-func (s *Store) CountItems(ctx context.Context, tableName string) (int64, error) {
+func (s *Store) CountItems(ctx context.Context, tx *sql.Tx, tableName string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM items WHERE table_name = ?`, tableName).Scan(&n)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM items WHERE table_name = ?`, tableName).Scan(&n)
 	return n, err
 }
 
-func (s *Store) GetItem(ctx context.Context, tableName, pk, sk string) (map[string]any, error) {
+func (s *Store) GetItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) (map[string]any, error) {
 	var raw []byte
-	err := s.db.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT item_json FROM items
 		WHERE table_name = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk).Scan(&raw)
@@ -210,28 +214,63 @@ func (s *Store) GetItem(ctx context.Context, tableName, pk, sk string) (map[stri
 	return decodeItem(raw)
 }
 
-func (s *Store) PutItem(ctx context.Context, tableName, pk, sk string, item map[string]any) error {
+func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string, item map[string]any) error {
+	t, err := s.GetTable(ctx, tx, tableName)
+	if err != nil {
+		return err
+	}
+
+	ttl, hasTTL := model.ExtractTTL(t, item)
+	var ttlVal any
+	if hasTTL {
+		ttlVal = ttl
+	}
+
 	raw, err := json.Marshal(item)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO items(table_name, pk, sk, item_json, updated_at)
-		VALUES (?, ?, ?, ?, ?)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO items(table_name, pk, sk, item_json, updated_at, ttl)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(table_name, pk, sk)
-		DO UPDATE SET item_json = excluded.item_json, updated_at = excluded.updated_at
-	`, tableName, pk, sk, raw, time.Now().Unix())
-	return err
+		DO UPDATE SET item_json = excluded.item_json, updated_at = excluded.updated_at, ttl = excluded.ttl
+	`, tableName, pk, sk, raw, time.Now().Unix(), ttlVal)
+	if err != nil {
+		return err
+	}
+
+	// Delete old GSI entries
+	_, err = tx.ExecContext(ctx, `DELETE FROM item_gsis WHERE table_name = ? AND pk = ? AND sk = ?`, tableName, pk, sk)
+	if err != nil {
+		return err
+	}
+
+	for _, gsi := range t.GSIs {
+		gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
+		if !ok {
+			continue
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO item_gsis(table_name, pk, sk, index_name, gsi_pk, gsi_sk)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, tableName, pk, sk, gsi.IndexName, gpk, gsk)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (s *Store) DeleteItem(ctx context.Context, tableName, pk, sk string) error {
-	_, err := s.db.ExecContext(ctx, `
+func (s *Store) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
+	_, err := tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
 	return err
 }
 
-func (s *Store) QueryByPK(ctx context.Context, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+func (s *Store) QueryByPK(ctx context.Context, tx *sql.Tx, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	order := "ASC"
 	comp := ">"
 	if !scanForward {
@@ -248,7 +287,7 @@ func (s *Store) QueryByPK(ctx context.Context, tableName, pk, startSK string, sc
 		q += " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -269,8 +308,47 @@ func (s *Store) QueryByPK(ctx context.Context, tableName, pk, startSK string, sc
 	return items, rows.Err()
 }
 
-func (s *Store) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]map[string]any, error) {
-	item, err := s.GetItem(ctx, tableName, pk, sk)
+func (s *Store) QueryByGSI(ctx context.Context, tx *sql.Tx, tableName, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+	order := "ASC"
+	comp := ">"
+	if !scanForward {
+		order = "DESC"
+		comp = "<"
+	}
+	q := fmt.Sprintf(`
+		SELECT i.item_json FROM item_gsis g
+		JOIN items i ON g.table_name = i.table_name AND g.pk = i.pk AND g.sk = i.sk
+		WHERE g.table_name = ? AND g.index_name = ? AND g.gsi_pk = ? AND g.gsi_sk %s ?
+		ORDER BY g.gsi_sk %s
+	`, comp, order)
+	args := []any{tableName, indexName, pk, startSK}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		item, err := decodeItem(raw)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) QueryByPKSK(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) ([]map[string]any, error) {
+	item, err := s.GetItem(ctx, tx, tableName, pk, sk)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -280,7 +358,7 @@ func (s *Store) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]ma
 	return []map[string]any{item}, nil
 }
 
-func (s *Store) Scan(ctx context.Context, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
+func (s *Store) Scan(ctx context.Context, tx *sql.Tx, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
 	q := `
 		SELECT item_json FROM items
 		WHERE table_name = ? AND (pk > ? OR (pk = ? AND sk > ?))
@@ -291,7 +369,7 @@ func (s *Store) Scan(ctx context.Context, tableName, startPK, startSK string, li
 		q += " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -327,29 +405,29 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
-func (s *Store) UpdateTimeToLive(ctx context.Context, tableName string, ttl model.TimeToLive) error {
+func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName string, ttl model.TimeToLive) error {
 	ttlEnabled := 0
 	if ttl.Enabled {
 		ttlEnabled = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ? WHERE name = ?
 	`, ttlEnabled, nullIfEmpty(ttl.AttrName), tableName)
 	return err
 }
 
-func (s *Store) GetExpiredItems(ctx context.Context, tableName string, ttlAttr string, before int64, limit int) ([]struct {
+func (s *Store) GetExpiredItems(ctx context.Context, tx *sql.Tx, tableName string, ttlAttr string, before int64, limit int) ([]struct {
 	PK string
 	SK string
 }, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT pk, sk, item_json FROM items
-		WHERE table_name = ?
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk FROM items
+		WHERE table_name = ? AND ttl > 0 AND ttl < ?
 		LIMIT ?
-	`, tableName, limit)
+	`, tableName, before, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -361,41 +439,19 @@ func (s *Store) GetExpiredItems(ctx context.Context, tableName string, ttlAttr s
 	}
 	for rows.Next() {
 		var pk, sk string
-		var raw []byte
-		if err := rows.Scan(&pk, &sk, &raw); err != nil {
+		if err := rows.Scan(&pk, &sk); err != nil {
 			return nil, err
 		}
-		item, err := decodeItem(raw)
-		if err != nil {
-			return nil, err
-		}
-		ttlVal, ok := item[ttlAttr]
-		if !ok {
-			continue
-		}
-		var ttlNum int64
-		switch v := ttlVal.(type) {
-		case float64:
-			ttlNum = int64(v)
-		case int64:
-			ttlNum = v
-		case int:
-			ttlNum = int64(v)
-		default:
-			continue
-		}
-		if ttlNum > 0 && ttlNum < before {
-			expired = append(expired, struct {
-				PK string
-				SK string
-			}{PK: pk, SK: sk})
-		}
+		expired = append(expired, struct {
+			PK string
+			SK string
+		}{PK: pk, SK: sk})
 	}
 	return expired, rows.Err()
 }
 
-func (s *Store) DeleteExpiredItem(ctx context.Context, tableName, pk, sk string) error {
-	_, err := s.db.ExecContext(ctx, `
+func (s *Store) DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
+	_, err := tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
 	return err

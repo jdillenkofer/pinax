@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -144,6 +145,53 @@ func ExtractKey(t Table, key map[string]any) (pk string, sk string, err error) {
 		return "", "", fmt.Errorf("invalid sort key %q: %w", t.RangeKey, err)
 	}
 	return pk, sk, nil
+}
+
+func ExtractGSIKeys(g GlobalSecondaryIndex, item map[string]any) (pk string, sk string, ok bool) {
+	pv, ok := item[g.HashKey]
+	if !ok {
+		return "", "", false
+	}
+	pk, err := SerializeKeyValue(pv)
+	if err != nil {
+		return "", "", false
+	}
+	if g.RangeKey == "" {
+		return pk, NoSortKey, true
+	}
+	sv, ok := item[g.RangeKey]
+	if !ok {
+		// DynamoDB GSIs are sparse: if sort key is missing, item is not in GSI
+		return "", "", false
+	}
+	sk, err = SerializeKeyValue(sv)
+	if err != nil {
+		return "", "", false
+	}
+	return pk, sk, true
+}
+
+func ExtractTTL(t Table, item map[string]any) (int64, bool) {
+	if !t.TimeToLive.Enabled || t.TimeToLive.AttrName == "" {
+		return 0, false
+	}
+	v, ok := item[t.TimeToLive.AttrName]
+	if !ok {
+		return 0, false
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	ns, ok := m["N"].(string)
+	if !ok {
+		return 0, false
+	}
+	ttl, err := strconv.ParseInt(ns, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return ttl, true
 }
 
 func SerializeKeyValue(v any) (string, error) {

@@ -26,7 +26,7 @@ func (s *Sweeper) Start(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 
-	s.run(ctx)
+	s.RunOnce(ctx)
 
 	for {
 		select {
@@ -35,7 +35,7 @@ func (s *Sweeper) Start(ctx context.Context) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.run(ctx)
+			s.RunOnce(ctx)
 		}
 	}
 }
@@ -44,10 +44,22 @@ func (s *Sweeper) Stop() {
 	close(s.stopCh)
 }
 
-func (s *Sweeper) run(ctx context.Context) {
-	tables, err := s.store.ListTables(ctx, "", 100)
+func (s *Sweeper) RunOnce(ctx context.Context) {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("failed to start transaction for TTL sweep", "err", err)
+		return
+	}
+	defer tx.Rollback()
+
+	tables, err := s.store.ListTables(ctx, tx, "", 100)
 	if err != nil {
 		slog.Error("failed to list tables for TTL sweep", "err", err)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("failed to commit transaction for TTL list tables", "err", err)
 		return
 	}
 
@@ -57,7 +69,14 @@ func (s *Sweeper) run(ctx context.Context) {
 }
 
 func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
-	t, err := s.store.GetTable(ctx, tableName)
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("failed to start transaction for TTL sweepTable", "table", tableName, "err", err)
+		return
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(ctx, tx, tableName)
 	if err != nil {
 		slog.Error("failed to get table for TTL sweep", "table", tableName, "err", err)
 		return
@@ -77,24 +96,28 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 		default:
 		}
 
-		expired, err := s.store.GetExpiredItems(ctx, tableName, t.TimeToLive.AttrName, now, limit)
+		expired, err := s.store.GetExpiredItems(ctx, tx, tableName, t.TimeToLive.AttrName, now, limit)
 		if err != nil {
 			slog.Error("failed to get expired items", "table", tableName, "err", err)
 			return
 		}
 
 		if len(expired) == 0 {
-			return
+			break
 		}
 
 		for _, item := range expired {
-			if err := s.store.DeleteExpiredItem(ctx, tableName, item.PK, item.SK); err != nil {
+			if err := s.store.DeleteExpiredItem(ctx, tx, tableName, item.PK, item.SK); err != nil {
 				slog.Error("failed to delete expired item", "table", tableName, "pk", item.PK, "sk", item.SK, "err", err)
 			}
 		}
 
 		if len(expired) < limit {
-			return
+			break
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("failed to commit transaction for TTL sweepTable", "table", tableName, "err", err)
 	}
 }

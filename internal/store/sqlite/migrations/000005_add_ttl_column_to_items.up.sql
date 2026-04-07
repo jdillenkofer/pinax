@@ -1,0 +1,2 @@
+ALTER TABLE items ADD COLUMN ttl INTEGER;
+CREATE INDEX IF NOT EXISTS idx_items_ttl ON items(ttl) WHERE ttl IS NOT NULL;

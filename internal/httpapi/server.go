@@ -160,6 +160,8 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.listTables(r, body)
 	case "DeleteTable":
 		return s.deleteTable(r, body)
+	case "UpdateTable":
+		return s.updateTable(r, body)
 	case "PutItem":
 		return s.putItem(r, body)
 	case "GetItem":
@@ -280,10 +282,20 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 			ProjectionType: firstNonEmpty(g.Projection.ProjectionType, "ALL"),
 		})
 	}
-	if err := s.store.CreateTable(r.Context(), t); err != nil {
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if err := s.store.CreateTable(r.Context(), tx, t); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return nil, awserr.ResourceInUse("Table already exists: " + req.TableName)
 		}
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -299,17 +311,28 @@ func (s *Server) describeTable(r *http.Request, body []byte) (map[string]any, er
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
 		return nil, err
 	}
-	count, err := s.store.CountItems(r.Context(), t.Name)
+	count, err := s.store.CountItems(r.Context(), tx, t.Name)
 	if err != nil {
 		return nil, err
 	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return map[string]any{"Table": t.Description(count)}, nil
 }
 
@@ -323,10 +346,21 @@ func (s *Server) listTables(r *http.Request, body []byte) (map[string]any, error
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	names, err := s.store.ListTables(r.Context(), req.ExclusiveStartTableName, req.Limit)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback()
+
+	names, err := s.store.ListTables(r.Context(), tx, req.ExclusiveStartTableName, req.Limit)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return map[string]any{"TableNames": names}, nil
 }
 
@@ -335,20 +369,31 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
 		return nil, err
 	}
-	count, err := s.store.CountItems(r.Context(), req.TableName)
+	count, err := s.store.CountItems(r.Context(), tx, req.TableName)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.DeleteTable(r.Context(), req.TableName); err != nil {
+	if err := s.store.DeleteTable(r.Context(), tx, req.TableName); err != nil {
 		return nil, err
 	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return map[string]any{"TableDescription": t.Description(count)}, nil
 }
 
@@ -370,7 +415,14 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if model.ItemTooLarge(req.Item) {
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -382,7 +434,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 
-	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -399,7 +451,11 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
 
-	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, req.Item); err != nil {
+	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, req.Item); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -432,7 +488,13 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -443,13 +505,18 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	item, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	item, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return map[string]any{}, nil
 		}
 		return nil, err
 	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
@@ -474,7 +541,14 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -485,7 +559,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -501,7 +575,11 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if !ok {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
-	if err := s.store.DeleteItem(r.Context(), t.Name, pk, sk); err != nil {
+	if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -536,7 +614,14 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -547,7 +632,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	oldItem := map[string]any{}
 	itemExisted := true
 	if err != nil {
@@ -584,7 +669,11 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if model.ItemTooLarge(updated) {
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
-	if err := s.store.PutItem(r.Context(), t.Name, pk, sk, updated); err != nil {
+	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -625,6 +714,36 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	return resp, nil
 }
 
+func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, error) {
+	var req tableNameRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return nil, err
+	}
+	count, err := s.store.CountItems(r.Context(), tx, t.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return map[string]any{"TableDescription": t.Description(count)}, nil
+}
+
 type queryRequest struct {
 	TableName                 string            `json:"TableName"`
 	IndexName                 string            `json:"IndexName"`
@@ -645,7 +764,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -699,11 +825,13 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	var items []map[string]any
-	if skToken == nil {
+	if strings.TrimSpace(req.IndexName) != "" {
+		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, startSK, scanForward, 0)
+	} else if skToken == nil {
 		if targetRangeKey == "" {
-			items, err = s.store.QueryByPKSK(r.Context(), t.Name, pk, model.NoSortKey)
+			items, err = s.store.QueryByPKSK(r.Context(), tx, t.Name, pk, model.NoSortKey)
 		} else {
-			items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
+			items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, startSK, scanForward, 0)
 		}
 	} else {
 		skAttr, err := resolveNameStrict(skToken.attr, req.ExpressionAttributeNames)
@@ -713,18 +841,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		if skAttr != targetRangeKey {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
-		items, err = s.store.QueryByPK(r.Context(), t.Name, pk, startSK, scanForward, 0)
+		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, startSK, scanForward, 0)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	if strings.TrimSpace(req.IndexName) != "" {
-		candidate, err := s.store.Scan(r.Context(), t.Name, "", "", 0)
-		if err != nil {
-			return nil, err
-		}
-		items = candidate
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	limit := parseLimit(req.Limit)
@@ -805,7 +929,14 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -821,8 +952,12 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 			return nil, awserr.Validation(err.Error())
 		}
 	}
-	items, err := s.store.Scan(r.Context(), t.Name, startPK, startSK, 0)
+	items, err := s.store.Scan(r.Context(), tx, t.Name, startPK, startSK, 0)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -885,9 +1020,15 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		return nil, awserr.Validation("BatchGetItem supports at most 100 keys")
 	}
 
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	responses := map[string]any{}
 	for tableName, itemReq := range req.RequestItems {
-		t, err := s.store.GetTable(r.Context(), tableName)
+		t, err := s.store.GetTable(r.Context(), tx, tableName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -900,7 +1041,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			item, err := s.store.GetItem(r.Context(), tableName, pk, sk)
+			item, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					continue
@@ -911,6 +1052,11 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		}
 		responses[tableName] = items
 	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	resp := map[string]any{"Responses": responses, "UnprocessedKeys": map[string]any{}}
 	for tableName, itemReq := range req.RequestItems {
 		if items, ok := responses[tableName]; ok {
@@ -948,6 +1094,12 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, awserr.Validation("BatchWriteItem supports at most 25 operations")
 	}
 
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	tableNames := make([]string, 0, len(req.RequestItems))
 	for tableName := range req.RequestItems {
 		tableNames = append(tableNames, tableName)
@@ -956,7 +1108,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 
 	for _, tableName := range tableNames {
 		ops := req.RequestItems[tableName]
-		t, err := s.store.GetTable(r.Context(), tableName)
+		t, err := s.store.GetTable(r.Context(), tx, tableName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -982,7 +1134,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
 				}
 				seenKeys[k] = struct{}{}
-				if err := s.store.PutItem(r.Context(), tableName, pk, sk, op.PutRequest.Item); err != nil {
+				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
 			}
@@ -996,11 +1148,15 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
 				}
 				seenKeys[k] = struct{}{}
-				if err := s.store.DeleteItem(r.Context(), tableName, pk, sk); err != nil {
+				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
 					return nil, err
 				}
 			}
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	return map[string]any{"UnprocessedItems": map[string]any{}}, nil
@@ -1028,10 +1184,16 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		return nil, awserr.Validation("TransactGetItems supports at most 25 items")
 	}
 
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	responses := make([]map[string]any, 0, len(req.TransactItems))
 	for _, txItem := range req.TransactItems {
 		g := txItem.Get
-		t, err := s.store.GetTable(r.Context(), g.TableName)
+		t, err := s.store.GetTable(r.Context(), tx, g.TableName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1042,7 +1204,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
-		item, err := s.store.GetItem(r.Context(), g.TableName, pk, sk)
+		item, err := s.store.GetItem(r.Context(), tx, g.TableName, pk, sk)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				responses = append(responses, map[string]any{})
@@ -1052,6 +1214,11 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		}
 		responses = append(responses, map[string]any{"Item": item})
 	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return map[string]any{"Responses": responses}, nil
 }
 
@@ -1101,19 +1268,17 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		return nil, awserr.Validation("TransactWriteItems supports at most 25 actions")
 	}
 
-	type stagedMutation struct {
-		table string
-		pk    string
-		sk    string
-		item  map[string]any
-		del   bool
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
 	}
-	staged := make([]stagedMutation, 0, len(req.TransactItems))
+	defer tx.Rollback()
+
 	seenTargets := map[string]struct{}{}
 
 	for _, txItem := range req.TransactItems {
 		if len(txItem.Put.Item) > 0 {
-			t, err := s.store.GetTable(r.Context(), txItem.Put.TableName)
+			t, err := s.store.GetTable(r.Context(), tx, txItem.Put.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1124,7 +1289,13 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
+
+			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
@@ -1141,17 +1312,14 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if model.ItemTooLarge(txItem.Put.Item) {
 				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 			}
-			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: txItem.Put.Item})
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
+				return nil, err
 			}
-			seenTargets[target] = struct{}{}
 			continue
 		}
 
 		if len(txItem.Delete.Key) > 0 {
-			t, err := s.store.GetTable(r.Context(), txItem.Delete.TableName)
+			t, err := s.store.GetTable(r.Context(), tx, txItem.Delete.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1162,7 +1330,13 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
+
+			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
@@ -1176,17 +1350,14 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if !ok {
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
-			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, del: true})
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
+				return nil, err
 			}
-			seenTargets[target] = struct{}{}
 			continue
 		}
 
 		if len(txItem.Update.Key) > 0 {
-			t, err := s.store.GetTable(r.Context(), txItem.Update.TableName)
+			t, err := s.store.GetTable(r.Context(), tx, txItem.Update.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1197,7 +1368,13 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
+
+			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					current = map[string]any{t.HashKey: txItem.Update.Key[t.HashKey]}
@@ -1226,17 +1403,14 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if model.ItemTooLarge(updated) {
 				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 			}
-			staged = append(staged, stagedMutation{table: t.Name, pk: pk, sk: sk, item: updated})
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
+				return nil, err
 			}
-			seenTargets[target] = struct{}{}
 			continue
 		}
 
 		if len(txItem.ConditionCheck.Key) > 0 {
-			t, err := s.store.GetTable(r.Context(), txItem.ConditionCheck.TableName)
+			t, err := s.store.GetTable(r.Context(), tx, txItem.ConditionCheck.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1247,7 +1421,13 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			current, err := s.store.GetItem(r.Context(), t.Name, pk, sk)
+			target := t.Name + "|" + pk + "|" + sk
+			if _, exists := seenTargets[target]; exists {
+				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+			}
+			seenTargets[target] = struct{}{}
+
+			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
@@ -1261,27 +1441,14 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if !ok {
 				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 			}
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
-			}
-			seenTargets[target] = struct{}{}
 			continue
 		}
 
 		return nil, awserr.Validation("each transact item must contain one operation")
 	}
 
-	for _, m := range staged {
-		if m.del {
-			if err := s.store.DeleteItem(r.Context(), m.table, m.pk, m.sk); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if err := s.store.PutItem(r.Context(), m.table, m.pk, m.sk, m.item); err != nil {
-			return nil, err
-		}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	return map[string]any{}, nil
@@ -1345,7 +1512,13 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 		return nil, awserr.Validation("AttributeName is required")
 	}
 
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -1357,7 +1530,11 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 		Enabled:  req.TimeToLiveSpecification.Enabled,
 		AttrName: req.TimeToLiveSpecification.AttributeName,
 	}
-	if err := s.store.UpdateTimeToLive(r.Context(), req.TableName, ttl); err != nil {
+	if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, ttl); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -1387,11 +1564,21 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	t, err := s.store.GetTable(r.Context(), req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
