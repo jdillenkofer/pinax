@@ -12,6 +12,7 @@ type APIError struct {
 	Code    string
 	Message string
 	Status  int
+	Details map[string]any
 }
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
@@ -32,6 +33,21 @@ func ConditionalCheckFailed(msg string) *APIError {
 	return &APIError{Code: "ConditionalCheckFailedException", Message: msg, Status: http.StatusBadRequest}
 }
 
+type CancellationReason struct {
+	Code    string         `json:"Code"`
+	Message string         `json:"Message,omitempty"`
+	Item    map[string]any `json:"Item,omitempty"`
+}
+
+func TransactionCanceled(msg string, reasons []CancellationReason) *APIError {
+	return &APIError{
+		Code:    "TransactionCanceledException",
+		Message: msg,
+		Status:  http.StatusBadRequest,
+		Details: map[string]any{"CancellationReasons": reasons},
+	}
+}
+
 func Internal(msg string) *APIError {
 	return &APIError{Code: "InternalServerError", Message: msg, Status: http.StatusInternalServerError}
 }
@@ -44,8 +60,12 @@ func Write(w http.ResponseWriter, err error) {
 
 	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	w.WriteHeader(apiErr.Status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	payload := map[string]any{
 		"__type":  prefix + apiErr.Code,
 		"message": apiErr.Message,
-	})
+	}
+	for k, v := range apiErr.Details {
+		payload[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(payload)
 }

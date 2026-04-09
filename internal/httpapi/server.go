@@ -1225,33 +1225,37 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 type transactWriteRequest struct {
 	TransactItems []struct {
 		Put struct {
-			TableName                 string            `json:"TableName"`
-			Item                      map[string]any    `json:"Item"`
-			ConditionExpression       string            `json:"ConditionExpression"`
-			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+			TableName                           string            `json:"TableName"`
+			Item                                map[string]any    `json:"Item"`
+			ConditionExpression                 string            `json:"ConditionExpression"`
+			ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+			ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
 		} `json:"Put"`
 		Delete struct {
-			TableName                 string            `json:"TableName"`
-			Key                       map[string]any    `json:"Key"`
-			ConditionExpression       string            `json:"ConditionExpression"`
-			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+			TableName                           string            `json:"TableName"`
+			Key                                 map[string]any    `json:"Key"`
+			ConditionExpression                 string            `json:"ConditionExpression"`
+			ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+			ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
 		} `json:"Delete"`
 		Update struct {
-			TableName                 string            `json:"TableName"`
-			Key                       map[string]any    `json:"Key"`
-			UpdateExpression          string            `json:"UpdateExpression"`
-			ConditionExpression       string            `json:"ConditionExpression"`
-			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+			TableName                           string            `json:"TableName"`
+			Key                                 map[string]any    `json:"Key"`
+			UpdateExpression                    string            `json:"UpdateExpression"`
+			ConditionExpression                 string            `json:"ConditionExpression"`
+			ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+			ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
 		} `json:"Update"`
 		ConditionCheck struct {
-			TableName                 string            `json:"TableName"`
-			Key                       map[string]any    `json:"Key"`
-			ConditionExpression       string            `json:"ConditionExpression"`
-			ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-			ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
+			TableName                           string            `json:"TableName"`
+			Key                                 map[string]any    `json:"Key"`
+			ConditionExpression                 string            `json:"ConditionExpression"`
+			ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+			ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+			ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
 		} `json:"ConditionCheck"`
 	} `json:"TransactItems"`
 }
@@ -1276,8 +1280,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 
 	seenTargets := map[string]struct{}{}
 
-	for _, txItem := range req.TransactItems {
+	for i, txItem := range req.TransactItems {
 		if len(txItem.Put.Item) > 0 {
+			if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
 			t, err := s.store.GetTable(r.Context(), tx, txItem.Put.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1296,10 +1303,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			seenTargets[target] = struct{}{}
 
 			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
+			itemExisted := true
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
 			if errors.Is(err, sql.ErrNoRows) {
+				itemExisted = false
 				current = map[string]any{}
 			}
 			ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
@@ -1307,7 +1316,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation(err.Error())
 			}
 			if !ok {
-				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "ConditionalCheckFailed",
+					Message: "The conditional request failed",
+					Item:    itemForConditionFailure(txItem.Put.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			if model.ItemTooLarge(txItem.Put.Item) {
 				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
@@ -1319,6 +1333,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		}
 
 		if len(txItem.Delete.Key) > 0 {
+			if err := validateReturnValuesOnConditionCheckFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure); err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
 			t, err := s.store.GetTable(r.Context(), tx, txItem.Delete.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1337,10 +1354,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			seenTargets[target] = struct{}{}
 
 			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
+			itemExisted := true
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
 			if errors.Is(err, sql.ErrNoRows) {
+				itemExisted = false
 				current = map[string]any{}
 			}
 			ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
@@ -1348,7 +1367,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation(err.Error())
 			}
 			if !ok {
-				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "ConditionalCheckFailed",
+					Message: "The conditional request failed",
+					Item:    itemForConditionFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 				return nil, err
@@ -1357,6 +1381,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		}
 
 		if len(txItem.Update.Key) > 0 {
+			if err := validateReturnValuesOnConditionCheckFailure(txItem.Update.ReturnValuesOnConditionCheckFailure); err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
 			t, err := s.store.GetTable(r.Context(), tx, txItem.Update.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1374,6 +1401,16 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			seenTargets[target] = struct{}{}
 
+			existing, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
+			itemExisted := true
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				itemExisted = false
+				existing = map[string]any{}
+			}
+
 			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1390,7 +1427,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation(err.Error())
 			}
 			if !ok {
-				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "ConditionalCheckFailed",
+					Message: "The conditional request failed",
+					Item:    itemForConditionFailure(txItem.Update.ReturnValuesOnConditionCheckFailure, existing, itemExisted),
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
 			if err != nil {
@@ -1410,6 +1452,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		}
 
 		if len(txItem.ConditionCheck.Key) > 0 {
+			if err := validateReturnValuesOnConditionCheckFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure); err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
 			t, err := s.store.GetTable(r.Context(), tx, txItem.ConditionCheck.TableName)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1428,10 +1473,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			seenTargets[target] = struct{}{}
 
 			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
+			itemExisted := true
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
 			if errors.Is(err, sql.ErrNoRows) {
+				itemExisted = false
 				current = map[string]any{}
 			}
 			ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
@@ -1439,7 +1486,12 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation(err.Error())
 			}
 			if !ok {
-				return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "ConditionalCheckFailed",
+					Message: "The conditional request failed",
+					Item:    itemForConditionFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			continue
 		}
@@ -1452,6 +1504,30 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	}
 
 	return map[string]any{}, nil
+}
+
+func buildTransactionCancellationReasons(count int, failedIndex int, failed awserr.CancellationReason) []awserr.CancellationReason {
+	reasons := make([]awserr.CancellationReason, count)
+	for i := 0; i < count; i++ {
+		reasons[i] = awserr.CancellationReason{Code: "None"}
+	}
+	reasons[failedIndex] = failed
+	return reasons
+}
+
+func validateReturnValuesOnConditionCheckFailure(v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "NONE" || v == "ALL_OLD" {
+		return nil
+	}
+	return fmt.Errorf("unsupported ReturnValuesOnConditionCheckFailure %q", v)
+}
+
+func itemForConditionFailure(returnValues string, item map[string]any, itemExisted bool) map[string]any {
+	if strings.TrimSpace(returnValues) != "ALL_OLD" || !itemExisted {
+		return nil
+	}
+	return item
 }
 
 func decode(body []byte, out any) error {
