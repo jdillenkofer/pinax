@@ -12,7 +12,7 @@ func Evaluate(condition string, item map[string]any, names map[string]string, va
 	if condition == "" {
 		return true, nil
 	}
-	return evalBoolean(condition, item, names, values)
+	return evaluateParsed(condition, item, names, values)
 }
 
 func evalBoolean(condition string, item map[string]any, names map[string]string, values map[string]any) (bool, error) {
