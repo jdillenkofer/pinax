@@ -1603,7 +1603,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "TransactionConflict",
+					Message: "Transaction request cannot include multiple operations on one item",
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
 			}
 			seenTargets[target] = struct{}{}
 
@@ -1654,7 +1658,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "TransactionConflict",
+					Message: "Transaction request cannot include multiple operations on one item",
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
 			}
 			seenTargets[target] = struct{}{}
 
@@ -1702,7 +1710,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "TransactionConflict",
+					Message: "Transaction request cannot include multiple operations on one item",
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
 			}
 			seenTargets[target] = struct{}{}
 
@@ -1773,7 +1785,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("TransactWriteItems cannot target the same item more than once")
+				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+					Code:    "TransactionConflict",
+					Message: "Transaction request cannot include multiple operations on one item",
+				})
+				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
 			}
 			seenTargets[target] = struct{}{}
 

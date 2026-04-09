@@ -131,6 +131,20 @@ func TestTransactWriteDuplicateTargetValidation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected duplicate target validation error")
 	}
+
+	var txErr *types.TransactionCanceledException
+	if !errors.As(err, &txErr) {
+		t.Fatalf("expected TransactionCanceledException, got %T: %v", err, err)
+	}
+	if len(txErr.CancellationReasons) != 2 {
+		t.Fatalf("expected 2 cancellation reasons, got %d", len(txErr.CancellationReasons))
+	}
+	if txErr.CancellationReasons[0].Code == nil || *txErr.CancellationReasons[0].Code != "None" {
+		t.Fatalf("expected first reason None, got %+v", txErr.CancellationReasons[0])
+	}
+	if txErr.CancellationReasons[1].Code == nil || *txErr.CancellationReasons[1].Code != "TransactionConflict" {
+		t.Fatalf("expected second reason TransactionConflict, got %+v", txErr.CancellationReasons[1])
+	}
 }
 
 func TestTransactWriteConditionFailureReturnsCancellationReasons(t *testing.T) {
