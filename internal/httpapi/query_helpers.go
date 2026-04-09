@@ -147,17 +147,34 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 	if err != nil {
 		return false, err
 	}
+	leftNum, leftIsNum := numberFromN(raw)
+	rightNum, rightIsNum := numberFromN(v1)
 
 	switch cond.op {
 	case "=":
+		if leftIsNum && rightIsNum {
+			return leftNum == rightNum, nil
+		}
 		return left == right1, nil
 	case "<":
+		if leftIsNum && rightIsNum {
+			return leftNum < rightNum, nil
+		}
 		return left < right1, nil
 	case "<=":
+		if leftIsNum && rightIsNum {
+			return leftNum <= rightNum, nil
+		}
 		return left <= right1, nil
 	case ">":
+		if leftIsNum && rightIsNum {
+			return leftNum > rightNum, nil
+		}
 		return left > right1, nil
 	case ">=":
+		if leftIsNum && rightIsNum {
+			return leftNum >= rightNum, nil
+		}
 		return left >= right1, nil
 	case "begins_with":
 		return strings.HasPrefix(left, right1), nil
@@ -169,6 +186,12 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 		right2, err := model.SerializeKeyValue(v2)
 		if err != nil {
 			return false, err
+		}
+		if leftIsNum && rightIsNum {
+			rightNum2, ok := numberFromN(v2)
+			if ok {
+				return leftNum >= rightNum && leftNum <= rightNum2, nil
+			}
 		}
 		return left >= right1 && left <= right2, nil
 	default:

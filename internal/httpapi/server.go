@@ -437,7 +437,11 @@ func (s *Server) listTables(r *http.Request, body []byte) (map[string]any, error
 		return nil, err
 	}
 
-	return map[string]any{"TableNames": names}, nil
+	resp := map[string]any{"TableNames": names}
+	if req.Limit > 0 && len(names) == req.Limit {
+		resp["LastEvaluatedTableName"] = names[len(names)-1]
+	}
+	return resp, nil
 }
 
 func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, error) {
@@ -536,7 +540,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item)))
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -598,7 +602,7 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 	resp := map[string]any{"Item": projected}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead), 0)
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead), 0)
 	return resp, nil
 }
 
@@ -660,7 +664,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	resp := map[string]any{}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current)))
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -754,7 +758,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	resp := map[string]any{}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated)))
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -1183,18 +1187,6 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		scanForward = *req.ScanIndexForward
 	}
 
-	startSK := ""
-	if queryGSI == nil && queryLSI == nil {
-		if len(req.ExclusiveStartKey) > 0 {
-			_, startSK, err = model.ExtractKey(t, req.ExclusiveStartKey)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-		} else if !scanForward {
-			startSK = "~"
-		}
-	}
-
 	var items []map[string]any
 	if queryGSI != nil {
 		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, "", true, 0)
@@ -1212,7 +1204,10 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		if targetRangeKey == "" {
 			items, err = s.store.QueryByPKSK(r.Context(), tx, t.Name, pk, model.NoSortKey)
 		} else {
-			items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, startSK, scanForward, 0)
+			items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, "", true, 0)
+			if err == nil {
+				items, err = orderItemsForTable(items, t, req.ExclusiveStartKey, scanForward)
+			}
 		}
 	} else {
 		skAttr, err := resolveNameStrict(skToken.attr, req.ExpressionAttributeNames)
@@ -1222,7 +1217,10 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		if skAttr != targetRangeKey {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
-		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, startSK, scanForward, 0)
+		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, "", true, 0)
+		if err == nil {
+			items, err = orderItemsForTable(items, t, req.ExclusiveStartKey, scanForward)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -1298,7 +1296,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if queryLSI != nil {
 		indexType = "LSI"
 	}
-	addQueryConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, req.IndexName, indexType, totalRead)
+	setSingleQueryConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, req.IndexName, indexType, totalRead)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
 	}
@@ -1358,15 +1356,20 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	filtered := make([]map[string]any, 0)
 	scanned := 0
 	var lastScanned map[string]any
+	totalRead := 0.0
 	for _, item := range items {
 		scanned++
 		lastScanned = keyFromItem(t, item)
+		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
 
 		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
 		if !matches {
+			if limit > 0 && scanned >= limit {
+				break
+			}
 			continue
 		}
 		projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
@@ -1374,18 +1377,14 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 			return nil, awserr.Validation(err.Error())
 		}
 		filtered = append(filtered, projected)
-
 		if limit > 0 && scanned >= limit {
 			break
 		}
+
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
-	var totalRead float64
-	for _, item := range filtered {
-		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
-	}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
 	}
@@ -1468,7 +1467,11 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 				}
 				return nil, err
 			}
-			items = append(items, item)
+			projected, err := applyProjection(item, itemReq.ProjectionExpression, itemReq.ExpressionAttributeNames)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			items = append(items, projected)
 			readByTable[tableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead)
 		}
 		responses[tableName] = items
@@ -2165,27 +2168,98 @@ func projectItemForLSI(item map[string]any, t model.Table, l model.LocalSecondar
 	return projected
 }
 
-func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+func orderItemsForTable(items []map[string]any, t model.Table, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
 	type entry struct {
 		item map[string]any
-		idx  string
+		raw  any
 		pk   string
 		sk   string
 	}
 
 	entries := make([]entry, 0, len(items))
 	for _, item := range items {
-		idx := ""
+		raw := any(nil)
+		if t.RangeKey != "" {
+			v, ok := item[t.RangeKey]
+			if !ok {
+				continue
+			}
+			raw = v
+		}
+		pkVal, ok := item[t.HashKey]
+		if !ok {
+			continue
+		}
+		pk, err := model.SerializeKeyValue(pkVal)
+		if err != nil {
+			continue
+		}
+		sk := model.NoSortKey
+		if t.RangeKey != "" {
+			skVal, ok := item[t.RangeKey]
+			if !ok {
+				continue
+			}
+			sk, err = model.SerializeKeyValue(skVal)
+			if err != nil {
+				continue
+			}
+		}
+		entries = append(entries, entry{item: item, raw: raw, pk: pk, sk: sk})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		cmp := compareAttributeValues(entries[i].raw, entries[j].raw)
+		if cmp == 0 {
+			if scanForward {
+				return entries[i].sk < entries[j].sk
+			}
+			return entries[i].sk > entries[j].sk
+		}
+		if scanForward {
+			return cmp < 0
+		}
+		return cmp > 0
+	})
+
+	start := 0
+	if len(exclusiveStartKey) > 0 {
+		startPK, startSK, err := model.ExtractKey(t, exclusiveStartKey)
+		if err != nil {
+			return nil, err
+		}
+		for i, e := range entries {
+			if e.pk == startPK && e.sk == startSK {
+				start = i + 1
+				break
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(entries)-start)
+	for i := start; i < len(entries); i++ {
+		out = append(out, entries[i].item)
+	}
+	return out, nil
+}
+
+func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	type entry struct {
+		item map[string]any
+		idx  any
+		pk   string
+		sk   string
+	}
+
+	entries := make([]entry, 0, len(items))
+	for _, item := range items {
+		idx := any(nil)
 		if g.RangeKey != "" {
 			raw, ok := item[g.RangeKey]
 			if !ok {
 				continue
 			}
-			v, err := model.SerializeKeyValue(raw)
-			if err != nil {
-				continue
-			}
-			idx = v
+			idx = raw
 		}
 
 		pkRaw, ok := item[t.HashKey]
@@ -2211,7 +2285,8 @@ func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecon
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].idx == entries[j].idx {
+		cmp := compareAttributeValues(entries[i].idx, entries[j].idx)
+		if cmp == 0 {
 			if entries[i].pk == entries[j].pk {
 				if scanForward {
 					return entries[i].sk < entries[j].sk
@@ -2224,9 +2299,9 @@ func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecon
 			return entries[i].pk > entries[j].pk
 		}
 		if scanForward {
-			return entries[i].idx < entries[j].idx
+			return cmp < 0
 		}
-		return entries[i].idx > entries[j].idx
+		return cmp > 0
 	})
 
 	start := 0
@@ -2252,9 +2327,10 @@ func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecon
 
 func orderItemsForLSI(items []map[string]any, t model.Table, l model.LocalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
 	type entry struct {
-		item  map[string]any
-		lsiSK string
-		tblSK string
+		item   map[string]any
+		lsiRaw any
+		tblRaw any
+		tblSK  string
 	}
 
 	entries := make([]entry, 0, len(items))
@@ -2263,35 +2339,36 @@ func orderItemsForLSI(items []map[string]any, t model.Table, l model.LocalSecond
 		if !ok {
 			continue
 		}
-		lsiSK, err := model.SerializeKeyValue(raw)
-		if err != nil {
-			continue
-		}
+		lsiRaw := raw
 		tblSK := model.NoSortKey
+		tblRaw := any(nil)
 		if t.RangeKey != "" {
 			rawTableSK, ok := item[t.RangeKey]
 			if !ok {
 				continue
 			}
+			tblRaw = rawTableSK
+			var err error
 			tblSK, err = model.SerializeKeyValue(rawTableSK)
 			if err != nil {
 				continue
 			}
 		}
-		entries = append(entries, entry{item: item, lsiSK: lsiSK, tblSK: tblSK})
+		entries = append(entries, entry{item: item, lsiRaw: lsiRaw, tblRaw: tblRaw, tblSK: tblSK})
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].lsiSK == entries[j].lsiSK {
+		cmp := compareAttributeValues(entries[i].lsiRaw, entries[j].lsiRaw)
+		if cmp == 0 {
 			if scanForward {
 				return entries[i].tblSK < entries[j].tblSK
 			}
 			return entries[i].tblSK > entries[j].tblSK
 		}
 		if scanForward {
-			return entries[i].lsiSK < entries[j].lsiSK
+			return cmp < 0
 		}
-		return entries[i].lsiSK > entries[j].lsiSK
+		return cmp > 0
 	})
 
 	if len(exclusiveStartKey) == 0 {
@@ -2338,6 +2415,59 @@ func orderItemsForLSI(items []map[string]any, t model.Table, l model.LocalSecond
 		out = append(out, entries[i].item)
 	}
 	return out, nil
+}
+
+func compareAttributeValues(a any, b any) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+
+	if an, ok := numberFromAttr(a); ok {
+		if bn, ok := numberFromAttr(b); ok {
+			if an < bn {
+				return -1
+			}
+			if an > bn {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	as, errA := model.SerializeKeyValue(a)
+	bs, errB := model.SerializeKeyValue(b)
+	if errA != nil || errB != nil {
+		return 0
+	}
+	if as < bs {
+		return -1
+	}
+	if as > bs {
+		return 1
+	}
+	return 0
+}
+
+func numberFromAttr(v any) (float64, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	n, ok := m["N"].(string)
+	if !ok {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(n, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
 }
 
 func firstNonEmpty(v string, fallback string) string {
@@ -2472,6 +2602,54 @@ func addConsumedCapacity(resp map[string]any, capacity string, tableName string,
 		entry["CapacityUnits"] = readUnits + writeUnits
 	}
 	resp["ConsumedCapacity"] = append(list, entry)
+}
+
+func setSingleConsumedCapacity(resp map[string]any, capacity string, tableName string, readUnits, writeUnits float64) {
+	if capacity == "" || capacity == "NONE" {
+		return
+	}
+	entry := map[string]any{"TableName": tableName}
+	if readUnits > 0 {
+		entry["ReadCapacityUnits"] = readUnits
+		entry["CapacityUnits"] = readUnits
+	}
+	if writeUnits > 0 {
+		entry["WriteCapacityUnits"] = writeUnits
+		entry["CapacityUnits"] = writeUnits
+	}
+	if readUnits > 0 && writeUnits > 0 {
+		entry["CapacityUnits"] = readUnits + writeUnits
+	}
+	resp["ConsumedCapacity"] = entry
+}
+
+func setSingleQueryConsumedCapacity(resp map[string]any, mode string, tableName, indexName, indexType string, readUnits float64) {
+	if mode == "" || mode == "NONE" {
+		return
+	}
+	entry := map[string]any{
+		"TableName":         tableName,
+		"ReadCapacityUnits": readUnits,
+		"CapacityUnits":     readUnits,
+	}
+	if mode == "INDEXES" && strings.TrimSpace(indexName) != "" {
+		if indexType == "GSI" {
+			entry["GlobalSecondaryIndexes"] = map[string]any{
+				indexName: map[string]any{
+					"ReadCapacityUnits": readUnits,
+					"CapacityUnits":     readUnits,
+				},
+			}
+		} else if indexType == "LSI" {
+			entry["LocalSecondaryIndexes"] = map[string]any{
+				indexName: map[string]any{
+					"ReadCapacityUnits": readUnits,
+					"CapacityUnits":     readUnits,
+				},
+			}
+		}
+	}
+	resp["ConsumedCapacity"] = entry
 }
 
 func addQueryConsumedCapacity(resp map[string]any, mode string, tableName, indexName, indexType string, readUnits float64) {
