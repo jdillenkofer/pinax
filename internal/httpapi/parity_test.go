@@ -249,6 +249,16 @@ func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected table to be removed after deletion transition")
 	}
+
+	listOut, err := client.ListTables(ctx, &dynamodb.ListTablesInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range listOut.TableNames {
+		if name == "dellife" {
+			t.Fatal("did not expect deleted table in ListTables response")
+		}
+	}
 }
 
 func TestScanFilterLimitReturnsLastEvaluatedKeyByScannedItems(t *testing.T) {

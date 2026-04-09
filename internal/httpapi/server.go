@@ -441,14 +441,26 @@ func (s *Server) listTables(r *http.Request, body []byte) (map[string]any, error
 	if err != nil {
 		return nil, err
 	}
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		t, err := s.getTableWithLifecycle(r.Context(), tx, name)
+		if err != nil {
+			var apiErr *awserr.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+				continue
+			}
+			return nil, err
+		}
+		filtered = append(filtered, t.Name)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	resp := map[string]any{"TableNames": names}
-	if req.Limit > 0 && len(names) == req.Limit {
-		resp["LastEvaluatedTableName"] = names[len(names)-1]
+	resp := map[string]any{"TableNames": filtered}
+	if req.Limit > 0 && len(filtered) == req.Limit {
+		resp["LastEvaluatedTableName"] = filtered[len(filtered)-1]
 	}
 	return resp, nil
 }
