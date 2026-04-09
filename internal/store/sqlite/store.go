@@ -644,3 +644,229 @@ func (s *Store) DeleteExpiredItems(ctx context.Context, tx *sql.Tx, tableName st
 	}
 	return deleted, nil
 }
+
+func (s *Store) CreateBackup(ctx context.Context, tx *sql.Tx, backup model.Backup) error {
+	sourceTableDetailsJSON, err := json.Marshal(backup.SourceTableDetails)
+	if err != nil {
+		return err
+	}
+	sourceTableFeatureDetailsJSON, err := json.Marshal(backup.SourceTableFeatureDetails)
+	if err != nil {
+		return err
+	}
+	snapshotTableJSON, err := json.Marshal(backup.SnapshotTable)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO backups(
+			backup_arn,
+			backup_name,
+			table_name,
+			table_arn,
+			table_id,
+			backup_status,
+			backup_type,
+			backup_creation_date_time,
+			backup_size_bytes,
+			source_table_details_json,
+			source_table_feature_details_json,
+			snapshot_table_json
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, backup.BackupARN, backup.BackupName, backup.TableName, backup.TableARN, backup.TableID, backup.BackupStatus, backup.BackupType, backup.BackupCreationDateTime, backup.BackupSizeBytes, string(sourceTableDetailsJSON), string(sourceTableFeatureDetailsJSON), string(snapshotTableJSON))
+	if err != nil {
+		return err
+	}
+	for i, item := range backup.SnapshotItems {
+		raw, err := json.Marshal(item)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO backup_items(backup_arn, ordinal, item_json)
+			VALUES (?, ?, ?)
+		`, backup.BackupARN, i, raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) GetBackup(ctx context.Context, tx *sql.Tx, backupARN string) (model.Backup, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT
+			backup_arn,
+			backup_name,
+			table_name,
+			table_arn,
+			table_id,
+			backup_status,
+			backup_type,
+			backup_creation_date_time,
+			backup_size_bytes,
+			source_table_details_json,
+			source_table_feature_details_json,
+			snapshot_table_json
+		FROM backups
+		WHERE backup_arn = ?
+	`, backupARN)
+	backup, err := scanBackupMetadata(row)
+	if err != nil {
+		return model.Backup{}, err
+	}
+	items, err := loadBackupItems(ctx, tx, backup.BackupARN)
+	if err != nil {
+		return model.Backup{}, err
+	}
+	backup.SnapshotItems = items
+	return backup, nil
+}
+
+func (s *Store) GetBackupByName(ctx context.Context, tx *sql.Tx, backupName string) (model.Backup, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT
+			backup_arn,
+			backup_name,
+			table_name,
+			table_arn,
+			table_id,
+			backup_status,
+			backup_type,
+			backup_creation_date_time,
+			backup_size_bytes,
+			source_table_details_json,
+			source_table_feature_details_json,
+			snapshot_table_json
+		FROM backups
+		WHERE backup_name = ?
+	`, backupName)
+	backup, err := scanBackupMetadata(row)
+	if err != nil {
+		return model.Backup{}, err
+	}
+	items, err := loadBackupItems(ctx, tx, backup.BackupARN)
+	if err != nil {
+		return model.Backup{}, err
+	}
+	backup.SnapshotItems = items
+	return backup, nil
+}
+
+func (s *Store) ListBackups(ctx context.Context, tx *sql.Tx) ([]model.Backup, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT
+			backup_arn,
+			backup_name,
+			table_name,
+			table_arn,
+			table_id,
+			backup_status,
+			backup_type,
+			backup_creation_date_time,
+			backup_size_bytes,
+			source_table_details_json,
+			source_table_feature_details_json,
+			snapshot_table_json
+		FROM backups
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]model.Backup, 0)
+	for rows.Next() {
+		backup, err := scanBackupMetadata(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, backup)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteBackup(ctx context.Context, tx *sql.Tx, backupARN string) error {
+	res, err := tx.ExecContext(ctx, `DELETE FROM backups WHERE backup_arn = ?`, backupARN)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+type backupScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanBackupMetadata(scanner backupScanner) (model.Backup, error) {
+	var backup model.Backup
+	var sourceTableDetailsJSON string
+	var sourceTableFeatureDetailsJSON string
+	var snapshotTableJSON string
+	if err := scanner.Scan(
+		&backup.BackupARN,
+		&backup.BackupName,
+		&backup.TableName,
+		&backup.TableARN,
+		&backup.TableID,
+		&backup.BackupStatus,
+		&backup.BackupType,
+		&backup.BackupCreationDateTime,
+		&backup.BackupSizeBytes,
+		&sourceTableDetailsJSON,
+		&sourceTableFeatureDetailsJSON,
+		&snapshotTableJSON,
+	); err != nil {
+		return model.Backup{}, err
+	}
+	if err := json.Unmarshal([]byte(sourceTableDetailsJSON), &backup.SourceTableDetails); err != nil {
+		return model.Backup{}, err
+	}
+	if err := json.Unmarshal([]byte(sourceTableFeatureDetailsJSON), &backup.SourceTableFeatureDetails); err != nil {
+		return model.Backup{}, err
+	}
+	if err := json.Unmarshal([]byte(snapshotTableJSON), &backup.SnapshotTable); err != nil {
+		return model.Backup{}, err
+	}
+	return backup, nil
+}
+
+func loadBackupItems(ctx context.Context, tx *sql.Tx, backupARN string) ([]map[string]any, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT item_json
+		FROM backup_items
+		WHERE backup_arn = ?
+		ORDER BY ordinal ASC
+	`, backupARN)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

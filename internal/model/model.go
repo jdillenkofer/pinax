@@ -15,6 +15,11 @@ const (
 	TableStatusUpdating = "UPDATING"
 	TableStatusDeleting = "DELETING"
 
+	BackupStatusCreating  = "CREATING"
+	BackupStatusAvailable = "AVAILABLE"
+	BackupStatusDeleted   = "DELETED"
+	BackupTypeUser        = "USER"
+
 	IndexStatusActive   = "ACTIVE"
 	IndexStatusCreating = "CREATING"
 	IndexStatusDeleting = "DELETING"
@@ -30,6 +35,22 @@ type TimeToLive struct {
 	AttrName string
 	Status   string
 	StatusAt int64
+}
+
+type Backup struct {
+	BackupARN                 string
+	BackupName                string
+	TableName                 string
+	TableARN                  string
+	TableID                   string
+	BackupStatus              string
+	BackupType                string
+	BackupCreationDateTime    int64
+	BackupSizeBytes           int64
+	SourceTableDetails        map[string]any
+	SourceTableFeatureDetails map[string]any
+	SnapshotTable             Table
+	SnapshotItems             []map[string]any
 }
 
 type Table struct {

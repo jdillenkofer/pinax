@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -332,6 +333,16 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.updateTimeToLive(r, body)
 	case "DescribeTimeToLive":
 		return s.describeTimeToLive(r, body)
+	case "CreateBackup":
+		return s.createBackup(r, body)
+	case "DescribeBackup":
+		return s.describeBackup(r, body)
+	case "ListBackups":
+		return s.listBackups(r, body)
+	case "DeleteBackup":
+		return s.deleteBackup(r, body)
+	case "RestoreTableFromBackup":
+		return s.restoreTableFromBackup(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -719,6 +730,427 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 
 	return map[string]any{"TableDescription": t.Description(count)}, nil
+}
+
+var backupNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,255}$`)
+
+type createBackupRequest struct {
+	BackupName string `json:"BackupName"`
+	TableName  string `json:"TableName"`
+}
+
+type backupArnRequest struct {
+	BackupArn string `json:"BackupArn"`
+}
+
+type listBackupsRequest struct {
+	BackupType              string   `json:"BackupType"`
+	ExclusiveStartBackupArn string   `json:"ExclusiveStartBackupArn"`
+	Limit                   int      `json:"Limit"`
+	TableName               string   `json:"TableName"`
+	TimeRangeLowerBound     *float64 `json:"TimeRangeLowerBound"`
+	TimeRangeUpperBound     *float64 `json:"TimeRangeUpperBound"`
+}
+
+type restoreTableFromBackupRequest struct {
+	BackupArn                  string `json:"BackupArn"`
+	TargetTableName            string `json:"TargetTableName"`
+	BillingModeOverride        string `json:"BillingModeOverride"`
+	OnDemandThroughputOverride *struct {
+		MaxReadRequestUnits  int64 `json:"MaxReadRequestUnits"`
+		MaxWriteRequestUnits int64 `json:"MaxWriteRequestUnits"`
+	} `json:"OnDemandThroughputOverride"`
+	ProvisionedThroughputOverride *struct {
+		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+	} `json:"ProvisionedThroughputOverride"`
+	SSESpecificationOverride *struct {
+		Enabled        bool   `json:"Enabled"`
+		SSEType        string `json:"SSEType"`
+		KMSMasterKeyID string `json:"KMSMasterKeyId"`
+	} `json:"SSESpecificationOverride"`
+	GlobalSecondaryIndexOverride []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+			WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+		} `json:"ProvisionedThroughput"`
+	} `json:"GlobalSecondaryIndexOverride"`
+	LocalSecondaryIndexOverride []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+	} `json:"LocalSecondaryIndexOverride"`
+}
+
+func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, error) {
+	var req createBackupRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.BackupName) == "" {
+		return nil, awserr.Validation("BackupName is required")
+	}
+	if !backupNamePattern.MatchString(req.BackupName) {
+		return nil, awserr.Validation("BackupName must match [a-zA-Z0-9_.-]+ and be between 3 and 255 characters")
+	}
+	if strings.TrimSpace(req.TableName) == "" {
+		return nil, awserr.Validation("TableName is required")
+	}
+
+	tableName := normalizeTableNameIdentifier(req.TableName)
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+	if t.Status != model.TableStatusActive {
+		return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
+	}
+
+	if _, err := s.store.GetBackupByName(r.Context(), tx, req.BackupName); err == nil {
+		return nil, &awserr.APIError{Code: "BackupInUseException", Message: "Backup with the requested name already exists", Status: http.StatusBadRequest}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	count, err := s.store.CountItems(r.Context(), tx, t.Name)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	tableDesc := t.Description(count)
+	now := time.Now().Unix()
+	backup := model.Backup{
+		BackupARN:                 localBackupARN(t.Name, req.BackupName, now),
+		BackupName:                req.BackupName,
+		TableName:                 t.Name,
+		TableARN:                  anyString(tableDesc["TableArn"]),
+		TableID:                   anyString(tableDesc["TableId"]),
+		BackupStatus:              model.BackupStatusAvailable,
+		BackupType:                model.BackupTypeUser,
+		BackupCreationDateTime:    now,
+		BackupSizeBytes:           estimateBackupSizeBytes(items),
+		SourceTableDetails:        sourceTableDetailsFromDescription(tableDesc, count),
+		SourceTableFeatureDetails: sourceTableFeatureDetailsFromDescription(tableDesc),
+		SnapshotTable:             t,
+		SnapshotItems:             items,
+	}
+	if err := s.store.CreateBackup(r.Context(), tx, backup); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return nil, &awserr.APIError{Code: "BackupInUseException", Message: "Backup with the requested name already exists", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"BackupDetails": backupDetailsMap(backup)}, nil
+}
+
+func (s *Server) describeBackup(r *http.Request, body []byte) (map[string]any, error) {
+	var req backupArnRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.BackupArn) == "" {
+		return nil, awserr.Validation("BackupArn is required")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"BackupDescription": backupDescriptionMap(backup)}, nil
+}
+
+func (s *Server) deleteBackup(r *http.Request, body []byte) (map[string]any, error) {
+	var req backupArnRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.BackupArn) == "" {
+		return nil, awserr.Validation("BackupArn is required")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+	deleted := backup
+	deleted.BackupStatus = model.BackupStatusDeleted
+	if err := s.store.DeleteBackup(r.Context(), tx, req.BackupArn); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"BackupDescription": backupDescriptionMap(deleted)}, nil
+}
+
+func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, error) {
+	var req listBackupsRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	backupType := strings.TrimSpace(req.BackupType)
+	if backupType == "" {
+		backupType = model.BackupTypeUser
+	}
+	switch backupType {
+	case model.BackupTypeUser, "SYSTEM", "AWS_BACKUP", "ALL":
+	default:
+		return nil, awserr.Validation("invalid BackupType")
+	}
+	if req.Limit < 0 || req.Limit > 100 {
+		return nil, awserr.Validation("Limit must be between 1 and 100")
+	}
+	if req.Limit == 0 {
+		req.Limit = 100
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	backups, err := s.store.ListBackups(r.Context(), tx)
+	if err != nil {
+		return nil, err
+	}
+
+	tableNameFilter := normalizeTableNameIdentifier(req.TableName)
+	filtered := make([]model.Backup, 0, len(backups))
+	for _, b := range backups {
+		if backupType == model.BackupTypeUser && b.BackupType != model.BackupTypeUser {
+			continue
+		}
+		if backupType == "SYSTEM" || backupType == "AWS_BACKUP" {
+			continue
+		}
+		if tableNameFilter != "" && b.TableName != tableNameFilter && b.TableARN != strings.TrimSpace(req.TableName) {
+			continue
+		}
+		if req.TimeRangeLowerBound != nil && float64(b.BackupCreationDateTime) < *req.TimeRangeLowerBound {
+			continue
+		}
+		if req.TimeRangeUpperBound != nil && float64(b.BackupCreationDateTime) >= *req.TimeRangeUpperBound {
+			continue
+		}
+		filtered = append(filtered, b)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].BackupCreationDateTime == filtered[j].BackupCreationDateTime {
+			return filtered[i].BackupARN > filtered[j].BackupARN
+		}
+		return filtered[i].BackupCreationDateTime > filtered[j].BackupCreationDateTime
+	})
+
+	start := 0
+	if strings.TrimSpace(req.ExclusiveStartBackupArn) != "" {
+		found := -1
+		for i, b := range filtered {
+			if b.BackupARN == req.ExclusiveStartBackupArn {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			return nil, awserr.Validation("ExclusiveStartBackupArn not found")
+		}
+		start = found + 1
+	}
+
+	if start > len(filtered) {
+		start = len(filtered)
+	}
+	end := start + req.Limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	page := filtered[start:end]
+
+	summaries := make([]map[string]any, 0, len(page))
+	for _, b := range page {
+		summaries = append(summaries, backupSummaryMap(b))
+	}
+
+	resp := map[string]any{"BackupSummaries": summaries}
+	if end < len(filtered) && len(page) > 0 {
+		resp["LastEvaluatedBackupArn"] = page[len(page)-1].BackupARN
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[string]any, error) {
+	var req restoreTableFromBackupRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.BackupArn) == "" {
+		return nil, awserr.Validation("BackupArn is required")
+	}
+	if strings.TrimSpace(req.TargetTableName) == "" {
+		return nil, awserr.Validation("TargetTableName is required")
+	}
+	if !backupNamePattern.MatchString(req.TargetTableName) {
+		return nil, awserr.Validation("TargetTableName must match [a-zA-Z0-9_.-]+ and be between 3 and 255 characters")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	if existing, err := s.store.GetTable(r.Context(), tx, req.TargetTableName); err == nil {
+		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
+			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
+		}
+		return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	tableToCreate := backup.SnapshotTable
+	tableToCreate.Name = req.TargetTableName
+	tableToCreate.Status = model.TableStatusCreating
+	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
+	tableToCreate.CreatedAt = time.Now().Unix()
+
+	billingMode := tableToCreate.BillingMode
+	readCapacity := tableToCreate.ReadCapacityUnits
+	writeCapacity := tableToCreate.WriteCapacityUnits
+	if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
+		billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+	}
+	tableToCreate.BillingMode = billingMode
+	tableToCreate.ReadCapacityUnits = readCapacity
+	tableToCreate.WriteCapacityUnits = writeCapacity
+
+	if req.SSESpecificationOverride != nil {
+		normalizedSSE, err := normalizeSSESpecCreate(&struct {
+			Enabled        bool   `json:"Enabled"`
+			SSEType        string `json:"SSEType"`
+			KMSMasterKeyID string `json:"KMSMasterKeyId"`
+		}{
+			Enabled:        req.SSESpecificationOverride.Enabled,
+			SSEType:        req.SSESpecificationOverride.SSEType,
+			KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
+		})
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		tableToCreate.SSE = normalizedSSE
+	}
+
+	if req.OnDemandThroughputOverride != nil {
+		if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
+			return nil, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
+		}
+	}
+
+	updatedGSIs, err := applyRestoreGSIOverride(tableToCreate.GSIs, req.GlobalSecondaryIndexOverride, tableToCreate.BillingMode)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tableToCreate.GSIs = updatedGSIs
+	updatedLSIs, err := applyRestoreLSIOverride(tableToCreate.LSIs, req.LocalSecondaryIndexOverride)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tableToCreate.LSIs = updatedLSIs
+
+	if err := s.store.CreateTable(r.Context(), tx, tableToCreate); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+	for _, item := range backup.SnapshotItems {
+		pk, sk, err := model.ExtractItemKeys(tableToCreate, item)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if err := s.store.PutItem(r.Context(), tx, tableToCreate.Name, pk, sk, item); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"TableDescription": tableToCreate.Description(int64(len(backup.SnapshotItems)))}, nil
 }
 
 type putItemRequest struct {
@@ -3095,6 +3527,268 @@ func normalizeBillingConfig(mode string, throughput *struct {
 	default:
 		return "", 0, 0, fmt.Errorf("unsupported BillingMode %q", mode)
 	}
+}
+
+func normalizeTableNameIdentifier(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "arn:") {
+		parts := strings.Split(v, "/")
+		if len(parts) >= 2 {
+			for i := 0; i < len(parts)-1; i++ {
+				if parts[i] == "table" {
+					return strings.TrimSpace(parts[i+1])
+				}
+			}
+		}
+	}
+	return v
+}
+
+func localBackupARN(tableName string, backupName string, createdAt int64) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(tableName + "|" + backupName + "|" + strconv.FormatInt(createdAt, 10)))
+	return fmt.Sprintf("arn:aws:dynamodb:local:000000000000:table/%s/backup/%016x", tableName, h.Sum64())
+}
+
+func anyString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func estimateBackupSizeBytes(items []map[string]any) int64 {
+	var total int64
+	for _, item := range items {
+		total += int64(model.CalculateItemSizeBytes(item))
+	}
+	return total
+}
+
+func sourceTableDetailsFromDescription(tableDescription map[string]any, itemCount int64) map[string]any {
+	resp := map[string]any{
+		"TableName":             tableDescription["TableName"],
+		"TableArn":              tableDescription["TableArn"],
+		"TableId":               tableDescription["TableId"],
+		"TableCreationDateTime": tableDescription["CreationDateTime"],
+		"KeySchema":             tableDescription["KeySchema"],
+		"TableSizeBytes":        tableDescription["TableSizeBytes"],
+		"ItemCount":             itemCount,
+	}
+	if billingModeSummary, ok := tableDescription["BillingModeSummary"].(map[string]any); ok {
+		resp["BillingMode"] = billingModeSummary["BillingMode"]
+	}
+	if throughput, ok := tableDescription["ProvisionedThroughput"].(map[string]any); ok {
+		resp["ProvisionedThroughput"] = map[string]any{
+			"ReadCapacityUnits":  throughput["ReadCapacityUnits"],
+			"WriteCapacityUnits": throughput["WriteCapacityUnits"],
+		}
+	}
+	return resp
+}
+
+func sourceTableFeatureDetailsFromDescription(tableDescription map[string]any) map[string]any {
+	resp := map[string]any{}
+	if gsis, ok := tableDescription["GlobalSecondaryIndexes"]; ok {
+		resp["GlobalSecondaryIndexes"] = gsis
+	}
+	if lsis, ok := tableDescription["LocalSecondaryIndexes"]; ok {
+		resp["LocalSecondaryIndexes"] = lsis
+	}
+	if stream, ok := tableDescription["StreamSpecification"]; ok {
+		resp["StreamDescription"] = stream
+	}
+	if sse, ok := tableDescription["SSEDescription"]; ok {
+		resp["SSEDescription"] = sse
+	}
+	if ttl, ok := tableDescription["TimeToLive"]; ok {
+		resp["TimeToLiveDescription"] = ttl
+	}
+	return resp
+}
+
+func backupDetailsMap(backup model.Backup) map[string]any {
+	return map[string]any{
+		"BackupArn":              backup.BackupARN,
+		"BackupName":             backup.BackupName,
+		"BackupStatus":           backup.BackupStatus,
+		"BackupType":             backup.BackupType,
+		"BackupCreationDateTime": backup.BackupCreationDateTime,
+		"BackupSizeBytes":        backup.BackupSizeBytes,
+	}
+}
+
+func backupSummaryMap(backup model.Backup) map[string]any {
+	out := backupDetailsMap(backup)
+	out["TableName"] = backup.TableName
+	out["TableArn"] = backup.TableARN
+	out["TableId"] = backup.TableID
+	return out
+}
+
+func backupDescriptionMap(backup model.Backup) map[string]any {
+	return map[string]any{
+		"BackupDetails":             backupDetailsMap(backup),
+		"SourceTableDetails":        backup.SourceTableDetails,
+		"SourceTableFeatureDetails": backup.SourceTableFeatureDetails,
+	}
+}
+
+func applyRestoreGSIOverride(source []model.GlobalSecondaryIndex, overrides []struct {
+	IndexName string `json:"IndexName"`
+	KeySchema []struct {
+		AttributeName string `json:"AttributeName"`
+		KeyType       string `json:"KeyType"`
+	} `json:"KeySchema"`
+	Projection struct {
+		ProjectionType   string   `json:"ProjectionType"`
+		NonKeyAttributes []string `json:"NonKeyAttributes"`
+	} `json:"Projection"`
+	ProvisionedThroughput *struct {
+		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+	} `json:"ProvisionedThroughput"`
+}, billingMode string) ([]model.GlobalSecondaryIndex, error) {
+	if len(overrides) == 0 {
+		return source, nil
+	}
+	byName := map[string]model.GlobalSecondaryIndex{}
+	for _, g := range source {
+		byName[g.IndexName] = g
+	}
+	out := make([]model.GlobalSecondaryIndex, 0, len(overrides))
+	for _, o := range overrides {
+		if strings.TrimSpace(o.IndexName) == "" {
+			return nil, fmt.Errorf("GlobalSecondaryIndexOverride IndexName is required")
+		}
+		g, ok := byName[o.IndexName]
+		if !ok {
+			return nil, fmt.Errorf("GlobalSecondaryIndexOverride contains unknown index %q", o.IndexName)
+		}
+		if len(o.KeySchema) > 0 {
+			if !gsiKeySchemaMatches(g, o.KeySchema) {
+				return nil, fmt.Errorf("GlobalSecondaryIndexOverride KeySchema must match source index %q", o.IndexName)
+			}
+		}
+		if strings.TrimSpace(o.Projection.ProjectionType) != "" || len(o.Projection.NonKeyAttributes) > 0 {
+			projType, attrs, err := normalizeIndexProjection(o.Projection.ProjectionType, o.Projection.NonKeyAttributes)
+			if err != nil {
+				return nil, err
+			}
+			if projType != g.ProjectionType || !stringSlicesEqual(attrs, g.NonKeyAttrs) {
+				return nil, fmt.Errorf("GlobalSecondaryIndexOverride Projection must match source index %q", o.IndexName)
+			}
+		}
+		if o.ProvisionedThroughput != nil {
+			if billingMode != "PROVISIONED" {
+				return nil, fmt.Errorf("ProvisionedThroughput for global secondary indexes is only allowed when table BillingMode is PROVISIONED")
+			}
+			if o.ProvisionedThroughput.ReadCapacityUnits <= 0 || o.ProvisionedThroughput.WriteCapacityUnits <= 0 {
+				return nil, fmt.Errorf("ProvisionedThroughput ReadCapacityUnits and WriteCapacityUnits must be greater than 0")
+			}
+			g.ReadCapacity = o.ProvisionedThroughput.ReadCapacityUnits
+			g.WriteCapacity = o.ProvisionedThroughput.WriteCapacityUnits
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+func applyRestoreLSIOverride(source []model.LocalSecondaryIndex, overrides []struct {
+	IndexName string `json:"IndexName"`
+	KeySchema []struct {
+		AttributeName string `json:"AttributeName"`
+		KeyType       string `json:"KeyType"`
+	} `json:"KeySchema"`
+	Projection struct {
+		ProjectionType   string   `json:"ProjectionType"`
+		NonKeyAttributes []string `json:"NonKeyAttributes"`
+	} `json:"Projection"`
+}) ([]model.LocalSecondaryIndex, error) {
+	if len(overrides) == 0 {
+		return source, nil
+	}
+	byName := map[string]model.LocalSecondaryIndex{}
+	for _, l := range source {
+		byName[l.IndexName] = l
+	}
+	out := make([]model.LocalSecondaryIndex, 0, len(overrides))
+	for _, o := range overrides {
+		if strings.TrimSpace(o.IndexName) == "" {
+			return nil, fmt.Errorf("LocalSecondaryIndexOverride IndexName is required")
+		}
+		l, ok := byName[o.IndexName]
+		if !ok {
+			return nil, fmt.Errorf("LocalSecondaryIndexOverride contains unknown index %q", o.IndexName)
+		}
+		if len(o.KeySchema) > 0 {
+			if !lsiKeySchemaMatches(l, o.KeySchema) {
+				return nil, fmt.Errorf("LocalSecondaryIndexOverride KeySchema must match source index %q", o.IndexName)
+			}
+		}
+		if strings.TrimSpace(o.Projection.ProjectionType) != "" || len(o.Projection.NonKeyAttributes) > 0 {
+			projType, attrs, err := normalizeIndexProjection(o.Projection.ProjectionType, o.Projection.NonKeyAttributes)
+			if err != nil {
+				return nil, err
+			}
+			if projType != l.ProjectionType || !stringSlicesEqual(attrs, l.NonKeyAttrs) {
+				return nil, fmt.Errorf("LocalSecondaryIndexOverride Projection must match source index %q", o.IndexName)
+			}
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+func gsiKeySchemaMatches(g model.GlobalSecondaryIndex, keySchema []struct {
+	AttributeName string `json:"AttributeName"`
+	KeyType       string `json:"KeyType"`
+}) bool {
+	expected := map[string]string{"HASH": g.HashKey}
+	if g.RangeKey != "" {
+		expected["RANGE"] = g.RangeKey
+	}
+	if len(keySchema) != len(expected) {
+		return false
+	}
+	for _, ks := range keySchema {
+		if expected[strings.TrimSpace(ks.KeyType)] != strings.TrimSpace(ks.AttributeName) {
+			return false
+		}
+	}
+	return true
+}
+
+func lsiKeySchemaMatches(l model.LocalSecondaryIndex, keySchema []struct {
+	AttributeName string `json:"AttributeName"`
+	KeyType       string `json:"KeyType"`
+}) bool {
+	if len(keySchema) != 2 {
+		return false
+	}
+	hashMatch := false
+	rangeMatch := false
+	for _, ks := range keySchema {
+		switch strings.TrimSpace(ks.KeyType) {
+		case "HASH":
+			hashMatch = strings.TrimSpace(ks.AttributeName) != ""
+		case "RANGE":
+			rangeMatch = strings.TrimSpace(ks.AttributeName) == l.RangeKey
+		}
+	}
+	return hashMatch && rangeMatch
+}
+
+func stringSlicesEqual(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func projectItemForGSI(item map[string]any, t model.Table, g model.GlobalSecondaryIndex) map[string]any {

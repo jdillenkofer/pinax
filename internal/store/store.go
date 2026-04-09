@@ -34,4 +34,9 @@ type Store interface {
 	}, error)
 	DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error
 	DeleteExpiredItems(ctx context.Context, tx *sql.Tx, tableName string, before int64, limit int) (int64, error)
+	CreateBackup(ctx context.Context, tx *sql.Tx, backup model.Backup) error
+	GetBackup(ctx context.Context, tx *sql.Tx, backupARN string) (model.Backup, error)
+	GetBackupByName(ctx context.Context, tx *sql.Tx, backupName string) (model.Backup, error)
+	ListBackups(ctx context.Context, tx *sql.Tx) ([]model.Backup, error)
+	DeleteBackup(ctx context.Context, tx *sql.Tx, backupARN string) error
 }
