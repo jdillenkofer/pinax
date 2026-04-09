@@ -9,11 +9,204 @@ import (
 )
 
 type updatePlan struct {
-	Set          map[string]any
-	Remove       []string
-	Add          map[string]any
-	Delete       map[string]any
+	Set          []setAction
+	Remove       []documentPath
+	Add          []addAction
+	Delete       []deleteAction
 	TouchedAttrs map[string]struct{}
+}
+
+type setAction struct {
+	target documentPath
+	value  setValueExpr
+}
+
+type addAction struct {
+	target documentPath
+	value  any
+}
+
+type deleteAction struct {
+	target documentPath
+	value  any
+}
+
+type setValueExpr interface {
+	resolve(item map[string]any) (any, error)
+}
+
+type valueLiteralExpr struct{ value any }
+
+func (e valueLiteralExpr) resolve(item map[string]any) (any, error) { return e.value, nil }
+
+type pathValueExpr struct{ path documentPath }
+
+func (e pathValueExpr) resolve(item map[string]any) (any, error) {
+	v, ok, err := getAtPath(item, e.path)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("The provided expression refers to an attribute that does not exist in the item")
+	}
+	return v, nil
+}
+
+type ifNotExistsExpr struct {
+	path       documentPath
+	defaultVal setValueExpr
+}
+
+func (e ifNotExistsExpr) resolve(item map[string]any) (any, error) {
+	v, ok, err := getAtPath(item, e.path)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return v, nil
+	}
+	return e.defaultVal.resolve(item)
+}
+
+type listAppendExpr struct {
+	left  setValueExpr
+	right setValueExpr
+}
+
+func (e listAppendExpr) resolve(item map[string]any) (any, error) {
+	left, err := e.left.resolve(item)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.right.resolve(item)
+	if err != nil {
+		return nil, err
+	}
+	ll, err := asList(left)
+	if err != nil {
+		return nil, err
+	}
+	rl, err := asList(right)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]any, 0, len(ll)+len(rl))
+	out = append(out, ll...)
+	out = append(out, rl...)
+	return map[string]any{"L": out}, nil
+}
+
+type arithmeticExpr struct {
+	left  setValueExpr
+	right setValueExpr
+	op    string
+}
+
+func (e arithmeticExpr) resolve(item map[string]any) (any, error) {
+	left, err := e.left.resolve(item)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.right.resolve(item)
+	if err != nil {
+		return nil, err
+	}
+	ln, ok := exprNumber(left)
+	if !ok {
+		return nil, fmt.Errorf("arithmetic updates require N attributes")
+	}
+	rn, ok := exprNumber(right)
+	if !ok {
+		return nil, fmt.Errorf("arithmetic updates require N expression values")
+	}
+	switch e.op {
+	case "+":
+		ln += rn
+	case "-":
+		ln -= rn
+	default:
+		return nil, fmt.Errorf("unsupported arithmetic operator %s", e.op)
+	}
+	return map[string]any{"N": trimTrailingZeros(ln)}, nil
+}
+
+type documentPath struct {
+	segments []pathSegment
+}
+
+type pathSegment struct {
+	name    string
+	indexes []int
+}
+
+func isTopLevelPath(p documentPath) bool {
+	return len(p.segments) == 1 && len(p.segments[0].indexes) == 0
+}
+
+func hasPathOverlap(plan updatePlan) bool {
+	paths := []documentPath{}
+	for _, a := range plan.Set {
+		paths = append(paths, a.target)
+	}
+	for _, p := range plan.Remove {
+		paths = append(paths, p)
+	}
+	for _, a := range plan.Add {
+		paths = append(paths, a.target)
+	}
+	for _, a := range plan.Delete {
+		paths = append(paths, a.target)
+	}
+	for i := 0; i < len(paths); i++ {
+		for j := i + 1; j < len(paths); j++ {
+			if documentPathsOverlap(paths[i], paths[j]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func documentPathsOverlap(a documentPath, b documentPath) bool {
+	minLen := len(a.segments)
+	if len(b.segments) < minLen {
+		minLen = len(b.segments)
+	}
+	if minLen == 0 {
+		return false
+	}
+	for i := 0; i < minLen; i++ {
+		as := a.segments[i]
+		bs := b.segments[i]
+		if as.name != bs.name {
+			return false
+		}
+		if len(as.indexes) != len(bs.indexes) {
+			prefixLen := len(as.indexes)
+			if len(bs.indexes) < prefixLen {
+				prefixLen = len(bs.indexes)
+			}
+			for k := 0; k < prefixLen; k++ {
+				if as.indexes[k] != bs.indexes[k] {
+					return false
+				}
+			}
+			return true
+		}
+		for k := 0; k < len(as.indexes); k++ {
+			if as.indexes[k] != bs.indexes[k] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (p documentPath) topLevel() string {
+	if len(p.segments) == 0 {
+		return ""
+	}
+	return p.segments[0].name
 }
 
 func parseUpdateExpression(raw string, names map[string]string, values map[string]any) (updatePlan, error) {
@@ -22,179 +215,235 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 		return updatePlan{}, fmt.Errorf("UpdateExpression is required")
 	}
 
-	plan := updatePlan{Set: map[string]any{}, Add: map[string]any{}, Delete: map[string]any{}, Remove: []string{}, TouchedAttrs: map[string]struct{}{}}
-	upper := strings.ToUpper(raw)
+	clauses, err := parseUpdateClauses(raw)
+	if err != nil {
+		return updatePlan{}, err
+	}
 
-	keywords := []string{"SET", "REMOVE", "ADD", "DELETE"}
+	plan := updatePlan{TouchedAttrs: map[string]struct{}{}}
 
-	for _, keyword := range keywords {
-		start := strings.Index(upper, keyword+" ")
-		if start < 0 {
-			continue
-		}
-		contentStart := start + len(keyword) + 1
-		contentEnd := len(raw)
-		for _, nextKeyword := range keywords {
-			if nextKeyword == keyword {
-				continue
+	if setRaw, ok := clauses["SET"]; ok {
+		items := splitTopLevel(setRaw, ',')
+		for _, item := range items {
+			parts := strings.SplitN(item, "=", 2)
+			if len(parts) != 2 {
+				return updatePlan{}, fmt.Errorf("invalid SET clause")
 			}
-			next := strings.Index(upper[contentStart:], " "+nextKeyword+" ")
-			if next >= 0 {
-				candidate := contentStart + next + 1
-				if candidate < contentEnd {
-					contentEnd = candidate
-				}
+			target, err := parseDocumentPath(parts[0], names)
+			if err != nil {
+				return updatePlan{}, err
 			}
+			rhs := strings.TrimSpace(parts[1])
+			if rhs == "" {
+				return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"= \"")
+			}
+			valueExpr, err := parseSetValueExpr(rhs, names, values)
+			if err != nil {
+				return updatePlan{}, err
+			}
+			plan.Set = append(plan.Set, setAction{target: target, value: valueExpr})
+			plan.TouchedAttrs[target.topLevel()] = struct{}{}
 		}
-		content := strings.TrimSpace(raw[contentStart:contentEnd])
-		if content == "" {
-			return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"%s \"", keyword)
-		}
+	}
 
-		switch keyword {
-		case "SET":
-			assignments := splitTopLevel(content, ',')
-			for _, assignment := range assignments {
-				parts := strings.SplitN(assignment, "=", 2)
-				if len(parts) != 2 {
-					return updatePlan{}, fmt.Errorf("invalid SET clause")
-				}
-				attr, err := resolveNameStrict(strings.TrimSpace(parts[0]), names)
-				if err != nil {
-					return updatePlan{}, err
-				}
-				rhs := strings.TrimSpace(parts[1])
-				if rhs == "" {
-					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"= \"")
-				}
-				value, err := evalSetValue(rhs, attr, names, values)
-				if err != nil {
-					return updatePlan{}, err
-				}
-				plan.Set[attr] = value
-				plan.TouchedAttrs[attr] = struct{}{}
+	if removeRaw, ok := clauses["REMOVE"]; ok {
+		items := splitTopLevel(removeRaw, ',')
+		for _, item := range items {
+			path, err := parseDocumentPath(item, names)
+			if err != nil {
+				return updatePlan{}, err
 			}
-		case "REMOVE":
-			attrs := splitTopLevel(content, ',')
-			for _, attr := range attrs {
-				resolved, err := resolveNameStrict(strings.TrimSpace(attr), names)
-				if err != nil {
-					return updatePlan{}, err
-				}
-				if resolved == "" {
-					continue
-				}
-				plan.Remove = append(plan.Remove, resolved)
-				plan.TouchedAttrs[resolved] = struct{}{}
+			plan.Remove = append(plan.Remove, path)
+			plan.TouchedAttrs[path.topLevel()] = struct{}{}
+		}
+	}
+
+	if addRaw, ok := clauses["ADD"]; ok {
+		items := splitTopLevel(addRaw, ',')
+		for _, item := range items {
+			fields := strings.Fields(item)
+			if len(fields) != 2 {
+				return updatePlan{}, fmt.Errorf("invalid ADD clause")
 			}
-		case "ADD":
-			parts := splitTopLevel(content, ',')
-			for _, entry := range parts {
-				fields := strings.Fields(entry)
-				if len(fields) != 2 {
-					return updatePlan{}, fmt.Errorf("invalid ADD clause")
-				}
-				attr, err := resolveNameStrict(fields[0], names)
-				if err != nil {
-					return updatePlan{}, err
-				}
-				v, ok := values[fields[1]]
-				if !ok {
-					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", fields[1])
-				}
-				plan.Add[attr] = v
-				plan.TouchedAttrs[attr] = struct{}{}
+			target, err := parseDocumentPath(fields[0], names)
+			if err != nil {
+				return updatePlan{}, err
 			}
-		case "DELETE":
-			parts := splitTopLevel(content, ',')
-			for _, entry := range parts {
-				fields := strings.Fields(entry)
-				if len(fields) != 2 {
-					return updatePlan{}, fmt.Errorf("invalid DELETE clause")
-				}
-				attr, err := resolveNameStrict(fields[0], names)
-				if err != nil {
-					return updatePlan{}, err
-				}
-				v, ok := values[fields[1]]
-				if !ok {
-					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", fields[1])
-				}
-				plan.Delete[attr] = v
-				plan.TouchedAttrs[attr] = struct{}{}
+			if !isTopLevelPath(target) {
+				return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: The document path provided in the update expression is invalid for update")
 			}
+			v, err := lookupExpressionValue(fields[1], values)
+			if err != nil {
+				return updatePlan{}, err
+			}
+			plan.Add = append(plan.Add, addAction{target: target, value: v})
+			plan.TouchedAttrs[target.topLevel()] = struct{}{}
+		}
+	}
+
+	if deleteRaw, ok := clauses["DELETE"]; ok {
+		items := splitTopLevel(deleteRaw, ',')
+		for _, item := range items {
+			fields := strings.Fields(item)
+			if len(fields) != 2 {
+				return updatePlan{}, fmt.Errorf("invalid DELETE clause")
+			}
+			target, err := parseDocumentPath(fields[0], names)
+			if err != nil {
+				return updatePlan{}, err
+			}
+			if !isTopLevelPath(target) {
+				return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: The document path provided in the update expression is invalid for update")
+			}
+			v, err := lookupExpressionValue(fields[1], values)
+			if err != nil {
+				return updatePlan{}, err
+			}
+			plan.Delete = append(plan.Delete, deleteAction{target: target, value: v})
+			plan.TouchedAttrs[target.topLevel()] = struct{}{}
 		}
 	}
 
 	if len(plan.Set) == 0 && len(plan.Remove) == 0 && len(plan.Add) == 0 && len(plan.Delete) == 0 {
 		return updatePlan{}, fmt.Errorf("only SET/REMOVE/ADD/DELETE update expressions are supported")
 	}
+
+	if hasPathOverlap(plan) {
+		return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Two document paths overlap with each other; must remove or rewrite one of these paths")
+	}
+
 	return plan, nil
 }
 
-func evalSetValue(raw string, attrName string, names map[string]string, values map[string]any) (any, error) {
-	raw = strings.TrimSpace(raw)
-	lowerRaw := strings.ToLower(raw)
+func parseUpdateClauses(raw string) (map[string]string, error) {
+	upper := strings.ToUpper(raw)
+	keywords := []string{"SET", "REMOVE", "ADD", "DELETE"}
+	type clausePos struct {
+		kw  string
+		pos int
+	}
+	positions := []clausePos{}
+	depth := 0
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth != 0 {
+			continue
+		}
+		for _, kw := range keywords {
+			if i+len(kw) > len(raw) {
+				continue
+			}
+			if upper[i:i+len(kw)] != kw {
+				continue
+			}
+			leftBoundary := i == 0 || raw[i-1] == ' '
+			rightBoundary := i+len(kw) < len(raw) && raw[i+len(kw)] == ' '
+			if leftBoundary && rightBoundary {
+				positions = append(positions, clausePos{kw: kw, pos: i})
+			}
+		}
+	}
+	if len(positions) == 0 {
+		return nil, fmt.Errorf("only SET/REMOVE/ADD/DELETE update expressions are supported")
+	}
+	out := map[string]string{}
+	for i, p := range positions {
+		if _, exists := out[p.kw]; exists {
+			return nil, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"%s\", near: \"%s\"", p.kw, raw[p.pos:])
+		}
+		start := p.pos + len(p.kw) + 1
+		end := len(raw)
+		if i+1 < len(positions) {
+			end = positions[i+1].pos
+		}
+		content := strings.TrimSpace(raw[start:end])
+		if content == "" {
+			return nil, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"%s \"", p.kw)
+		}
+		out[p.kw] = content
+	}
+	return out, nil
+}
 
-	if strings.HasPrefix(lowerRaw, "list_append(") && strings.HasSuffix(raw, ")") {
+func parseSetValueExpr(raw string, names map[string]string, values map[string]any) (setValueExpr, error) {
+	raw = strings.TrimSpace(raw)
+	lower := strings.ToLower(raw)
+
+	if strings.HasPrefix(lower, "if_not_exists(") && strings.HasSuffix(raw, ")") {
+		inside := strings.TrimSpace(raw[len("if_not_exists(") : len(raw)-1])
+		arg1, arg2, err := parseTwoArgs(inside)
+		if err != nil {
+			return nil, err
+		}
+		path, err := parseDocumentPath(arg1, names)
+		if err != nil {
+			return nil, err
+		}
+		def, err := parseSetValueExpr(arg2, names, values)
+		if err != nil {
+			return nil, err
+		}
+		return ifNotExistsExpr{path: path, defaultVal: def}, nil
+	}
+
+	if strings.HasPrefix(lower, "list_append(") && strings.HasSuffix(raw, ")") {
 		inside := strings.TrimSpace(raw[len("list_append(") : len(raw)-1])
 		arg1, arg2, err := parseTwoArgs(inside)
 		if err != nil {
 			return nil, err
 		}
-		left, err := evalListOperand(arg1, names, values)
+		left, err := parseSetValueExpr(arg1, names, values)
 		if err != nil {
 			return nil, err
 		}
-		right, err := evalListOperand(arg2, names, values)
+		right, err := parseSetValueExpr(arg2, names, values)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"__list_append_left": left, "__list_append_right": right}, nil
-	}
-
-	if strings.HasPrefix(strings.ToLower(raw), "if_not_exists(") && strings.HasSuffix(raw, ")") {
-		inside := strings.TrimSuffix(strings.TrimPrefix(raw, "if_not_exists("), ")")
-		arg1, arg2, err := parseTwoArgs(inside)
-		if err != nil {
-			return nil, err
-		}
-		target, err := resolveNameStrict(arg1, names)
-		if err != nil {
-			return nil, err
-		}
-		if target == "" {
-			return nil, fmt.Errorf("invalid if_not_exists target")
-		}
-		v, ok := values[strings.TrimSpace(arg2)]
-		if !ok {
-			return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", strings.TrimSpace(arg2))
-		}
-		return map[string]any{"__if_not_exists_attr": target, "__if_not_exists_default": v}, nil
+		return listAppendExpr{left: left, right: right}, nil
 	}
 
 	for _, op := range []string{"+", "-"} {
 		parts := splitByOperatorTopLevel(raw, op)
 		if len(parts) == 2 {
-			left := strings.TrimSpace(parts[0])
-			right := strings.TrimSpace(parts[1])
-			resolvedLeft, err := resolveNameStrict(left, names)
+			left, err := parseSetValueExpr(parts[0], names, values)
 			if err != nil {
 				return nil, err
 			}
-			if resolvedLeft == attrName {
-				v, ok := values[right]
-				if !ok {
-					return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", right)
-				}
-				return map[string]any{"__arith_op": op, "__arith_value": v}, nil
+			right, err := parseSetValueExpr(parts[1], names, values)
+			if err != nil {
+				return nil, err
 			}
+			return arithmeticExpr{left: left, right: right, op: op}, nil
 		}
 	}
 
-	v, ok := values[raw]
+	if strings.HasPrefix(raw, ":") {
+		v, err := lookupExpressionValue(raw, values)
+		if err != nil {
+			return nil, err
+		}
+		return valueLiteralExpr{value: v}, nil
+	}
+
+	path, err := parseDocumentPath(raw, names)
+	if err != nil {
+		return nil, err
+	}
+	return pathValueExpr{path: path}, nil
+}
+
+func lookupExpressionValue(token string, values map[string]any) (any, error) {
+	v, ok := values[strings.TrimSpace(token)]
 	if !ok {
-		return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", raw)
+		return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", strings.TrimSpace(token))
 	}
 	return v, nil
 }
@@ -203,71 +452,490 @@ func applyUpdatePlan(current map[string]any, plan updatePlan) (map[string]any, m
 	next := cloneItem(current)
 	changed := map[string]any{}
 
-	for attr, v := range plan.Set {
-		if m, ok := v.(map[string]any); ok {
-			if _, ok := m["__list_append_left"]; ok {
-				result, err := applyListAppend(next, m)
-				if err != nil {
-					return nil, nil, err
-				}
-				next[attr] = result
-				changed[attr] = result
-				continue
-			}
-			if fallbackAttr, ok := m["__if_not_exists_attr"].(string); ok {
-				if _, exists := next[fallbackAttr]; !exists {
-					next[attr] = m["__if_not_exists_default"]
-					changed[attr] = next[attr]
-				}
-				continue
-			}
-			if arithOp, ok := m["__arith_op"].(string); ok {
-				result, err := applyArithmetic(next[attr], m["__arith_value"], arithOp)
-				if err != nil {
-					return nil, nil, err
-				}
-				next[attr] = result
-				changed[attr] = result
-				continue
-			}
-		}
-		next[attr] = v
-		changed[attr] = v
-	}
-
-	for _, attr := range plan.Remove {
-		delete(next, attr)
-		changed[attr] = nil
-	}
-
-	for attr, delta := range plan.Add {
-		result, err := applyArithmetic(next[attr], delta, "+")
+	for _, act := range plan.Set {
+		v, err := act.value.resolve(next)
 		if err != nil {
 			return nil, nil, err
 		}
-		next[attr] = result
-		changed[attr] = result
+		if err := setAtPath(next, act.target, v); err != nil {
+			return nil, nil, err
+		}
+		changed[act.target.topLevel()] = next[act.target.topLevel()]
 	}
 
-	for attr, subset := range plan.Delete {
-		current, exists := next[attr]
-		if !exists {
+	for _, path := range plan.Remove {
+		if err := removeAtPath(next, path); err != nil {
+			return nil, nil, err
+		}
+		if top := path.topLevel(); top != "" {
+			if v, ok := next[top]; ok {
+				changed[top] = v
+			} else {
+				changed[top] = nil
+			}
+		}
+	}
+
+	for _, act := range plan.Add {
+		existing, _, err := getAtPath(next, act.target)
+		if err != nil {
+			return nil, nil, err
+		}
+		result, err := applyAddValue(existing, act.value)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := setAtPath(next, act.target, result); err != nil {
+			return nil, nil, err
+		}
+		changed[act.target.topLevel()] = next[act.target.topLevel()]
+	}
+
+	for _, act := range plan.Delete {
+		existing, ok, err := getAtPath(next, act.target)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
 			continue
 		}
-		result, err := applyDeleteFromSet(current, subset)
+		result, err := applyDeleteFromSet(existing, act.value)
 		if err != nil {
 			return nil, nil, err
 		}
 		if result == nil {
-			delete(next, attr)
-			changed[attr] = nil
-			continue
+			if err := removeAtPath(next, act.target); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			if err := setAtPath(next, act.target, result); err != nil {
+				return nil, nil, err
+			}
 		}
-		next[attr] = result
-		changed[attr] = result
+		if top := act.target.topLevel(); top != "" {
+			if v, ok := next[top]; ok {
+				changed[top] = v
+			} else {
+				changed[top] = nil
+			}
+		}
 	}
 
 	return next, changed, nil
+}
+
+func parseDocumentPath(raw string, names map[string]string) (documentPath, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return documentPath{}, fmt.Errorf("empty attribute name")
+	}
+	parts := strings.Split(raw, ".")
+	segments := make([]pathSegment, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return documentPath{}, fmt.Errorf("empty attribute name")
+		}
+		base := part
+		if idx := strings.Index(part, "["); idx >= 0 {
+			base = part[:idx]
+		}
+		base = strings.TrimSpace(base)
+		resolved, err := resolveNameStrict(base, names)
+		if err != nil {
+			return documentPath{}, err
+		}
+		if resolved == "" {
+			return documentPath{}, fmt.Errorf("empty attribute name")
+		}
+		seg := pathSegment{name: resolved}
+		rest := strings.TrimSpace(part[len(base):])
+		for rest != "" {
+			if !strings.HasPrefix(rest, "[") {
+				return documentPath{}, fmt.Errorf("invalid document path")
+			}
+			end := strings.Index(rest, "]")
+			if end <= 1 {
+				return documentPath{}, fmt.Errorf("invalid document path")
+			}
+			idxVal, err := strconv.Atoi(strings.TrimSpace(rest[1:end]))
+			if err != nil || idxVal < 0 {
+				return documentPath{}, fmt.Errorf("invalid document path")
+			}
+			seg.indexes = append(seg.indexes, idxVal)
+			rest = strings.TrimSpace(rest[end+1:])
+		}
+		segments = append(segments, seg)
+	}
+	return documentPath{segments: segments}, nil
+}
+
+func getAtPath(item map[string]any, path documentPath) (any, bool, error) {
+	if len(path.segments) == 0 {
+		return nil, false, fmt.Errorf("invalid document path")
+	}
+	current, ok := item[path.segments[0].name]
+	if !ok {
+		return nil, false, nil
+	}
+	for _, idx := range path.segments[0].indexes {
+		list, ok := current.(map[string]any)["L"].([]any)
+		if !ok || idx < 0 || idx >= len(list) {
+			return nil, false, nil
+		}
+		current = list[idx]
+	}
+	for i := 1; i < len(path.segments); i++ {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, false, nil
+		}
+		doc, ok := m["M"].(map[string]any)
+		if !ok {
+			return nil, false, nil
+		}
+		seg := path.segments[i]
+		next, ok := doc[seg.name]
+		if !ok {
+			return nil, false, nil
+		}
+		current = next
+		for _, idx := range seg.indexes {
+			list, ok := current.(map[string]any)["L"].([]any)
+			if !ok || idx < 0 || idx >= len(list) {
+				return nil, false, nil
+			}
+			current = list[idx]
+		}
+	}
+	return current, true, nil
+}
+
+func setAtPath(item map[string]any, path documentPath, value any) error {
+	if len(path.segments) == 0 {
+		return fmt.Errorf("invalid document path")
+	}
+	if len(path.segments) == 1 && len(path.segments[0].indexes) == 0 {
+		item[path.segments[0].name] = value
+		return nil
+	}
+
+	seg := path.segments[0]
+	current, ok := item[seg.name]
+	if !ok {
+		current = map[string]any{"M": map[string]any{}}
+		if len(seg.indexes) > 0 {
+			current = map[string]any{"L": []any{}}
+		}
+		item[seg.name] = current
+	}
+	var err error
+	current, err = ensureIndexPath(current, seg.indexes, true)
+	if err != nil {
+		return err
+	}
+	if len(path.segments) == 1 {
+		if len(seg.indexes) == 0 {
+			item[seg.name] = value
+			return nil
+		}
+		base := item[seg.name]
+		updated, err := setListLeaf(base, seg.indexes, value)
+		if err != nil {
+			return err
+		}
+		item[seg.name] = updated
+		return nil
+	}
+
+	parent := current
+	for i := 1; i < len(path.segments)-1; i++ {
+		m, ok := parent.(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid document path")
+		}
+		doc, ok := m["M"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid document path")
+		}
+		nextSeg := path.segments[i]
+		next, ok := doc[nextSeg.name]
+		if !ok {
+			next = map[string]any{"M": map[string]any{}}
+			if len(nextSeg.indexes) > 0 {
+				next = map[string]any{"L": []any{}}
+			}
+			doc[nextSeg.name] = next
+		}
+		next, err = ensureIndexPath(next, nextSeg.indexes, true)
+		if err != nil {
+			return err
+		}
+		parent = next
+	}
+
+	last := path.segments[len(path.segments)-1]
+	m, ok := parent.(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid document path")
+	}
+	doc, ok := m["M"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid document path")
+	}
+	if len(last.indexes) == 0 {
+		doc[last.name] = value
+		return nil
+	}
+	base, ok := doc[last.name]
+	if !ok {
+		base = map[string]any{"L": []any{}}
+	}
+	updated, err := setListLeaf(base, last.indexes, value)
+	if err != nil {
+		return err
+	}
+	doc[last.name] = updated
+	return nil
+}
+
+func ensureIndexPath(base any, indexes []int, create bool) (any, error) {
+	current := base
+	for _, idx := range indexes {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid document path")
+		}
+		list, ok := m["L"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid document path")
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("invalid document path")
+		}
+		if idx >= len(list) {
+			if !create {
+				return nil, fmt.Errorf("invalid document path")
+			}
+			for len(list) <= idx {
+				list = append(list, map[string]any{"M": map[string]any{}})
+			}
+			m["L"] = list
+		}
+		current = list[idx]
+	}
+	return current, nil
+}
+
+func setListLeaf(base any, indexes []int, value any) (any, error) {
+	if len(indexes) == 0 {
+		return value, nil
+	}
+	m, ok := base.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	list, ok := m["L"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	idx := indexes[0]
+	if idx < 0 {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	if idx > len(list) {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	if idx == len(list) {
+		if len(indexes) > 1 {
+			list = append(list, map[string]any{"L": []any{}})
+		} else {
+			list = append(list, value)
+			m["L"] = list
+			return m, nil
+		}
+	}
+	next, err := setListLeaf(list[idx], indexes[1:], value)
+	if err != nil {
+		return nil, err
+	}
+	list[idx] = next
+	m["L"] = list
+	return m, nil
+}
+
+func removeAtPath(item map[string]any, path documentPath) error {
+	if len(path.segments) == 0 {
+		return fmt.Errorf("invalid document path")
+	}
+	if len(path.segments) == 1 && len(path.segments[0].indexes) == 0 {
+		delete(item, path.segments[0].name)
+		return nil
+	}
+
+	parent, key, idxs, ok, err := resolveParentContainer(item, path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if len(idxs) == 0 {
+		doc := parent[key].(map[string]any)["M"].(map[string]any)
+		delete(doc, path.segments[len(path.segments)-1].name)
+		return nil
+	}
+	base := parent[key]
+	updated, err := removeFromListPath(base, idxs)
+	if err != nil {
+		return err
+	}
+	parent[key] = updated
+	return nil
+}
+
+func resolveParentContainer(item map[string]any, path documentPath) (map[string]any, string, []int, bool, error) {
+	if len(path.segments) == 0 {
+		return nil, "", nil, false, fmt.Errorf("invalid document path")
+	}
+	if len(path.segments) == 1 {
+		return item, path.segments[0].name, path.segments[0].indexes, true, nil
+	}
+	first := path.segments[0]
+	current, ok := item[first.name]
+	if !ok {
+		return nil, "", nil, false, nil
+	}
+	for _, idx := range first.indexes {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, "", nil, false, nil
+		}
+		list, ok := m["L"].([]any)
+		if !ok || idx < 0 || idx >= len(list) {
+			return nil, "", nil, false, nil
+		}
+		current = list[idx]
+	}
+	for i := 1; i < len(path.segments)-1; i++ {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, "", nil, false, nil
+		}
+		doc, ok := m["M"].(map[string]any)
+		if !ok {
+			return nil, "", nil, false, nil
+		}
+		seg := path.segments[i]
+		next, ok := doc[seg.name]
+		if !ok {
+			return nil, "", nil, false, nil
+		}
+		current = next
+		for _, idx := range seg.indexes {
+			m, ok := current.(map[string]any)
+			if !ok {
+				return nil, "", nil, false, nil
+			}
+			list, ok := m["L"].([]any)
+			if !ok || idx < 0 || idx >= len(list) {
+				return nil, "", nil, false, nil
+			}
+			current = list[idx]
+		}
+	}
+	parentMap, ok := current.(map[string]any)
+	if !ok {
+		return nil, "", nil, false, nil
+	}
+	doc, ok := parentMap["M"].(map[string]any)
+	if !ok {
+		return nil, "", nil, false, nil
+	}
+	last := path.segments[len(path.segments)-1]
+	if _, exists := doc[last.name]; !exists {
+		return nil, "", nil, false, nil
+	}
+	return doc, last.name, last.indexes, true, nil
+}
+
+func removeFromListPath(base any, indexes []int) (any, error) {
+	m, ok := base.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	list, ok := m["L"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid document path")
+	}
+	idx := indexes[0]
+	if idx < 0 || idx >= len(list) {
+		return nil, nil
+	}
+	if len(indexes) == 1 {
+		list = append(list[:idx], list[idx+1:]...)
+		m["L"] = list
+		return m, nil
+	}
+	updated, err := removeFromListPath(list[idx], indexes[1:])
+	if err != nil {
+		return nil, err
+	}
+	if updated != nil {
+		list[idx] = updated
+		m["L"] = list
+	}
+	return m, nil
+}
+
+func applyAddValue(existing any, delta any) (any, error) {
+	if dn, ok := exprNumber(delta); ok {
+		base := 0.0
+		if existing != nil {
+			en, ok := exprNumber(existing)
+			if !ok {
+				return nil, fmt.Errorf("ADD action supports only Number and Set data types")
+			}
+			base = en
+		}
+		return map[string]any{"N": trimTrailingZeros(base + dn)}, nil
+	}
+
+	dType, dVals, err := decodeSetAttribute(delta)
+	if err != nil {
+		return nil, fmt.Errorf("ADD action supports only Number and Set data types")
+	}
+	if existing == nil {
+		copyVals := make([]any, len(dVals))
+		for i, v := range dVals {
+			copyVals[i] = v
+		}
+		return map[string]any{dType: copyVals}, nil
+	}
+	eType, eVals, err := decodeSetAttribute(existing)
+	if err != nil {
+		return nil, fmt.Errorf("ADD action supports only Number and Set data types")
+	}
+	if eType != dType {
+		return nil, fmt.Errorf("ADD action supports only Number and Set data types")
+	}
+	seen := map[string]struct{}{}
+	out := make([]any, 0, len(eVals)+len(dVals))
+	for _, v := range eVals {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range dVals {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return map[string]any{eType: out}, nil
 }
 
 func applyDeleteFromSet(current any, subset any) (any, error) {
@@ -336,80 +1004,6 @@ func decodeSetAttribute(v any) (string, []string, error) {
 	return "", nil, fmt.Errorf("DELETE action supports only SS/NS/BS set attributes")
 }
 
-func evalListOperand(raw string, names map[string]string, values map[string]any) (map[string]any, error) {
-	raw = strings.TrimSpace(raw)
-	if v, ok := values[raw]; ok {
-		return map[string]any{"__literal": v}, nil
-	}
-	if strings.HasPrefix(strings.ToLower(raw), "if_not_exists(") && strings.HasSuffix(raw, ")") {
-		inside := strings.TrimSuffix(strings.TrimPrefix(raw, "if_not_exists("), ")")
-		arg1, arg2, err := parseTwoArgs(inside)
-		if err != nil {
-			return nil, err
-		}
-		target, err := resolveNameStrict(arg1, names)
-		if err != nil {
-			return nil, err
-		}
-		if target == "" {
-			return nil, fmt.Errorf("invalid if_not_exists target")
-		}
-		v, ok := values[strings.TrimSpace(arg2)]
-		if !ok {
-			return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", strings.TrimSpace(arg2))
-		}
-		return map[string]any{"__if_not_exists_attr": target, "__if_not_exists_default": v}, nil
-	}
-	resolved, err := resolveNameStrict(raw, names)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"__attr_ref": resolved}, nil
-}
-
-func applyListAppend(next map[string]any, plan map[string]any) (map[string]any, error) {
-	left, err := resolveListOperand(next, plan["__list_append_left"])
-	if err != nil {
-		return nil, err
-	}
-	right, err := resolveListOperand(next, plan["__list_append_right"])
-	if err != nil {
-		return nil, err
-	}
-	combined := make([]any, 0, len(left)+len(right))
-	combined = append(combined, left...)
-	combined = append(combined, right...)
-	return map[string]any{"L": combined}, nil
-}
-
-func resolveListOperand(current map[string]any, operand any) ([]any, error) {
-	m, ok := operand.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("list_append operands must be list attributes or list values")
-	}
-
-	if attr, ok := m["__attr_ref"].(string); ok {
-		v, exists := current[attr]
-		if !exists {
-			return nil, fmt.Errorf("list_append requires existing list attribute %q", attr)
-		}
-		return asList(v)
-	}
-
-	if attr, ok := m["__if_not_exists_attr"].(string); ok {
-		if v, exists := current[attr]; exists {
-			return asList(v)
-		}
-		return asList(m["__if_not_exists_default"])
-	}
-
-	if literal, ok := m["__literal"]; ok {
-		return asList(literal)
-	}
-
-	return nil, fmt.Errorf("list_append operands must be list attributes or list values")
-}
-
 func asList(v any) ([]any, error) {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -422,30 +1016,6 @@ func asList(v any) ([]any, error) {
 	out := make([]any, len(list))
 	copy(out, list)
 	return out, nil
-}
-
-func applyArithmetic(existing any, delta any, op string) (any, error) {
-	current := 0.0
-	if existing != nil {
-		n, ok := exprNumber(existing)
-		if !ok {
-			return nil, fmt.Errorf("arithmetic updates require N attributes")
-		}
-		current = n
-	}
-	change, ok := exprNumber(delta)
-	if !ok {
-		return nil, fmt.Errorf("arithmetic updates require N expression values")
-	}
-	switch op {
-	case "+":
-		current += change
-	case "-":
-		current -= change
-	default:
-		return nil, fmt.Errorf("unsupported arithmetic operator %s", op)
-	}
-	return map[string]any{"N": trimTrailingZeros(current)}, nil
 }
 
 func applyProjection(item map[string]any, projectionExpression string, names map[string]string) (map[string]any, error) {

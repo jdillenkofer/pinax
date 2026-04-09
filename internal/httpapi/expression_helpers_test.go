@@ -205,3 +205,85 @@ func TestUpdateExpressionDeleteRejectsMismatchedSetTypes(t *testing.T) {
 		t.Fatalf("expected mismatched set type message, got %q", err.Error())
 	}
 }
+
+func TestUpdateExpressionSetSupportsNestedPath(t *testing.T) {
+	plan, err := parseUpdateExpression("SET #p.#a.city = :city", map[string]string{"#p": "profile", "#a": "address"}, map[string]any{
+		":city": map[string]any{"S": "Berlin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := applyUpdatePlan(map[string]any{}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := next["profile"].(map[string]any)["M"].(map[string]any)
+	address := profile["address"].(map[string]any)["M"].(map[string]any)
+	if address["city"].(map[string]any)["S"] != "Berlin" {
+		t.Fatal("expected nested city to be set")
+	}
+}
+
+func TestUpdateExpressionRemoveSupportsListIndex(t *testing.T) {
+	plan, err := parseUpdateExpression("REMOVE tags[1]", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := applyUpdatePlan(map[string]any{
+		"tags": map[string]any{"L": []any{map[string]any{"S": "a"}, map[string]any{"S": "b"}, map[string]any{"S": "c"}}},
+	}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := next["tags"].(map[string]any)["L"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("expected list length 2, got %d", len(list))
+	}
+	if list[1].(map[string]any)["S"] != "c" {
+		t.Fatal("expected list element shift after removal")
+	}
+}
+
+func TestUpdateExpressionAddSupportsSetUnion(t *testing.T) {
+	plan, err := parseUpdateExpression("ADD tags :more", nil, map[string]any{
+		":more": map[string]any{"SS": []any{"green", "blue"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := applyUpdatePlan(map[string]any{
+		"tags": map[string]any{"SS": []any{"blue", "red"}},
+	}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := next["tags"].(map[string]any)["SS"].([]any)
+	if len(set) != 3 {
+		t.Fatalf("expected unioned set size 3, got %d", len(set))
+	}
+}
+
+func TestUpdateExpressionRejectsOverlappingPaths(t *testing.T) {
+	_, err := parseUpdateExpression("SET profile = :p, profile.city = :c", nil, map[string]any{
+		":p": map[string]any{"M": map[string]any{}},
+		":c": map[string]any{"S": "Berlin"},
+	})
+	if err == nil {
+		t.Fatal("expected overlapping path validation error")
+	}
+	if !strings.Contains(err.Error(), "Two document paths overlap") {
+		t.Fatalf("expected overlap message, got %q", err.Error())
+	}
+}
+
+func TestUpdateExpressionRejectsNestedPathInAdd(t *testing.T) {
+	_, err := parseUpdateExpression("ADD profile.score :inc", nil, map[string]any{
+		":inc": map[string]any{"N": "1"},
+	})
+	if err == nil {
+		t.Fatal("expected nested ADD path validation error")
+	}
+	if !strings.Contains(err.Error(), "invalid for update") {
+		t.Fatalf("expected invalid path message, got %q", err.Error())
+	}
+}

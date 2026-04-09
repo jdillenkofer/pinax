@@ -148,3 +148,15 @@ func TestEvaluateWithMixedCaseKeywordsAndFunctions(t *testing.T) {
 		t.Fatal("expected mixed-case expression to evaluate to true")
 	}
 }
+
+func TestEvaluateSizeRejectsNonPathOperand(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	_, err := Evaluate("size(:v) = :n", map[string]any{"name": map[string]any{"S": "Jane"}}, nil, map[string]any{
+		":v": map[string]any{"S": "Jane"},
+		":n": map[string]any{"N": "4"},
+	})
+	if err == nil {
+		t.Fatal("expected size() parse error for non-path operand")
+	}
+}

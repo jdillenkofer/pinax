@@ -487,7 +487,7 @@ func (p *exprParser) parseOperand() (operandExpr, error) {
 		if strings.EqualFold(tok.text, "size") && p.peek().kind == tokenLParen {
 			p.next()
 			p.next()
-			inner, err := p.parseOperand()
+			inner, err := p.parsePathOperand()
 			if err != nil {
 				return nil, err
 			}

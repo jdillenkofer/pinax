@@ -1762,7 +1762,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 	if err != nil {
-		return nil, awserr.Validation(err.Error())
+		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
 	}
 	if !ok {
 		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
@@ -1908,7 +1908,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	}
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 	if err != nil {
-		return nil, awserr.Validation(err.Error())
+		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
 	}
 	if !ok {
 		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
@@ -1992,7 +1992,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 
 	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 	if err != nil {
-		return nil, awserr.Validation(err.Error())
+		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
 	}
 	if !ok {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
@@ -3438,7 +3438,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
 			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -3490,7 +3490,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
 			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -3548,7 +3548,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
 			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -3608,7 +3608,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
 			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -5247,13 +5247,25 @@ func nextLegacyToken(values map[string]any, prefix string) string {
 	}
 }
 
-func filterExpressionValidationMessage(err error) string {
+func expressionValidationMessage(expressionName string, err error) string {
 	msg := err.Error()
-	const prefix = "missing expression value "
-	if strings.HasPrefix(msg, prefix) {
-		token := strings.TrimPrefix(msg, prefix)
+	if strings.HasPrefix(msg, "missing expression value ") {
+		token := strings.TrimPrefix(msg, "missing expression value ")
 		token = strings.Trim(token, "\"")
-		return "Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: " + token
+		return "Invalid " + expressionName + ": An expression attribute value used in expression is not defined; attribute value: " + token
+	}
+	if strings.HasPrefix(msg, "missing expression name ") {
+		token := strings.TrimPrefix(msg, "missing expression name ")
+		token = strings.Trim(token, "\"")
+		return "Invalid " + expressionName + ": An expression attribute name used in the document path is not defined; attribute name: " + token
 	}
 	return msg
+}
+
+func filterExpressionValidationMessage(err error) string {
+	return expressionValidationMessage("FilterExpression", err)
+}
+
+func conditionExpressionValidationMessage(err error) string {
+	return expressionValidationMessage("ConditionExpression", err)
 }
