@@ -40,6 +40,7 @@ const (
 	defaultAccountMaxWriteCapacityUnits int64 = 80000
 	defaultTableMaxReadCapacityUnits    int64 = 40000
 	defaultTableMaxWriteCapacityUnits   int64 = 40000
+	defaultDescribeEndpointsCachePeriod int64 = 60
 )
 
 var (
@@ -299,6 +300,8 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.describeTable(r, body)
 	case "DescribeLimits":
 		return s.describeLimits(r, body)
+	case "DescribeEndpoints":
+		return s.describeEndpoints(r, body)
 	case "ListTables":
 		return s.listTables(r, body)
 	case "DeleteTable":
@@ -622,6 +625,23 @@ func (s *Server) describeLimits(_ *http.Request, body []byte) (map[string]any, e
 	}, nil
 }
 
+func (s *Server) describeEndpoints(r *http.Request, body []byte) (map[string]any, error) {
+	var req struct{}
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	address := strings.TrimSpace(r.Host)
+	if address == "" {
+		address = "localhost"
+	}
+	return map[string]any{
+		"Endpoints": []map[string]any{{
+			"Address":              address,
+			"CachePeriodInMinutes": defaultDescribeEndpointsCachePeriod,
+		}},
+	}, nil
+}
+
 type listTablesRequest struct {
 	ExclusiveStartTableName string `json:"ExclusiveStartTableName"`
 	Limit                   int    `json:"Limit"`
@@ -790,6 +810,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 type getItemRequest struct {
 	TableName                string            `json:"TableName"`
 	Key                      map[string]any    `json:"Key"`
+	AttributesToGet          []string          `json:"AttributesToGet"`
 	ProjectionExpression     string            `json:"ProjectionExpression"`
 	ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
 	ConsistentRead           bool              `json:"ConsistentRead"`
@@ -799,6 +820,13 @@ type getItemRequest struct {
 func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	var req getItemRequest
 	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	projectionExpression, err := normalizeLegacyAttributesProjection(req.AttributesToGet, req.ProjectionExpression)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if _, err := applyProjection(map[string]any{}, projectionExpression, req.ExpressionAttributeNames); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -837,7 +865,7 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, err
 	}
 
-	projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+	projected, err := applyProjection(item, projectionExpression, req.ExpressionAttributeNames)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
@@ -1897,6 +1925,7 @@ type batchGetItemRequest struct {
 	RequestItems           map[string]struct {
 		Keys                     []map[string]any  `json:"Keys"`
 		ConsistentRead           bool              `json:"ConsistentRead"`
+		AttributesToGet          []string          `json:"AttributesToGet"`
 		ProjectionExpression     string            `json:"ProjectionExpression"`
 		ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
 		ReturnConsumedCapacity   string            `json:"ReturnConsumedCapacity"`
@@ -1931,6 +1960,13 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	unprocessed := map[string]any{}
 	readByTable := map[string]float64{}
 	for tableName, itemReq := range req.RequestItems {
+		projectionExpression, err := normalizeLegacyAttributesProjection(itemReq.AttributesToGet, itemReq.ProjectionExpression)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if _, err := applyProjection(map[string]any{}, projectionExpression, itemReq.ExpressionAttributeNames); err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
 		if len(itemReq.Keys) == 0 {
 			return nil, awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
 		}
@@ -1976,7 +2012,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 				unprocessedKeys = append(unprocessedKeys, key)
 				continue
 			}
-			projected, err := applyProjection(item, itemReq.ProjectionExpression, itemReq.ExpressionAttributeNames)
+			projected, err := applyProjection(item, projectionExpression, itemReq.ExpressionAttributeNames)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
@@ -1985,12 +2021,16 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		}
 		responses[tableName] = items
 		if len(unprocessedKeys) > 0 {
-			unprocessed[tableName] = map[string]any{
+			entry := map[string]any{
 				"Keys":                     unprocessedKeys,
 				"ConsistentRead":           itemReq.ConsistentRead,
 				"ProjectionExpression":     itemReq.ProjectionExpression,
 				"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
 			}
+			if len(itemReq.AttributesToGet) > 0 {
+				entry["AttributesToGet"] = itemReq.AttributesToGet
+			}
+			unprocessed[tableName] = entry
 		}
 	}
 
@@ -2018,13 +2058,21 @@ type batchWriteItemRequest struct {
 			Key map[string]any `json:"Key"`
 		} `json:"DeleteRequest"`
 	} `json:"RequestItems"`
-	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
+	ReturnConsumedCapacity      string `json:"ReturnConsumedCapacity"`
+	ReturnItemCollectionMetrics string `json:"ReturnItemCollectionMetrics"`
 }
 
 func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, error) {
 	var req batchWriteItemRequest
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	itemCollectionMode := strings.ToUpper(strings.TrimSpace(req.ReturnItemCollectionMetrics))
+	if itemCollectionMode == "" {
+		itemCollectionMode = "NONE"
+	}
+	if itemCollectionMode != "NONE" && itemCollectionMode != "SIZE" {
+		return nil, awserr.Validation("BatchWriteItem ReturnItemCollectionMetrics must be NONE or SIZE")
 	}
 
 	totalOps := 0
@@ -2054,6 +2102,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	processed := 0
 	unprocessed := map[string]any{}
 	writeByTable := map[string]float64{}
+	itemCollectionMetrics := map[string][]map[string]any{}
 
 	for _, tableName := range tableNames {
 		ops := req.RequestItems[tableName]
@@ -2066,6 +2115,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		}
 
 		seenKeys := map[string]struct{}{}
+		seenItemCollections := map[string]struct{}{}
 		for _, op := range ops {
 			if len(op.PutRequest.Item) == 0 && len(op.DeleteRequest.Key) == 0 {
 				return nil, awserr.Validation("write request must contain either PutRequest or DeleteRequest")
@@ -2109,6 +2159,18 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, err
 				}
 				writeByTable[tableName] += writeUnits
+				if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
+					hashValue := op.PutRequest.Item[t.HashKey]
+					if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
+						if _, exists := seenItemCollections[keyToken]; !exists {
+							seenItemCollections[keyToken] = struct{}{}
+							itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
+								"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
+								"SizeEstimateRangeGB": []float64{0, 1},
+							})
+						}
+					}
+				}
 				processed++
 			}
 			if len(op.DeleteRequest.Key) > 0 {
@@ -2140,6 +2202,18 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, err
 				}
 				writeByTable[tableName] += writeUnits
+				if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
+					hashValue := op.DeleteRequest.Key[t.HashKey]
+					if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
+						if _, exists := seenItemCollections[keyToken]; !exists {
+							seenItemCollections[keyToken] = struct{}{}
+							itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
+								"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
+								"SizeEstimateRangeGB": []float64{0, 1},
+							})
+						}
+					}
+				}
 				processed++
 			}
 		}
@@ -2152,6 +2226,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	resp := map[string]any{"UnprocessedItems": unprocessed}
 	for tableName, units := range writeByTable {
 		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
+	}
+	if itemCollectionMode == "SIZE" {
+		resp["ItemCollectionMetrics"] = itemCollectionMetrics
 	}
 	return resp, nil
 }
@@ -3617,25 +3694,9 @@ func cloneExpressionValues(in map[string]any) map[string]any {
 }
 
 func normalizeQuerySelect(req queryRequest, hasIndex bool, isGSI bool) (string, string, error) {
-	projectionExpression := strings.TrimSpace(req.ProjectionExpression)
-	if len(req.AttributesToGet) > 0 {
-		if projectionExpression != "" {
-			return "", "", fmt.Errorf("AttributesToGet and ProjectionExpression cannot both be set")
-		}
-		attrs := make([]string, 0, len(req.AttributesToGet))
-		seen := map[string]struct{}{}
-		for _, attr := range req.AttributesToGet {
-			attr = strings.TrimSpace(attr)
-			if attr == "" {
-				continue
-			}
-			if _, ok := seen[attr]; ok {
-				continue
-			}
-			seen[attr] = struct{}{}
-			attrs = append(attrs, attr)
-		}
-		projectionExpression = strings.Join(attrs, ", ")
+	projectionExpression, err := normalizeLegacyAttributesProjection(req.AttributesToGet, req.ProjectionExpression)
+	if err != nil {
+		return "", "", err
 	}
 
 	selectMode := strings.ToUpper(strings.TrimSpace(req.Select))
@@ -3670,6 +3731,30 @@ func normalizeQuerySelect(req queryRequest, hasIndex bool, isGSI bool) (string, 
 	}
 
 	return selectMode, projectionExpression, nil
+}
+
+func normalizeLegacyAttributesProjection(attributesToGet []string, projectionExpression string) (string, error) {
+	projectionExpression = strings.TrimSpace(projectionExpression)
+	if len(attributesToGet) == 0 {
+		return projectionExpression, nil
+	}
+	if projectionExpression != "" {
+		return "", fmt.Errorf("AttributesToGet and ProjectionExpression cannot both be set")
+	}
+	attrs := make([]string, 0, len(attributesToGet))
+	seen := map[string]struct{}{}
+	for _, attr := range attributesToGet {
+		attr = strings.TrimSpace(attr)
+		if attr == "" {
+			continue
+		}
+		if _, ok := seen[attr]; ok {
+			continue
+		}
+		seen[attr] = struct{}{}
+		attrs = append(attrs, attr)
+	}
+	return strings.Join(attrs, ", "), nil
 }
 
 func parseLegacyQueryKeyConditions(

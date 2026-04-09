@@ -47,6 +47,51 @@ func TestGetItemConsumedCapacityIsSingleObject(t *testing.T) {
 	}
 }
 
+func TestGetItemSupportsLegacyAttributesToGet(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("getlegacy"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("getlegacy"),
+		Item: map[string]types.AttributeValue{
+			"pk":     &types.AttributeValueMemberS{Value: "a"},
+			"shown":  &types.AttributeValueMemberS{Value: "v"},
+			"hidden": &types.AttributeValueMemberS{Value: "x"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:       aws.String("getlegacy"),
+		Key:             map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}},
+		AttributesToGet: []string{"pk", "shown"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out.Item["shown"]; !ok {
+		t.Fatalf("expected shown in legacy projection, got %+v", out.Item)
+	}
+	if _, ok := out.Item["hidden"]; ok {
+		t.Fatalf("did not expect hidden in legacy projection, got %+v", out.Item)
+	}
+}
+
 func TestBatchGetAppliesProjectionExpression(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)
@@ -91,6 +136,50 @@ func TestBatchGetAppliesProjectionExpression(t *testing.T) {
 	}
 }
 
+func TestBatchGetSupportsLegacyAttributesToGet(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("bglegacy"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("bglegacy"), Item: map[string]types.AttributeValue{
+		"pk":     &types.AttributeValueMemberS{Value: "a"},
+		"hidden": &types.AttributeValueMemberS{Value: "x"},
+		"shown":  &types.AttributeValueMemberS{Value: "y"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			"bglegacy": {
+				Keys:            []map[string]types.AttributeValue{{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+				AttributesToGet: []string{"pk", "shown"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Responses["bglegacy"][0]
+	if _, ok := item["shown"]; !ok {
+		t.Fatal("expected projected attribute shown")
+	}
+	if _, ok := item["hidden"]; ok {
+		t.Fatal("did not expect hidden attribute in legacy projected batch-get item")
+	}
+}
+
 func TestDescribeLimitsReturnsCapacityFields(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)
@@ -112,6 +201,27 @@ func TestDescribeLimitsReturnsCapacityFields(t *testing.T) {
 	}
 	if out.TableMaxWriteCapacityUnits == nil || *out.TableMaxWriteCapacityUnits <= 0 {
 		t.Fatalf("expected TableMaxWriteCapacityUnits to be set, got %+v", out)
+	}
+}
+
+func TestDescribeEndpointsReturnsEndpointMetadata(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	out, err := client.DescribeEndpoints(ctx, &dynamodb.DescribeEndpointsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Endpoints) == 0 {
+		t.Fatalf("expected at least one endpoint, got %+v", out)
+	}
+	if out.Endpoints[0].Address == nil || *out.Endpoints[0].Address == "" {
+		t.Fatalf("expected endpoint address to be set, got %+v", out.Endpoints[0])
+	}
+	if out.Endpoints[0].CachePeriodInMinutes <= 0 {
+		t.Fatalf("expected cache period to be set, got %+v", out.Endpoints[0])
 	}
 }
 

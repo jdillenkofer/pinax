@@ -374,6 +374,90 @@ func TestBatchWriteReturnConsumedCapacity(t *testing.T) {
 	}
 }
 
+func TestBatchWriteReturnItemCollectionMetricsSize(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bwmetrics"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("lsi"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+			{
+				IndexName: aws.String("by-lsi"),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String("lsi"), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		ReturnItemCollectionMetrics: types.ReturnItemCollectionMetricsSize,
+		RequestItems: map[string][]types.WriteRequest{
+			"bwmetrics": {
+				{
+					PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{
+						"pk":  &types.AttributeValueMemberS{Value: "p1"},
+						"sk":  &types.AttributeValueMemberS{Value: "a"},
+						"lsi": &types.AttributeValueMemberS{Value: "l1"},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ItemCollectionMetrics["bwmetrics"]) == 0 {
+		t.Fatalf("expected item collection metrics for lsi table, got %+v", out.ItemCollectionMetrics)
+	}
+}
+
+func TestBatchWriteRejectsInvalidReturnItemCollectionMetrics(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bwmetricsbad"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		ReturnItemCollectionMetrics: types.ReturnItemCollectionMetrics("MAYBE"),
+		RequestItems: map[string][]types.WriteRequest{
+			"bwmetricsbad": {{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}}}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for invalid ReturnItemCollectionMetrics")
+	}
+}
+
 func TestTransactWriteDuplicateTargetValidation(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)

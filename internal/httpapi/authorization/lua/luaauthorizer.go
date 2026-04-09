@@ -619,7 +619,7 @@ func ipInCIDR(ipStr string, cidr string) bool {
 
 func isReadOnly(operation string) bool {
 	switch operation {
-	case "DescribeTable", "DescribeLimits", "ListTables", "GetItem", "Query", "Scan", "BatchGetItem", "TransactGetItems", "DescribeTimeToLive":
+	case "DescribeTable", "DescribeLimits", "DescribeEndpoints", "ListTables", "GetItem", "Query", "Scan", "BatchGetItem", "TransactGetItems", "DescribeTimeToLive":
 		return true
 	case "CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem", "BatchWriteItem":
 		return false
