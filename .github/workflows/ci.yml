@@ -63,6 +63,13 @@ jobs:
           PINAX_LIFECYCLE_DELAY_MS: "0"
         run: go test ./internal/httpapi -integration -run Conformance -v
 
+      - name: Run stress conformance tests
+        env:
+          PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT: http://localhost:8000
+          PINAX_CONFORMANCE_STRESS: "1"
+          PINAX_LIFECYCLE_DELAY_MS: "0"
+        run: go test ./internal/httpapi -integration -run ConformanceStress -v
+
       - name: Stop DynamoDB Local
         if: always()
         run: docker rm -f ddb-local

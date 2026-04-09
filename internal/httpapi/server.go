@@ -24,10 +24,47 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/store"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const targetPrefix = "DynamoDB_20120810."
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pinax_http_requests_total",
+			Help: "Total HTTP requests processed by Pinax.",
+		},
+		[]string{"operation", "status_code", "result"},
+	)
+
+	httpRequestDurationSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "pinax_http_request_duration_seconds",
+			Help:    "HTTP request duration by operation.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"operation", "status_code", "result"},
+	)
+
+	conditionalCheckFailuresTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pinax_conditional_check_failures_total",
+			Help: "Total conditional check failures by operation.",
+		},
+		[]string{"operation"},
+	)
+
+	throttlingFailuresTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "pinax_throttling_failures_total",
+			Help: "Total provisioned throughput throttling failures by operation.",
+		},
+		[]string{"operation"},
+	)
+)
 
 type Server struct {
 	store             store.Store
@@ -48,51 +85,102 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	iw := &instrumentedResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	operation := "unknown"
+	errCode := ""
+	start := time.Now()
+	defer func() {
+		s.observeRequest(operation, iw.statusCode, errCode, time.Since(start))
+	}()
+
 	if r.Method == http.MethodGet {
 		switch r.URL.Path {
 		case "/health":
-			s.serveHealth(w, r)
+			operation = "health"
+			s.serveHealth(iw, r)
 			return
 		case "/metrics":
-			s.metricsHandler.ServeHTTP(w, r)
+			operation = "metrics"
+			s.metricsHandler.ServeHTTP(iw, r)
 			return
 		}
 	}
 
 	if r.Method != http.MethodPost || r.URL.Path != "/" {
-		http.NotFound(w, r)
+		errCode = "NotFound"
+		http.NotFound(iw, r)
 		return
 	}
 
 	target := strings.TrimSpace(r.Header.Get("X-Amz-Target"))
 	if !strings.HasPrefix(target, targetPrefix) {
-		awserr.Write(w, awserr.Validation("X-Amz-Target header must look like DynamoDB_20120810.<Operation>"))
+		err := awserr.Validation("X-Amz-Target header must look like DynamoDB_20120810.<Operation>")
+		errCode = apiErrorCodeForMetrics(err)
+		awserr.Write(iw, err)
 		return
 	}
 	op := strings.TrimPrefix(target, targetPrefix)
+	operation = op
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		awserr.Write(w, err)
+		errCode = apiErrorCodeForMetrics(err)
+		awserr.Write(iw, err)
 		return
 	}
 
 	if err := s.authorizeRequest(r, op, body); err != nil {
-		awserr.Write(w, err)
+		errCode = apiErrorCodeForMetrics(err)
+		awserr.Write(iw, err)
 		return
 	}
 
 	resp, err := s.dispatch(r, op, body)
 	if err != nil {
 		slog.Debug("request failed", "operation", op, "err", err)
-		awserr.Write(w, err)
+		errCode = apiErrorCodeForMetrics(err)
+		awserr.Write(iw, err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	if err := json.NewEncoder(iw).Encode(resp); err != nil {
 		slog.Error("encode response", "operation", op, "err", err)
 	}
+}
+
+func (s *Server) observeRequest(operation string, statusCode int, errorCode string, duration time.Duration) {
+	statusLabel := strconv.Itoa(statusCode)
+	result := "success"
+	if statusCode >= http.StatusBadRequest {
+		result = "error"
+	}
+	httpRequestsTotal.WithLabelValues(operation, statusLabel, result).Inc()
+	httpRequestDurationSeconds.WithLabelValues(operation, statusLabel, result).Observe(duration.Seconds())
+	if errorCode == "ConditionalCheckFailedException" {
+		conditionalCheckFailuresTotal.WithLabelValues(operation).Inc()
+	}
+	if errorCode == "ProvisionedThroughputExceededException" {
+		throttlingFailuresTotal.WithLabelValues(operation).Inc()
+	}
+}
+
+func apiErrorCodeForMetrics(err error) string {
+	var apiErr *awserr.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code
+	}
+	return "InternalServerError"
+}
+
+type instrumentedResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *instrumentedResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func (s *Server) serveHealth(w http.ResponseWriter, r *http.Request) {

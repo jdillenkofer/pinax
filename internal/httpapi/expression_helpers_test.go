@@ -57,3 +57,41 @@ func TestApplyProjectionMissingExpressionName(t *testing.T) {
 		t.Fatal("expected missing expression name validation error")
 	}
 }
+
+func TestUpdateExpressionListAppendAndIfNotExists(t *testing.T) {
+	plan, err := parseUpdateExpression("SET tags = list_append(if_not_exists(tags, :empty), :new)", nil, map[string]any{
+		":empty": map[string]any{"L": []any{}},
+		":new":   map[string]any{"L": []any{map[string]any{"S": "blue"}, map[string]any{"S": "green"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, _, err := applyUpdatePlan(map[string]any{}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list, ok := next["tags"].(map[string]any)["L"].([]any)
+	if !ok {
+		t.Fatal("expected tags list")
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 tags, got %d", len(list))
+	}
+
+	plan2, err := parseUpdateExpression("SET tags = list_append(tags, :extra)", nil, map[string]any{
+		":extra": map[string]any{"L": []any{map[string]any{"S": "red"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next2, _, err := applyUpdatePlan(next, plan2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list2 := next2["tags"].(map[string]any)["L"].([]any)
+	if len(list2) != 3 {
+		t.Fatalf("expected 3 tags after append, got %d", len(list2))
+	}
+}

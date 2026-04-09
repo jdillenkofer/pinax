@@ -99,8 +99,15 @@ Run conformance checks against DynamoDB Local (requires local container on `http
 PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT=http://localhost:8000 go test ./internal/httpapi -integration -run Conformance
 ```
 
+Run the optional stress conformance profile (larger pagination and concurrent writes):
+
+```bash
+PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT=http://localhost:8000 PINAX_CONFORMANCE_STRESS=1 go test ./internal/httpapi -integration -run ConformanceStress
+```
+
 Known conformance differences are tracked in `internal/httpapi/testdata/conformance_known_differences.json`.
 When extending conformance coverage, prefer fixing parity gaps first and only add entries to this file when the difference is intentional or externally constrained.
+Stale or unknown entries are treated as test failures to keep the registry current.
 
 ## Optimistic locking
 

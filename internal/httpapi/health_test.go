@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
@@ -41,6 +42,16 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 		}
 		if len(body) == 0 {
 			t.Fatalf("expected non-empty body for %s", path)
+		}
+		if path == "/metrics" {
+			for _, metricName := range []string{
+				"pinax_http_requests_total",
+				"pinax_http_request_duration_seconds",
+			} {
+				if !strings.Contains(string(body), metricName) {
+					t.Fatalf("expected metrics output to include %s", metricName)
+				}
+			}
 		}
 	}
 

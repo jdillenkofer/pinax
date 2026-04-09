@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,9 +35,17 @@ type conformanceSnapshot struct {
 	BatchProjectionHasHidden bool
 	ConditionalErrorCode     string
 	ConditionalErrorHasMsg   bool
+	BatchGetDupHasMsg        bool
+	BatchWriteDupHasMsg      bool
+	TransactionErrorHasMsg   bool
+	TransactionReasonCount   int
 	FilteredScanCount        int32
 	FilteredScanScanned      int32
 	FilteredScanHasLEK       bool
+	ComplexFilterCount       int32
+	NestedPathFilterCount    int32
+	IfNotExistsInitialized   bool
+	ListAppendLength         int
 	CreateTableStatus        types.TableStatus
 	UpdateTableStatus        types.TableStatus
 	BatchGetDupErrorCode     string
@@ -52,7 +61,8 @@ type conformanceSnapshot struct {
 	GSIIncludeHasSummary     bool
 	GSIIncludeHasHidden      bool
 	LSIKeysOnlyHasNonKey     bool
-	TTLStatusAfterEnable     string
+	TTLStatusRecognized      bool
+	TTLHasAttributeName      bool
 }
 
 type knownConformanceDifferences struct {
@@ -97,6 +107,49 @@ func TestConformanceAgainstDynamoDBLocal(t *testing.T) {
 
 	if len(mismatches) > 0 {
 		t.Fatalf("conformance mismatches:\n%s\n\npinax: %+v\nlocal: %+v", strings.Join(mismatches, "\n"), pinaxSnap, localSnap)
+	}
+}
+
+type conformanceStressSnapshot struct {
+	TotalItems   int
+	PageCount    int
+	ScannedCount int32
+}
+
+func TestConformanceStressAgainstDynamoDBLocal(t *testing.T) {
+	testutils.SkipIfNotIntegration(t)
+	if os.Getenv("PINAX_CONFORMANCE_STRESS") != "1" {
+		t.Skip("set PINAX_CONFORMANCE_STRESS=1 to run stress conformance scenario")
+	}
+
+	localEndpoint := os.Getenv("PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT")
+	if localEndpoint == "" {
+		t.Skip("set PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT (for example http://localhost:8000) to run conformance test")
+	}
+
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pinaxSrv := httptest.NewServer(NewServer(store, nil))
+	t.Cleanup(pinaxSrv.Close)
+
+	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)
+	localClient := mustConformanceClient(ctx, t, localEndpoint)
+
+	pinaxSnap := runConformanceStressScenario(ctx, t, pinaxClient, "pinax")
+	localSnap := runConformanceStressScenario(ctx, t, localClient, "local")
+	if pinaxSnap != localSnap {
+		t.Fatalf("stress conformance mismatch\npinax: %+v\nlocal: %+v", pinaxSnap, localSnap)
 	}
 }
 
@@ -242,6 +295,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		t.Fatal("expected batch get duplicate key error")
 	}
 	batchGetDupCode := apiErrorCode(err)
+	batchGetDupHasMsg := apiErrorMessage(err) != ""
 
 	_, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{
 		table: {
@@ -253,6 +307,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		t.Fatal("expected batch write duplicate key error")
 	}
 	batchWriteDupCode := apiErrorCode(err)
+	batchWriteDupHasMsg := apiErrorMessage(err) != ""
 
 	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
 		TableName: aws.String(table),
@@ -296,7 +351,9 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		t.Fatal("expected transaction cancellation")
 	}
 	txCode := apiErrorCode(err)
+	txHasMsg := apiErrorMessage(err) != ""
 	txReasons := transactionReasonCodes(err)
+	txReasonCount := len(txReasons)
 
 	tg, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal, TransactItems: []types.TransactGetItem{{
 		Get: &types.Get{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
@@ -376,6 +433,90 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 	lsiItem := lsiOut.Items[0]
 	_, lsiHasNonKey := lsiItem["hidden"]
 
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{
+		"pk":      &types.AttributeValueMemberS{Value: "u#2"},
+		"sk":      &types.AttributeValueMemberN{Value: "1"},
+		"score":   &types.AttributeValueMemberN{Value: "10"},
+		"counter": &types.AttributeValueMemberN{Value: "1"},
+		"meta": &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+			"state": &types.AttributeValueMemberS{Value: "active"},
+		}},
+		"tags": &types.AttributeValueMemberL{Value: []types.AttributeValue{&types.AttributeValueMemberS{Value: "a"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	complexScan, err := client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        aws.String(table),
+		FilterExpression: aws.String("NOT (#meta.#state = :archived) AND (#score >= :min OR attribute_not_exists(#ghost))"),
+		ExpressionAttributeNames: map[string]string{
+			"#meta":  "meta",
+			"#state": "state",
+			"#score": "score",
+			"#ghost": "ghost",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":archived": &types.AttributeValueMemberS{Value: "archived"},
+			":min":      &types.AttributeValueMemberN{Value: "5"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nestedScan, err := client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        aws.String(table),
+		FilterExpression: aws.String("#meta.#state = :active"),
+		ExpressionAttributeNames: map[string]string{
+			"#meta":  "meta",
+			"#state": "state",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":active": &types.AttributeValueMemberS{Value: "active"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(table),
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}},
+		UpdateExpression:          aws.String("SET #missing = if_not_exists(#missing, :seed), #tags = list_append(if_not_exists(#tags, :empty), :newtag)"),
+		ExpressionAttributeNames:  map[string]string{"#missing": "missingCounter", "#tags": "tags"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":seed": &types.AttributeValueMemberN{Value: "1"}, ":empty": &types.AttributeValueMemberL{Value: []types.AttributeValue{}}, ":newtag": &types.AttributeValueMemberL{Value: []types.AttributeValue{&types.AttributeValueMemberS{Value: "b"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(table),
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}},
+		UpdateExpression:          aws.String("ADD #ctr :one"),
+		ExpressionAttributeNames:  map[string]string{"#ctr": "counter"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":one": &types.AttributeValueMemberN{Value: "1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedExpr, err := client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingCounterAttr, ok := updatedExpr.Item["missingCounter"].(*types.AttributeValueMemberN)
+	if !ok {
+		t.Fatal("expected numeric missingCounter")
+	}
+	counterAttr, ok := updatedExpr.Item["counter"].(*types.AttributeValueMemberN)
+	if !ok {
+		t.Fatal("expected numeric counter")
+	}
+	tagsAttr, ok := updatedExpr.Item["tags"].(*types.AttributeValueMemberL)
+	if !ok {
+		t.Fatal("expected list tags")
+	}
+
 	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
 		TableName: aws.String(table),
 		TimeToLiveSpecification: &types.TimeToLiveSpecification{
@@ -390,7 +531,8 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 	if err != nil {
 		t.Fatal(err)
 	}
-	ttlStatus := string(ttlDesc.TimeToLiveDescription.TimeToLiveStatus)
+	ttlStatus := ttlDesc.TimeToLiveDescription.TimeToLiveStatus
+	ttlHasAttr := ttlDesc.TimeToLiveDescription.AttributeName != nil && *ttlDesc.TimeToLiveDescription.AttributeName == "ttl"
 
 	scanOut, err := client.Scan(ctx, &dynamodb.ScanInput{
 		TableName:        aws.String(table),
@@ -422,9 +564,17 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		BatchProjectionHasHidden: hasHidden,
 		ConditionalErrorCode:     condCode,
 		ConditionalErrorHasMsg:   condHasMsg,
+		BatchGetDupHasMsg:        batchGetDupHasMsg,
+		BatchWriteDupHasMsg:      batchWriteDupHasMsg,
+		TransactionErrorHasMsg:   txHasMsg,
+		TransactionReasonCount:   txReasonCount,
 		FilteredScanCount:        scanOut.Count,
 		FilteredScanScanned:      scanOut.ScannedCount,
 		FilteredScanHasLEK:       scanOut.LastEvaluatedKey != nil,
+		ComplexFilterCount:       complexScan.Count,
+		NestedPathFilterCount:    nestedScan.Count,
+		IfNotExistsInitialized:   missingCounterAttr.Value == "1" && counterAttr.Value == "2",
+		ListAppendLength:         len(tagsAttr.Value),
 		CreateTableStatus:        descAfterCreate.Table.TableStatus,
 		UpdateTableStatus:        descAfterUpdate.Table.TableStatus,
 		BatchGetDupErrorCode:     batchGetDupCode,
@@ -440,8 +590,101 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		GSIIncludeHasSummary:     gsiHasSummary,
 		GSIIncludeHasHidden:      gsiHasHidden,
 		LSIKeysOnlyHasNonKey:     lsiHasNonKey,
-		TTLStatusAfterEnable:     ttlStatus,
+		TTLStatusRecognized:      ttlStatus == types.TimeToLiveStatusEnabled || ttlStatus == types.TimeToLiveStatusEnabling,
+		TTLHasAttributeName:      ttlHasAttr,
 	}
+}
+
+func runConformanceStressScenario(ctx context.Context, t *testing.T, client *dynamodb.Client, prefix string) conformanceStressSnapshot {
+	t.Helper()
+
+	table := fmt.Sprintf("cf_stress_%s_%d", prefix, time.Now().UnixNano())
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(table),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 4
+	const writesPerWorker = 25
+	const seeded = 10
+	for i := 0; i < seeded; i++ {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "load#1"},
+			"sk": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", i)},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		workerID := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				sk := seeded + (workerID * writesPerWorker) + i
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "load#1"},
+					"sk": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", sk)},
+				}})
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for writeErr := range errCh {
+		if writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+
+	total := 0
+	pages := 0
+	var scannedCount int32
+	var last map[string]types.AttributeValue
+	for {
+		out, err := client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(table),
+			KeyConditionExpression: aws.String("pk = :pk"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": &types.AttributeValueMemberS{Value: "load#1"},
+			},
+			Limit:             aws.Int32(7),
+			ExclusiveStartKey: last,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += len(out.Items)
+		scannedCount += out.ScannedCount
+		pages++
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		last = out.LastEvaluatedKey
+	}
+
+	expected := seeded + (workers * writesPerWorker)
+	if total != expected {
+		t.Fatalf("expected %d items in stress table, got %d", expected, total)
+	}
+
+	return conformanceStressSnapshot{TotalItems: total, PageCount: pages, ScannedCount: scannedCount}
 }
 
 func apiErrorCode(err error) string {
@@ -498,21 +741,40 @@ func compareConformanceSnapshots(pinax conformanceSnapshot, local conformanceSna
 	typeOf := vp.Type()
 	mismatches := make([]string, 0)
 	ignoredMsgs := make([]string, 0)
+	seen := map[string]struct{}{}
 
 	for i := 0; i < typeOf.NumField(); i++ {
 		name := typeOf.Field(i).Name
+		seen[name] = struct{}{}
 		pv := vp.Field(i).Interface()
 		lv := vl.Field(i).Interface()
 		if reflect.DeepEqual(pv, lv) {
+			if _, ok := ignored[name]; ok {
+				mismatches = append(mismatches, fmt.Sprintf("%s: known-difference entry is stale (values now match)", name))
+			}
 			continue
 		}
 		if reason, ok := ignored[name]; ok {
-			ignoredMsgs = append(ignoredMsgs, fmt.Sprintf("%s (reason: %s): pinax=%v local=%v", name, reason, pv, lv))
+			ignoredMsgs = append(ignoredMsgs, fmt.Sprintf("%s (reason: %s): pinax=%s local=%s", name, reason, formatConformanceValue(pv), formatConformanceValue(lv)))
 			continue
 		}
-		mismatches = append(mismatches, fmt.Sprintf("%s: pinax=%v local=%v", name, pv, lv))
+		mismatches = append(mismatches, fmt.Sprintf("%s:\n  pinax=%s\n  local=%s", name, formatConformanceValue(pv), formatConformanceValue(lv)))
+	}
+
+	for field := range ignored {
+		if _, ok := seen[field]; !ok {
+			mismatches = append(mismatches, fmt.Sprintf("%s: known-difference entry does not match any snapshot field", field))
+		}
 	}
 	sort.Strings(mismatches)
 	sort.Strings(ignoredMsgs)
 	return mismatches, ignoredMsgs
+}
+
+func formatConformanceValue(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return string(b)
 }

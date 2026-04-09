@@ -115,6 +115,26 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 }
 
 func evalSetValue(raw string, attrName string, names map[string]string, values map[string]any) (any, error) {
+	raw = strings.TrimSpace(raw)
+	lowerRaw := strings.ToLower(raw)
+
+	if strings.HasPrefix(lowerRaw, "list_append(") && strings.HasSuffix(raw, ")") {
+		inside := strings.TrimSpace(raw[len("list_append(") : len(raw)-1])
+		arg1, arg2, err := parseTwoArgs(inside)
+		if err != nil {
+			return nil, err
+		}
+		left, err := evalListOperand(arg1, names, values)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalListOperand(arg2, names, values)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"__list_append_left": left, "__list_append_right": right}, nil
+	}
+
 	if strings.HasPrefix(strings.ToLower(raw), "if_not_exists(") && strings.HasSuffix(raw, ")") {
 		inside := strings.TrimSuffix(strings.TrimPrefix(raw, "if_not_exists("), ")")
 		arg1, arg2, err := parseTwoArgs(inside)
@@ -167,6 +187,15 @@ func applyUpdatePlan(current map[string]any, plan updatePlan) (map[string]any, m
 
 	for attr, v := range plan.Set {
 		if m, ok := v.(map[string]any); ok {
+			if _, ok := m["__list_append_left"]; ok {
+				result, err := applyListAppend(next, m)
+				if err != nil {
+					return nil, nil, err
+				}
+				next[attr] = result
+				changed[attr] = result
+				continue
+			}
 			if fallbackAttr, ok := m["__if_not_exists_attr"].(string); ok {
 				if _, exists := next[fallbackAttr]; !exists {
 					next[attr] = m["__if_not_exists_default"]
@@ -203,6 +232,94 @@ func applyUpdatePlan(current map[string]any, plan updatePlan) (map[string]any, m
 	}
 
 	return next, changed, nil
+}
+
+func evalListOperand(raw string, names map[string]string, values map[string]any) (map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if v, ok := values[raw]; ok {
+		return map[string]any{"__literal": v}, nil
+	}
+	if strings.HasPrefix(strings.ToLower(raw), "if_not_exists(") && strings.HasSuffix(raw, ")") {
+		inside := strings.TrimSuffix(strings.TrimPrefix(raw, "if_not_exists("), ")")
+		arg1, arg2, err := parseTwoArgs(inside)
+		if err != nil {
+			return nil, err
+		}
+		target, err := resolveNameStrict(arg1, names)
+		if err != nil {
+			return nil, err
+		}
+		if target == "" {
+			return nil, fmt.Errorf("invalid if_not_exists target")
+		}
+		v, ok := values[strings.TrimSpace(arg2)]
+		if !ok {
+			return nil, fmt.Errorf("missing expression attribute value %q", strings.TrimSpace(arg2))
+		}
+		return map[string]any{"__if_not_exists_attr": target, "__if_not_exists_default": v}, nil
+	}
+	resolved, err := resolveNameStrict(raw, names)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"__attr_ref": resolved}, nil
+}
+
+func applyListAppend(next map[string]any, plan map[string]any) (map[string]any, error) {
+	left, err := resolveListOperand(next, plan["__list_append_left"])
+	if err != nil {
+		return nil, err
+	}
+	right, err := resolveListOperand(next, plan["__list_append_right"])
+	if err != nil {
+		return nil, err
+	}
+	combined := make([]any, 0, len(left)+len(right))
+	combined = append(combined, left...)
+	combined = append(combined, right...)
+	return map[string]any{"L": combined}, nil
+}
+
+func resolveListOperand(current map[string]any, operand any) ([]any, error) {
+	m, ok := operand.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("list_append operands must be list attributes or list values")
+	}
+
+	if attr, ok := m["__attr_ref"].(string); ok {
+		v, exists := current[attr]
+		if !exists {
+			return nil, fmt.Errorf("list_append requires existing list attribute %q", attr)
+		}
+		return asList(v)
+	}
+
+	if attr, ok := m["__if_not_exists_attr"].(string); ok {
+		if v, exists := current[attr]; exists {
+			return asList(v)
+		}
+		return asList(m["__if_not_exists_default"])
+	}
+
+	if literal, ok := m["__literal"]; ok {
+		return asList(literal)
+	}
+
+	return nil, fmt.Errorf("list_append operands must be list attributes or list values")
+}
+
+func asList(v any) ([]any, error) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("list_append supports only L operands")
+	}
+	list, ok := m["L"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("list_append supports only L operands")
+	}
+	out := make([]any, len(list))
+	copy(out, list)
+	return out, nil
 }
 
 func applyArithmetic(existing any, delta any, op string) (any, error) {

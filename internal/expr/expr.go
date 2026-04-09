@@ -576,12 +576,31 @@ func resolveAttr(token string, names map[string]string) (string, error) {
 	if token == "" {
 		return "", fmt.Errorf("empty attribute name")
 	}
-	if strings.HasPrefix(token, "#") {
-		r, ok := names[token]
-		if !ok {
-			return "", fmt.Errorf("missing expression name %q", token)
-		}
-		return r, nil
+	if !strings.Contains(token, "#") {
+		return token, nil
 	}
-	return token, nil
+	segments := strings.Split(token, ".")
+	resolved := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		name, indexes := parsePathSegment(seg)
+		if strings.HasPrefix(name, "#") {
+			r, ok := names[name]
+			if !ok {
+				return "", fmt.Errorf("missing expression name %q", name)
+			}
+			name = r
+		}
+		if name == "" {
+			return "", fmt.Errorf("empty attribute name")
+		}
+		var b strings.Builder
+		b.WriteString(name)
+		for _, idx := range indexes {
+			b.WriteString("[")
+			b.WriteString(strconv.Itoa(idx))
+			b.WriteString("]")
+		}
+		resolved = append(resolved, b.String())
+	}
+	return strings.Join(resolved, "."), nil
 }
