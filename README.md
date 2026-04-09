@@ -122,3 +122,26 @@ Failure semantics:
 
 - stale single-item writes return `ConditionalCheckFailedException`
 - stale transactional writes return `TransactionCanceledException` with ordered cancellation reasons
+
+Transactional optimistic update example:
+
+```text
+TransactWriteItems:
+  - Update:
+      TableName: users
+      Key: { pk: {"S":"u#1"} }
+      UpdateExpression: SET #v = #v + :one, #state = :next
+      ConditionExpression: #v = :expected
+      ExpressionAttributeNames:
+        #v -> version
+        #state -> state
+      ExpressionAttributeValues:
+        :one -> {"N":"1"}
+        :expected -> {"N":"12"}
+        :next -> {"S":"active"}
+```
+
+Application retry guidance:
+
+- on stale write errors, re-read the item, re-apply business logic, and retry with the new expected version
+- do not rely on implicit version management; keep version writes explicit in expressions
