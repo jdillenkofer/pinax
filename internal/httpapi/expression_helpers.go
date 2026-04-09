@@ -12,6 +12,7 @@ type updatePlan struct {
 	Set          map[string]any
 	Remove       []string
 	Add          map[string]any
+	Delete       map[string]any
 	TouchedAttrs map[string]struct{}
 }
 
@@ -21,27 +22,22 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 		return updatePlan{}, fmt.Errorf("UpdateExpression is required")
 	}
 
-	plan := updatePlan{Set: map[string]any{}, Add: map[string]any{}, Remove: []string{}, TouchedAttrs: map[string]struct{}{}}
+	plan := updatePlan{Set: map[string]any{}, Add: map[string]any{}, Delete: map[string]any{}, Remove: []string{}, TouchedAttrs: map[string]struct{}{}}
 	upper := strings.ToUpper(raw)
 
-	sections := []struct {
-		keyword string
-		nextA   string
-		nextB   string
-	}{
-		{keyword: "SET", nextA: "REMOVE", nextB: "ADD"},
-		{keyword: "REMOVE", nextA: "SET", nextB: "ADD"},
-		{keyword: "ADD", nextA: "SET", nextB: "REMOVE"},
-	}
+	keywords := []string{"SET", "REMOVE", "ADD", "DELETE"}
 
-	for _, section := range sections {
-		start := strings.Index(upper, section.keyword+" ")
+	for _, keyword := range keywords {
+		start := strings.Index(upper, keyword+" ")
 		if start < 0 {
 			continue
 		}
-		contentStart := start + len(section.keyword) + 1
+		contentStart := start + len(keyword) + 1
 		contentEnd := len(raw)
-		for _, nextKeyword := range []string{section.nextA, section.nextB} {
+		for _, nextKeyword := range keywords {
+			if nextKeyword == keyword {
+				continue
+			}
 			next := strings.Index(upper[contentStart:], " "+nextKeyword+" ")
 			if next >= 0 {
 				candidate := contentStart + next + 1
@@ -52,10 +48,10 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 		}
 		content := strings.TrimSpace(raw[contentStart:contentEnd])
 		if content == "" {
-			continue
+			return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"%s \"", keyword)
 		}
 
-		switch section.keyword {
+		switch keyword {
 		case "SET":
 			assignments := splitTopLevel(content, ',')
 			for _, assignment := range assignments {
@@ -109,11 +105,29 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 				plan.Add[attr] = v
 				plan.TouchedAttrs[attr] = struct{}{}
 			}
+		case "DELETE":
+			parts := splitTopLevel(content, ',')
+			for _, entry := range parts {
+				fields := strings.Fields(entry)
+				if len(fields) != 2 {
+					return updatePlan{}, fmt.Errorf("invalid DELETE clause")
+				}
+				attr, err := resolveNameStrict(fields[0], names)
+				if err != nil {
+					return updatePlan{}, err
+				}
+				v, ok := values[fields[1]]
+				if !ok {
+					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", fields[1])
+				}
+				plan.Delete[attr] = v
+				plan.TouchedAttrs[attr] = struct{}{}
+			}
 		}
 	}
 
-	if len(plan.Set) == 0 && len(plan.Remove) == 0 && len(plan.Add) == 0 {
-		return updatePlan{}, fmt.Errorf("only SET/REMOVE/ADD update expressions are supported")
+	if len(plan.Set) == 0 && len(plan.Remove) == 0 && len(plan.Add) == 0 && len(plan.Delete) == 0 {
+		return updatePlan{}, fmt.Errorf("only SET/REMOVE/ADD/DELETE update expressions are supported")
 	}
 	return plan, nil
 }
@@ -235,7 +249,91 @@ func applyUpdatePlan(current map[string]any, plan updatePlan) (map[string]any, m
 		changed[attr] = result
 	}
 
+	for attr, subset := range plan.Delete {
+		current, exists := next[attr]
+		if !exists {
+			continue
+		}
+		result, err := applyDeleteFromSet(current, subset)
+		if err != nil {
+			return nil, nil, err
+		}
+		if result == nil {
+			delete(next, attr)
+			changed[attr] = nil
+			continue
+		}
+		next[attr] = result
+		changed[attr] = result
+	}
+
 	return next, changed, nil
+}
+
+func applyDeleteFromSet(current any, subset any) (any, error) {
+	setType, currentValues, err := decodeSetAttribute(current)
+	if err != nil {
+		return nil, err
+	}
+	deleteType, deleteValues, err := decodeSetAttribute(subset)
+	if err != nil {
+		return nil, err
+	}
+	if setType != deleteType {
+		return nil, fmt.Errorf("DELETE action requires both operands to be the same set type")
+	}
+	if len(deleteValues) == 0 {
+		return nil, fmt.Errorf("DELETE action requires a non-empty set value")
+	}
+
+	remove := make(map[string]struct{}, len(deleteValues))
+	for _, v := range deleteValues {
+		remove[v] = struct{}{}
+	}
+	remaining := make([]any, 0, len(currentValues))
+	for _, v := range currentValues {
+		if _, ok := remove[v]; ok {
+			continue
+		}
+		remaining = append(remaining, v)
+	}
+	if len(remaining) == 0 {
+		return nil, nil
+	}
+	return map[string]any{setType: remaining}, nil
+}
+
+func decodeSetAttribute(v any) (string, []string, error) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", nil, fmt.Errorf("DELETE action supports only SS/NS/BS set attributes")
+	}
+	for _, setType := range []string{"SS", "NS", "BS"} {
+		raw, ok := m[setType]
+		if !ok {
+			continue
+		}
+		listAny, ok := raw.([]any)
+		if ok {
+			out := make([]string, 0, len(listAny))
+			for _, item := range listAny {
+				s, ok := item.(string)
+				if !ok {
+					return "", nil, fmt.Errorf("DELETE action supports only SS/NS/BS set attributes")
+				}
+				out = append(out, s)
+			}
+			return setType, out, nil
+		}
+		listStr, ok := raw.([]string)
+		if ok {
+			out := make([]string, len(listStr))
+			copy(out, listStr)
+			return setType, out, nil
+		}
+		return "", nil, fmt.Errorf("DELETE action supports only SS/NS/BS set attributes")
+	}
+	return "", nil, fmt.Errorf("DELETE action supports only SS/NS/BS set attributes")
 }
 
 func evalListOperand(raw string, names map[string]string, values map[string]any) (map[string]any, error) {

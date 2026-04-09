@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
@@ -1315,10 +1316,21 @@ func applyGSIUpdates(table model.Table, updates []struct {
 }
 
 type queryRequest struct {
-	TableName                 string            `json:"TableName"`
-	IndexName                 string            `json:"IndexName"`
-	KeyConditionExpression    string            `json:"KeyConditionExpression"`
-	FilterExpression          string            `json:"FilterExpression"`
+	TableName              string `json:"TableName"`
+	IndexName              string `json:"IndexName"`
+	KeyConditionExpression string `json:"KeyConditionExpression"`
+	KeyConditions          map[string]struct {
+		AttributeValueList []any  `json:"AttributeValueList"`
+		ComparisonOperator string `json:"ComparisonOperator"`
+	} `json:"KeyConditions"`
+	FilterExpression string `json:"FilterExpression"`
+	QueryFilter      map[string]struct {
+		AttributeValueList []any  `json:"AttributeValueList"`
+		ComparisonOperator string `json:"ComparisonOperator"`
+	} `json:"QueryFilter"`
+	ConditionalOperator       string            `json:"ConditionalOperator"`
+	AttributesToGet           []string          `json:"AttributesToGet"`
+	Select                    string            `json:"Select"`
 	ProjectionExpression      string            `json:"ProjectionExpression"`
 	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
@@ -1334,6 +1346,12 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	if len(req.QueryFilter) > 0 {
+		return nil, awserr.Validation("QueryFilter is not supported")
+	}
+	if strings.TrimSpace(req.ConditionalOperator) != "" {
+		return nil, awserr.Validation("ConditionalOperator is not supported")
+	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1348,10 +1366,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
 		return nil, err
 	}
-	pkToken, skToken, err := parseKeyCondition(req.KeyConditionExpression)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
+
 	targetHashKey := t.HashKey
 	targetRangeKey := t.RangeKey
 	targetHashType := t.HashType
@@ -1385,6 +1400,30 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 	}
 
+	selectMode, projectionExpression, err := normalizeQuerySelect(req, strings.TrimSpace(req.IndexName) != "", queryGSI != nil)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	if strings.TrimSpace(req.KeyConditionExpression) != "" && len(req.KeyConditions) > 0 {
+		return nil, awserr.Validation("KeyConditionExpression and KeyConditions cannot both be set")
+	}
+
+	expressionValues := cloneExpressionValues(req.ExpressionAttributeValues)
+	var pkToken keyExprToken
+	var skToken *sortKeyCondition
+	if strings.TrimSpace(req.KeyConditionExpression) != "" {
+		pkToken, skToken, err = parseKeyCondition(req.KeyConditionExpression)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+	} else {
+		pkToken, skToken, expressionValues, err = parseLegacyQueryKeyConditions(req.KeyConditions, targetHashKey, targetRangeKey, expressionValues)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+	}
+
 	pkAttr, err := resolveNameStrict(pkToken.attr, req.ExpressionAttributeNames)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
@@ -1392,7 +1431,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if pkAttr != targetHashKey {
 		return nil, awserr.Validation("partition key condition must target HASH key")
 	}
-	pkValue, ok := req.ExpressionAttributeValues[pkToken.value]
+	pkValue, ok := expressionValues[pkToken.value]
 	if !ok {
 		return nil, awserr.Validation("missing partition key expression value")
 	}
@@ -1479,7 +1518,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 
 		if skToken != nil {
-			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues, targetRangeType)
+			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, expressionValues, targetRangeType)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
@@ -1492,16 +1531,25 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		lastScanned = keyFromItem(t, item)
 		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(queryItem), req.ConsistentRead)
 
-		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, expressionValues)
 		if err != nil {
 			return nil, awserr.Validation(filterExpressionValidationMessage(err))
 		}
 		if matches {
-			projected, err := applyProjection(queryItem, req.ProjectionExpression, req.ExpressionAttributeNames)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
+			if selectMode != "COUNT" {
+				emit := queryItem
+				switch selectMode {
+				case "ALL_ATTRIBUTES":
+					emit = item
+				case "SPECIFIC_ATTRIBUTES":
+					projected, err := applyProjection(queryItem, projectionExpression, req.ExpressionAttributeNames)
+					if err != nil {
+						return nil, awserr.Validation(err.Error())
+					}
+					emit = projected
+				}
+				filtered = append(filtered, cloneItem(emit))
 			}
-			filtered = append(filtered, projected)
 			count++
 		}
 
@@ -1510,7 +1558,10 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 	}
 
-	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
+	resp := map[string]any{"Count": count, "ScannedCount": scanned}
+	if selectMode != "COUNT" {
+		resp["Items"] = filtered
+	}
 	if err := s.ensureReadCapacity(t, totalRead); err != nil {
 		return nil, err
 	}
@@ -1536,6 +1587,8 @@ type scanRequest struct {
 	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
 	Limit                     int               `json:"Limit"`
 	ExclusiveStartKey         map[string]any    `json:"ExclusiveStartKey"`
+	Segment                   *int              `json:"Segment"`
+	TotalSegments             *int              `json:"TotalSegments"`
 	ConsistentRead            bool              `json:"ConsistentRead"`
 	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
@@ -1544,6 +1597,25 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	var req scanRequest
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if (req.Segment == nil) != (req.TotalSegments == nil) {
+		return nil, awserr.Validation("Segment and TotalSegments must be provided together")
+	}
+	segmentEnabled := req.Segment != nil && req.TotalSegments != nil
+	segment := 0
+	totalSegments := 0
+	if segmentEnabled {
+		segment = *req.Segment
+		totalSegments = *req.TotalSegments
+		if totalSegments <= 0 {
+			return nil, awserr.Validation("TotalSegments must be greater than zero")
+		}
+		if totalSegments > 1000000 {
+			return nil, awserr.Validation("TotalSegments must be less than or equal to 1000000")
+		}
+		if segment < 0 || segment >= totalSegments {
+			return nil, awserr.Validation("Segment must be greater than or equal to 0 and less than TotalSegments")
+		}
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -1580,6 +1652,19 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	var lastScanned map[string]any
 	totalRead := 0.0
 	for _, item := range items {
+		if segmentEnabled {
+			rawPK, ok := item[t.HashKey]
+			if !ok {
+				continue
+			}
+			serializedPK, err := model.SerializeKeyValue(rawPK)
+			if err != nil {
+				continue
+			}
+			if scanSegmentForPK(serializedPK, totalSegments) != segment {
+				continue
+			}
+		}
 		scanned++
 		lastScanned = keyFromItem(t, item)
 		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
@@ -3096,6 +3181,176 @@ func addQueryConsumedCapacity(resp map[string]any, mode string, tableName, index
 	}
 	list := resp["ConsumedCapacity"].([]map[string]any)
 	resp["ConsumedCapacity"] = append(list, entry)
+}
+
+func cloneExpressionValues(in map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func normalizeQuerySelect(req queryRequest, hasIndex bool, isGSI bool) (string, string, error) {
+	projectionExpression := strings.TrimSpace(req.ProjectionExpression)
+	if len(req.AttributesToGet) > 0 {
+		if projectionExpression != "" {
+			return "", "", fmt.Errorf("AttributesToGet and ProjectionExpression cannot both be set")
+		}
+		attrs := make([]string, 0, len(req.AttributesToGet))
+		seen := map[string]struct{}{}
+		for _, attr := range req.AttributesToGet {
+			attr = strings.TrimSpace(attr)
+			if attr == "" {
+				continue
+			}
+			if _, ok := seen[attr]; ok {
+				continue
+			}
+			seen[attr] = struct{}{}
+			attrs = append(attrs, attr)
+		}
+		projectionExpression = strings.Join(attrs, ", ")
+	}
+
+	selectMode := strings.ToUpper(strings.TrimSpace(req.Select))
+	if selectMode == "" {
+		switch {
+		case projectionExpression != "":
+			selectMode = "SPECIFIC_ATTRIBUTES"
+		case hasIndex:
+			selectMode = "ALL_PROJECTED_ATTRIBUTES"
+		default:
+			selectMode = "ALL_ATTRIBUTES"
+		}
+	}
+
+	switch selectMode {
+	case "ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "SPECIFIC_ATTRIBUTES", "COUNT":
+	default:
+		return "", "", fmt.Errorf("unsupported Query Select value %q", req.Select)
+	}
+
+	if projectionExpression != "" && selectMode != "SPECIFIC_ATTRIBUTES" {
+		return "", "", fmt.Errorf("Select can only be SPECIFIC_ATTRIBUTES when ProjectionExpression or AttributesToGet is set")
+	}
+	if selectMode == "SPECIFIC_ATTRIBUTES" && projectionExpression == "" {
+		return "", "", fmt.Errorf("ProjectionExpression or AttributesToGet is required when Select is SPECIFIC_ATTRIBUTES")
+	}
+	if selectMode == "ALL_PROJECTED_ATTRIBUTES" && !hasIndex {
+		return "", "", fmt.Errorf("ALL_PROJECTED_ATTRIBUTES is only valid when querying an index")
+	}
+	if selectMode == "ALL_ATTRIBUTES" && isGSI {
+		return "", "", fmt.Errorf("ALL_ATTRIBUTES is not supported when querying a global secondary index")
+	}
+
+	return selectMode, projectionExpression, nil
+}
+
+func parseLegacyQueryKeyConditions(
+	keyConditions map[string]struct {
+		AttributeValueList []any  `json:"AttributeValueList"`
+		ComparisonOperator string `json:"ComparisonOperator"`
+	},
+	targetHashKey string,
+	targetRangeKey string,
+	expressionValues map[string]any,
+) (keyExprToken, *sortKeyCondition, map[string]any, error) {
+	if len(keyConditions) == 0 {
+		return keyExprToken{}, nil, expressionValues, fmt.Errorf("KeyConditionExpression is required")
+	}
+
+	for attr := range keyConditions {
+		if attr != targetHashKey && attr != targetRangeKey {
+			return keyExprToken{}, nil, expressionValues, fmt.Errorf("legacy KeyConditions may only include HASH and RANGE key attributes")
+		}
+	}
+
+	hashCond, ok := keyConditions[targetHashKey]
+	if !ok {
+		return keyExprToken{}, nil, expressionValues, fmt.Errorf("partition key condition must target HASH key")
+	}
+	if strings.ToUpper(strings.TrimSpace(hashCond.ComparisonOperator)) != "EQ" {
+		return keyExprToken{}, nil, expressionValues, fmt.Errorf("partition key condition must use '='")
+	}
+	if len(hashCond.AttributeValueList) != 1 {
+		return keyExprToken{}, nil, expressionValues, fmt.Errorf("partition key condition requires exactly one value")
+	}
+
+	pkToken := nextLegacyToken(expressionValues, ":__legacy_pk")
+	expressionValues[pkToken] = hashCond.AttributeValueList[0]
+	pk := keyExprToken{attr: targetHashKey, value: pkToken}
+
+	if targetRangeKey == "" {
+		if _, exists := keyConditions[targetRangeKey]; exists {
+			return keyExprToken{}, nil, expressionValues, fmt.Errorf("sort key condition is not supported for tables without a RANGE key")
+		}
+		return pk, nil, expressionValues, nil
+	}
+
+	rangeCond, ok := keyConditions[targetRangeKey]
+	if !ok {
+		return pk, nil, expressionValues, nil
+	}
+
+	op := strings.ToUpper(strings.TrimSpace(rangeCond.ComparisonOperator))
+	sk := &sortKeyCondition{attr: targetRangeKey}
+	valueToken1 := nextLegacyToken(expressionValues, ":__legacy_sk")
+
+	switch op {
+	case "EQ", "LT", "LE", "GT", "GE", "BEGINS_WITH":
+		if len(rangeCond.AttributeValueList) != 1 {
+			return keyExprToken{}, nil, expressionValues, fmt.Errorf("sort key condition %s requires exactly one value", op)
+		}
+		expressionValues[valueToken1] = rangeCond.AttributeValueList[0]
+		switch op {
+		case "EQ":
+			sk.op = "="
+		case "LT":
+			sk.op = "<"
+		case "LE":
+			sk.op = "<="
+		case "GT":
+			sk.op = ">"
+		case "GE":
+			sk.op = ">="
+		case "BEGINS_WITH":
+			sk.op = "begins_with"
+		}
+		sk.value1 = valueToken1
+	case "BETWEEN":
+		if len(rangeCond.AttributeValueList) != 2 {
+			return keyExprToken{}, nil, expressionValues, fmt.Errorf("sort key condition BETWEEN requires exactly two values")
+		}
+		expressionValues[valueToken1] = rangeCond.AttributeValueList[0]
+		valueToken2 := nextLegacyToken(expressionValues, ":__legacy_sk")
+		expressionValues[valueToken2] = rangeCond.AttributeValueList[1]
+		sk.op = "BETWEEN"
+		sk.value1 = valueToken1
+		sk.value2 = valueToken2
+	default:
+		return keyExprToken{}, nil, expressionValues, fmt.Errorf("unsupported sort key condition")
+	}
+
+	return pk, sk, expressionValues, nil
+}
+
+func scanSegmentForPK(serializedPK string, totalSegments int) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(serializedPK))
+	return int(h.Sum32() % uint32(totalSegments))
+}
+
+func nextLegacyToken(values map[string]any, prefix string) string {
+	if _, exists := values[prefix]; !exists {
+		return prefix
+	}
+	for i := 1; ; i++ {
+		token := fmt.Sprintf("%s_%d", prefix, i)
+		if _, exists := values[token]; !exists {
+			return token
+		}
+	}
 }
 
 func filterExpressionValidationMessage(err error) string {

@@ -142,3 +142,66 @@ func TestUpdateExpressionListAppendRejectsNonListOperand(t *testing.T) {
 		t.Fatalf("expected list operand message, got %q", err.Error())
 	}
 }
+
+func TestUpdateExpressionDeleteRemovesSetMembers(t *testing.T) {
+	plan, err := parseUpdateExpression("DELETE tags :remove", nil, map[string]any{
+		":remove": map[string]any{"SS": []any{"blue"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, _, err := applyUpdatePlan(map[string]any{
+		"tags": map[string]any{"SS": []any{"blue", "green"}},
+	}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	set, ok := next["tags"].(map[string]any)["SS"].([]any)
+	if !ok {
+		t.Fatal("expected SS set in result")
+	}
+	if len(set) != 1 || set[0] != "green" {
+		t.Fatalf("expected only green to remain, got %#v", set)
+	}
+}
+
+func TestUpdateExpressionDeleteDropsAttributeWhenSetBecomesEmpty(t *testing.T) {
+	plan, err := parseUpdateExpression("DELETE tags :remove", nil, map[string]any{
+		":remove": map[string]any{"SS": []any{"blue", "green"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next, _, err := applyUpdatePlan(map[string]any{
+		"tags": map[string]any{"SS": []any{"blue", "green"}},
+	}, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := next["tags"]; ok {
+		t.Fatal("expected tags attribute to be removed when set is empty")
+	}
+}
+
+func TestUpdateExpressionDeleteRejectsMismatchedSetTypes(t *testing.T) {
+	plan, err := parseUpdateExpression("DELETE score :remove", nil, map[string]any{
+		":remove": map[string]any{"SS": []any{"a"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = applyUpdatePlan(map[string]any{
+		"score": map[string]any{"NS": []any{"1", "2"}},
+	}, plan)
+	if err == nil {
+		t.Fatal("expected mismatched set type error")
+	}
+	if !strings.Contains(err.Error(), "same set type") {
+		t.Fatalf("expected mismatched set type message, got %q", err.Error())
+	}
+}
