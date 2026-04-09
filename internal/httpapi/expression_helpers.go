@@ -100,7 +100,7 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 				}
 				v, ok := values[fields[1]]
 				if !ok {
-					return updatePlan{}, fmt.Errorf("missing expression attribute value %q", fields[1])
+					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", fields[1])
 				}
 				plan.Add[attr] = v
 				plan.TouchedAttrs[attr] = struct{}{}
@@ -150,7 +150,7 @@ func evalSetValue(raw string, attrName string, names map[string]string, values m
 		}
 		v, ok := values[strings.TrimSpace(arg2)]
 		if !ok {
-			return nil, fmt.Errorf("missing expression attribute value %q", strings.TrimSpace(arg2))
+			return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", strings.TrimSpace(arg2))
 		}
 		return map[string]any{"__if_not_exists_attr": target, "__if_not_exists_default": v}, nil
 	}
@@ -167,7 +167,7 @@ func evalSetValue(raw string, attrName string, names map[string]string, values m
 			if resolvedLeft == attrName {
 				v, ok := values[right]
 				if !ok {
-					return nil, fmt.Errorf("missing expression attribute value %q", right)
+					return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", right)
 				}
 				return map[string]any{"__arith_op": op, "__arith_value": v}, nil
 			}
@@ -176,7 +176,7 @@ func evalSetValue(raw string, attrName string, names map[string]string, values m
 
 	v, ok := values[raw]
 	if !ok {
-		return nil, fmt.Errorf("missing expression attribute value %q", raw)
+		return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", raw)
 	}
 	return v, nil
 }
@@ -254,7 +254,7 @@ func evalListOperand(raw string, names map[string]string, values map[string]any)
 		}
 		v, ok := values[strings.TrimSpace(arg2)]
 		if !ok {
-			return nil, fmt.Errorf("missing expression attribute value %q", strings.TrimSpace(arg2))
+			return nil, fmt.Errorf("Invalid UpdateExpression: An expression attribute value used in expression is not defined; attribute value: %s", strings.TrimSpace(arg2))
 		}
 		return map[string]any{"__if_not_exists_attr": target, "__if_not_exists_default": v}, nil
 	}

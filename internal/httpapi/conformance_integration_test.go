@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +54,7 @@ type conformanceSnapshot struct {
 	BatchWriteDupErrorCode   string
 	TransactionErrorCode     string
 	TransactionReasonCodes   []string
+	TransactionReasonMsgs    []string
 	GetHasConsumedCapacity   bool
 	BatchGetConsumedCount    int
 	QueryHasConsumedCapacity bool
@@ -63,6 +66,13 @@ type conformanceSnapshot struct {
 	LSIKeysOnlyHasNonKey     bool
 	TTLStatusRecognized      bool
 	TTLHasAttributeName      bool
+	CRCDescribeTableValid    bool
+	CRCConditionalErrValid   bool
+	CRCTxCanceledErrValid    bool
+	ExprValidationCode       string
+	ExprValidationMessage    string
+	TxValidationCode         string
+	TxValidationMessage      string
 }
 
 type knownConformanceDifferences struct {
@@ -146,30 +156,40 @@ func TestConformanceStressAgainstDynamoDBLocal(t *testing.T) {
 	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)
 	localClient := mustConformanceClient(ctx, t, localEndpoint)
 
-	pinaxSnap := runConformanceStressScenario(ctx, t, pinaxClient, "pinax")
-	localSnap := runConformanceStressScenario(ctx, t, localClient, "local")
+	pinaxSnap := runConformanceStressScenario(ctx, t, pinaxClient.ddb, "pinax")
+	localSnap := runConformanceStressScenario(ctx, t, localClient.ddb, "local")
 	if pinaxSnap != localSnap {
 		t.Fatalf("stress conformance mismatch\npinax: %+v\nlocal: %+v", pinaxSnap, localSnap)
 	}
 }
 
-func mustConformanceClient(ctx context.Context, t *testing.T, endpoint string) *dynamodb.Client {
+type conformanceClient struct {
+	ddb      *dynamodb.Client
+	recorder *crcHeaderRecorder
+}
+
+func mustConformanceClient(ctx context.Context, t *testing.T, endpoint string) conformanceClient {
 	t.Helper()
+	recorder := &crcHeaderRecorder{}
+	httpClient := &http.Client{Transport: &recordingTransport{base: http.DefaultTransport, recorder: recorder}}
 
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		config.WithHTTPClient(httpClient),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 	})
+	return conformanceClient{ddb: client, recorder: recorder}
 }
 
-func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.Client, prefix string) conformanceSnapshot {
+func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceClient, prefix string) conformanceSnapshot {
 	t.Helper()
+	client := cc.ddb
 
 	table := fmt.Sprintf("cf_%s_%d", prefix, time.Now().UnixNano())
 	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
@@ -191,6 +211,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 	if err != nil {
 		t.Fatal(err)
 	}
+	crcDescribeTableValid := crcHeaderParseable(cc.recorder.last())
 
 	for _, sk := range []string{"1", "2", "10"} {
 		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
@@ -282,6 +303,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 	}
 	condCode := apiErrorCode(err)
 	condHasMsg := apiErrorMessage(err) != ""
+	crcConditionalErrValid := crcHeaderParseable(cc.recorder.last())
 
 	_, err = client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: map[string]types.KeysAndAttributes{
 		table: {
@@ -353,7 +375,32 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 	txCode := apiErrorCode(err)
 	txHasMsg := apiErrorMessage(err) != ""
 	txReasons := transactionReasonCodes(err)
+	txReasonMsgs := transactionReasonMessages(err)
 	txReasonCount := len(txReasons)
+	crcTxCanceledErrValid := crcHeaderParseable(cc.recorder.last())
+
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(table),
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}},
+		UpdateExpression:          aws.String("SET #v = :missing"),
+		ExpressionAttributeNames:  map[string]string{"#v": "version"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":other": &types.AttributeValueMemberN{Value: "1"}},
+	})
+	if err == nil {
+		t.Fatal("expected invalid expression update error")
+	}
+	exprValidationCode := apiErrorCode(err)
+	exprValidationMsg := apiErrorMessage(err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{{
+		Put:    &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#tx"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
+		Delete: &types.Delete{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#tx"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
+	}}})
+	if err == nil {
+		t.Fatal("expected invalid transact write shape error")
+	}
+	txValidationCode := apiErrorCode(err)
+	txValidationMsg := apiErrorMessage(err)
 
 	tg, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal, TransactItems: []types.TransactGetItem{{
 		Get: &types.Get{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
@@ -581,6 +628,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		BatchWriteDupErrorCode:   batchWriteDupCode,
 		TransactionErrorCode:     txCode,
 		TransactionReasonCodes:   txReasons,
+		TransactionReasonMsgs:    txReasonMsgs,
 		GetHasConsumedCapacity:   getOut.ConsumedCapacity != nil,
 		BatchGetConsumedCount:    len(bg.ConsumedCapacity),
 		QueryHasConsumedCapacity: q1.ConsumedCapacity != nil,
@@ -592,6 +640,13 @@ func runConformanceScenario(ctx context.Context, t *testing.T, client *dynamodb.
 		LSIKeysOnlyHasNonKey:     lsiHasNonKey,
 		TTLStatusRecognized:      ttlStatus == types.TimeToLiveStatusEnabled || ttlStatus == types.TimeToLiveStatusEnabling,
 		TTLHasAttributeName:      ttlHasAttr,
+		CRCDescribeTableValid:    crcDescribeTableValid,
+		CRCConditionalErrValid:   crcConditionalErrValid,
+		CRCTxCanceledErrValid:    crcTxCanceledErrValid,
+		ExprValidationCode:       exprValidationCode,
+		ExprValidationMessage:    exprValidationMsg,
+		TxValidationCode:         txValidationCode,
+		TxValidationMessage:      txValidationMsg,
 	}
 }
 
@@ -717,6 +772,64 @@ func transactionReasonCodes(err error) []string {
 		out = append(out, *r.Code)
 	}
 	return out
+}
+
+func transactionReasonMessages(err error) []string {
+	var txErr *types.TransactionCanceledException
+	if !errors.As(err, &txErr) {
+		return nil
+	}
+	out := make([]string, 0, len(txErr.CancellationReasons))
+	for _, r := range txErr.CancellationReasons {
+		if r.Message == nil {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, *r.Message)
+	}
+	return out
+}
+
+type crcHeaderRecorder struct {
+	mu      sync.Mutex
+	lastCRC string
+}
+
+func (r *crcHeaderRecorder) set(headers http.Header) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastCRC = headers.Get("X-Amz-Crc32")
+}
+
+func (r *crcHeaderRecorder) last() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastCRC
+}
+
+type recordingTransport struct {
+	base     http.RoundTripper
+	recorder *crcHeaderRecorder
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil && resp != nil && t.recorder != nil {
+		t.recorder.set(resp.Header)
+	}
+	return resp, err
+}
+
+func crcHeaderParseable(crcStr string) bool {
+	crcStr = strings.TrimSpace(crcStr)
+	if crcStr == "" {
+		return false
+	}
+	_, err := strconv.ParseUint(crcStr, 10, 32)
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 func loadKnownConformanceDifferences(t *testing.T) map[string]string {

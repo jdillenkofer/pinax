@@ -1,3 +1,6 @@
 {
-  "fields": {}
+  "fields": {
+    "CRCConditionalErrValid": "DynamoDB Local omits or does not expose parseable CRC headers on some error responses",
+    "CRCTxCanceledErrValid": "DynamoDB Local omits or does not expose parseable CRC headers on some error responses"
+  }
 }

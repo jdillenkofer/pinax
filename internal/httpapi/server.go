@@ -2029,7 +2029,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			actions++
 		}
 		if actions != 1 {
-			return nil, awserr.Validation("each TransactWriteItem must include exactly one operation")
+			return nil, awserr.Validation("TransactItems can only contain one of Check, Put, Update or Delete")
 		}
 
 		if len(txItem.Put.Item) > 0 {
