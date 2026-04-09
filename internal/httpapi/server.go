@@ -1815,6 +1815,23 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	writeByTable := map[string]float64{}
 
 	for i, txItem := range req.TransactItems {
+		actions := 0
+		if len(txItem.Put.Item) > 0 {
+			actions++
+		}
+		if len(txItem.Delete.Key) > 0 {
+			actions++
+		}
+		if len(txItem.Update.Key) > 0 {
+			actions++
+		}
+		if len(txItem.ConditionCheck.Key) > 0 {
+			actions++
+		}
+		if actions != 1 {
+			return nil, awserr.Validation("each TransactWriteItem must include exactly one operation")
+		}
+
 		if len(txItem.Put.Item) > 0 {
 			if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
 				return nil, awserr.Validation(err.Error())

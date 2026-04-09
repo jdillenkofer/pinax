@@ -326,6 +326,36 @@ func TestTransactWriteDuplicateTargetValidation(t *testing.T) {
 	}
 }
 
+func TestTransactWriteRejectsMultipleOperationsInOneItem(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txmultiop"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{
+			Put:    &types.Put{TableName: aws.String("txmultiop"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+			Delete: &types.Delete{TableName: aws.String("txmultiop"), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+		},
+	}})
+	if err == nil {
+		t.Fatal("expected validation error for multiple operations in one transaction item")
+	}
+}
+
 func TestTransactWriteConditionFailureReturnsCancellationReasons(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 
