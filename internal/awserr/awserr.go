@@ -33,6 +33,10 @@ func ConditionalCheckFailed(msg string) *APIError {
 	return &APIError{Code: "ConditionalCheckFailedException", Message: msg, Status: http.StatusBadRequest}
 }
 
+func ProvisionedThroughputExceeded(msg string) *APIError {
+	return &APIError{Code: "ProvisionedThroughputExceededException", Message: msg, Status: http.StatusBadRequest}
+}
+
 type CancellationReason struct {
 	Code    string         `json:"Code"`
 	Message string         `json:"Message,omitempty"`

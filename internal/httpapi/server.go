@@ -553,6 +553,10 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if !ok {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
+	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item))
+	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+		return nil, err
+	}
 
 	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, req.Item); err != nil {
 		return nil, err
@@ -563,7 +567,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{}
-	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, writeUnits)
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -608,10 +612,18 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	item, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			readUnits := model.CalculateReadCapacityUnits(1, req.ConsistentRead)
+			if err := ensureReadCapacity(t, readUnits); err != nil {
+				return nil, err
+			}
 			resp := map[string]any{}
-			setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(1, req.ConsistentRead), 0)
+			setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, readUnits, 0)
 			return resp, nil
 		}
+		return nil, err
+	}
+	readUnits := model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
+	if err := ensureReadCapacity(t, readUnits); err != nil {
 		return nil, err
 	}
 
@@ -624,7 +636,7 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 	resp := map[string]any{"Item": projected}
-	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead), 0)
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, readUnits, 0)
 	return resp, nil
 }
 
@@ -674,6 +686,10 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if !ok {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
+	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+		return nil, err
+	}
 	if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 		return nil, err
 	}
@@ -683,7 +699,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	resp := map[string]any{}
-	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, writeUnits)
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -768,6 +784,10 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if model.ItemTooLarge(updated) {
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
+	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
+	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+		return nil, err
+	}
 	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
 		return nil, err
 	}
@@ -777,7 +797,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	resp := map[string]any{}
-	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated)))
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, 0, writeUnits)
 
 	if strings.TrimSpace(req.ReturnValues) == "" || req.ReturnValues == "NONE" {
 		return resp, nil
@@ -1364,6 +1384,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
+	if err := ensureReadCapacity(t, totalRead); err != nil {
+		return nil, err
+	}
 	indexType := ""
 	if queryGSI != nil {
 		indexType = "GSI"
@@ -1456,6 +1479,9 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
+	if err := ensureReadCapacity(t, totalRead); err != nil {
+		return nil, err
+	}
 	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
@@ -1552,6 +1578,15 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 				"ProjectionExpression":     itemReq.ProjectionExpression,
 				"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
 			}
+		}
+	}
+	for tableName, units := range readByTable {
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureReadCapacity(t, units); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1689,6 +1724,15 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 			}
 		}
 	}
+	for tableName, units := range writeByTable {
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureWriteCapacity(t, units); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -1752,6 +1796,15 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		}
 		readByTable[g.TableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), true)
 		responses = append(responses, map[string]any{"Item": item})
+	}
+	for tableName, units := range readByTable {
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureReadCapacity(t, units); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -2074,6 +2127,15 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 
 		return nil, awserr.Validation("each transact item must contain one operation")
 	}
+	for tableName, units := range writeByTable {
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureWriteCapacity(t, units); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -2120,6 +2182,30 @@ func processingLimitFromEnv(name string) int {
 		return 0
 	}
 	return v
+}
+
+func enforceProvisionedLimits() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("PINAX_ENFORCE_PROVISIONED_LIMITS")), "true")
+}
+
+func ensureReadCapacity(t model.Table, units float64) error {
+	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
+		return nil
+	}
+	if t.ReadCapacityUnits > 0 && units > float64(t.ReadCapacityUnits) {
+		return awserr.ProvisionedThroughputExceeded("read capacity exceeded for table " + t.Name)
+	}
+	return nil
+}
+
+func ensureWriteCapacity(t model.Table, units float64) error {
+	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
+		return nil
+	}
+	if t.WriteCapacityUnits > 0 && units > float64(t.WriteCapacityUnits) {
+		return awserr.ProvisionedThroughputExceeded("write capacity exceeded for table " + t.Name)
+	}
+	return nil
 }
 
 func decode(body []byte, out any) error {

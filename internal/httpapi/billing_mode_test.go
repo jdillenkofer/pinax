@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -117,5 +118,69 @@ func TestCreateTableRejectsProvisionedThroughputWithPayPerRequest(t *testing.T) 
 	var inUse *types.ResourceInUseException
 	if errors.As(err, &inUse) {
 		t.Fatalf("expected validation error, got resource in use: %v", err)
+	}
+}
+
+func TestProvisionedModeThrottlesReadsWhenEnabled(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_ENFORCE_PROVISIONED_LIMITS", "true")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String("bmthrottle1"),
+		BillingMode: types.BillingModeProvisioned,
+		ProvisionedThroughput: &types.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(1),
+			WriteCapacityUnits: aws.Int64(10),
+		},
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 6000)
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("bmthrottle1"), Item: map[string]types.AttributeValue{
+		"pk":      &types.AttributeValueMemberS{Value: "a"},
+		"payload": &types.AttributeValueMemberS{Value: large},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String("bmthrottle1"), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}, ConsistentRead: aws.Bool(true)})
+	if err == nil {
+		t.Fatal("expected ProvisionedThroughputExceededException on read")
+	}
+}
+
+func TestProvisionedModeThrottlesWritesWhenEnabled(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_ENFORCE_PROVISIONED_LIMITS", "true")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String("bmthrottle2"),
+		BillingMode: types.BillingModeProvisioned,
+		ProvisionedThroughput: &types.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(10),
+			WriteCapacityUnits: aws.Int64(1),
+		},
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 2048)
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("bmthrottle2"), Item: map[string]types.AttributeValue{
+		"pk":      &types.AttributeValueMemberS{Value: "a"},
+		"payload": &types.AttributeValueMemberS{Value: large},
+	}})
+	if err == nil {
+		t.Fatal("expected ProvisionedThroughputExceededException on write")
 	}
 }
