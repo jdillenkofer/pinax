@@ -192,6 +192,36 @@ func TestGetItemRejectsWrongKeyType(t *testing.T) {
 	}
 }
 
+func TestQueryRejectsWrongKeyType(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("keytype2"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("keytype2"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "wrong"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for wrong query key type")
+	}
+}
+
 func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)
@@ -218,5 +248,54 @@ func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
 	_, err = client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("dellife")})
 	if err == nil {
 		t.Fatal("expected table to be removed after deletion transition")
+	}
+}
+
+func TestScanFilterLimitReturnsLastEvaluatedKeyByScannedItems(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("scanpage"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("scanpage"), Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "a"},
+			"sk": &types.AttributeValueMemberN{Value: string(rune('0' + i))},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        aws.String("scanpage"),
+		FilterExpression: aws.String("sk = :target"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":target": &types.AttributeValueMemberN{Value: "3"},
+		},
+		Limit: aws.Int32(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Count != 0 {
+		t.Fatalf("expected 0 returned items in first page, got %d", out.Count)
+	}
+	if out.ScannedCount != 2 {
+		t.Fatalf("expected scanned count 2, got %d", out.ScannedCount)
+	}
+	if out.LastEvaluatedKey == nil {
+		t.Fatal("expected LastEvaluatedKey based on scanned limit")
 	}
 }
