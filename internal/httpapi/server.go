@@ -13,6 +13,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -343,6 +344,12 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.deleteBackup(r, body)
 	case "RestoreTableFromBackup":
 		return s.restoreTableFromBackup(r, body)
+	case "UpdateContinuousBackups":
+		return s.updateContinuousBackups(r, body)
+	case "DescribeContinuousBackups":
+		return s.describeContinuousBackups(r, body)
+	case "RestoreTableToPointInTime":
+		return s.restoreTableToPointInTime(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -1084,6 +1091,7 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 	tableToCreate.Status = model.TableStatusCreating
 	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
 	tableToCreate.CreatedAt = time.Now().Unix()
+	tableToCreate.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: 35}
 
 	billingMode := tableToCreate.BillingMode
 	readCapacity := tableToCreate.ReadCapacityUnits
@@ -1151,6 +1159,329 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 		return nil, err
 	}
 	return map[string]any{"TableDescription": tableToCreate.Description(int64(len(backup.SnapshotItems)))}, nil
+}
+
+type updateContinuousBackupsRequest struct {
+	TableName                        string `json:"TableName"`
+	PointInTimeRecoverySpecification *struct {
+		PointInTimeRecoveryEnabled *bool `json:"PointInTimeRecoveryEnabled"`
+		RecoveryPeriodInDays       int64 `json:"RecoveryPeriodInDays"`
+	} `json:"PointInTimeRecoverySpecification"`
+}
+
+type describeContinuousBackupsRequest struct {
+	TableName string `json:"TableName"`
+}
+
+type restoreTableToPointInTimeRequest struct {
+	SourceTableName            string   `json:"SourceTableName"`
+	SourceTableArn             string   `json:"SourceTableArn"`
+	TargetTableName            string   `json:"TargetTableName"`
+	UseLatestRestorableTime    bool     `json:"UseLatestRestorableTime"`
+	RestoreDateTime            *float64 `json:"RestoreDateTime"`
+	BillingModeOverride        string   `json:"BillingModeOverride"`
+	OnDemandThroughputOverride *struct {
+		MaxReadRequestUnits  int64 `json:"MaxReadRequestUnits"`
+		MaxWriteRequestUnits int64 `json:"MaxWriteRequestUnits"`
+	} `json:"OnDemandThroughputOverride"`
+	ProvisionedThroughputOverride *struct {
+		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+	} `json:"ProvisionedThroughputOverride"`
+	SSESpecificationOverride *struct {
+		Enabled        bool   `json:"Enabled"`
+		SSEType        string `json:"SSEType"`
+		KMSMasterKeyID string `json:"KMSMasterKeyId"`
+	} `json:"SSESpecificationOverride"`
+	GlobalSecondaryIndexOverride []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+			WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+		} `json:"ProvisionedThroughput"`
+	} `json:"GlobalSecondaryIndexOverride"`
+	LocalSecondaryIndexOverride []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+	} `json:"LocalSecondaryIndexOverride"`
+}
+
+func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[string]any, error) {
+	var req updateContinuousBackupsRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.TableName) == "" {
+		return nil, awserr.Validation("TableName is required")
+	}
+	if req.PointInTimeRecoverySpecification == nil || req.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled == nil {
+		return nil, awserr.Validation("PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled is required")
+	}
+	if req.PointInTimeRecoverySpecification.RecoveryPeriodInDays != 0 {
+		if req.PointInTimeRecoverySpecification.RecoveryPeriodInDays < 1 || req.PointInTimeRecoverySpecification.RecoveryPeriodInDays > 35 {
+			return nil, awserr.Validation("RecoveryPeriodInDays must be between 1 and 35")
+		}
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, normalizeTableNameIdentifier(req.TableName))
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	nowMs := time.Now().UnixMilli()
+	enable := *req.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled
+	recoveryDays := t.PITR.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	if req.PointInTimeRecoverySpecification.RecoveryPeriodInDays != 0 {
+		recoveryDays = req.PointInTimeRecoverySpecification.RecoveryPeriodInDays
+	}
+	enabledAt := t.PITR.EnabledAt
+	if enable {
+		if !t.PITR.Enabled || enabledAt == 0 {
+			enabledAt = nowMs
+			items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				pk, sk, err := model.ExtractItemKeys(t, item)
+				if err != nil {
+					return nil, awserr.Validation(err.Error())
+				}
+				if err := s.store.AppendItemChange(r.Context(), tx, t.Name, pk, sk, "PUT", item, enabledAt); err != nil {
+					return nil, err
+				}
+			}
+		}
+	} else {
+		enabledAt = 0
+	}
+
+	next := model.PointInTimeRecovery{Enabled: enable, RecoveryPeriodInDays: recoveryDays, EnabledAt: enabledAt}
+	if err := s.store.UpdatePointInTimeRecovery(r.Context(), tx, t.Name, next); err != nil {
+		return nil, err
+	}
+	t.PITR = next
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ContinuousBackupsDescription": continuousBackupsDescription(t, nowMs)}, nil
+}
+
+func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[string]any, error) {
+	var req describeContinuousBackupsRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.TableName) == "" {
+		return nil, awserr.Validation("TableName is required")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, normalizeTableNameIdentifier(req.TableName))
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	nowMs := time.Now().UnixMilli()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ContinuousBackupsDescription": continuousBackupsDescription(t, nowMs)}, nil
+}
+
+func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[string]any, error) {
+	var req restoreTableToPointInTimeRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.TargetTableName) == "" {
+		return nil, awserr.Validation("TargetTableName is required")
+	}
+	if !backupNamePattern.MatchString(req.TargetTableName) {
+		return nil, awserr.Validation("TargetTableName must match [a-zA-Z0-9_.-]+ and be between 3 and 255 characters")
+	}
+	if strings.TrimSpace(req.SourceTableName) == "" && strings.TrimSpace(req.SourceTableArn) == "" {
+		return nil, awserr.Validation("SourceTableName or SourceTableArn is required")
+	}
+	if strings.TrimSpace(req.SourceTableName) != "" && strings.TrimSpace(req.SourceTableArn) != "" {
+		return nil, awserr.Validation("Specify only one of SourceTableName or SourceTableArn")
+	}
+	if req.UseLatestRestorableTime && req.RestoreDateTime != nil {
+		return nil, awserr.Validation("UseLatestRestorableTime and RestoreDateTime are mutually exclusive")
+	}
+	if !req.UseLatestRestorableTime && req.RestoreDateTime == nil {
+		return nil, awserr.Validation("RestoreDateTime is required unless UseLatestRestorableTime is true")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	sourceName := normalizeTableNameIdentifier(firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn)))
+	source, err := s.getTableWithLifecycle(r.Context(), tx, sourceName)
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+	if !source.PITR.Enabled {
+		return nil, &awserr.APIError{Code: "PointInTimeRecoveryUnavailableException", Message: "Point in time recovery has not yet been enabled for this source table.", Status: http.StatusBadRequest}
+	}
+
+	nowMs := time.Now().UnixMilli()
+	earliest, latest := pitrRestoreWindow(source, nowMs)
+	restoreAt := latest
+	if req.RestoreDateTime != nil {
+		restoreAt = int64(math.Round(*req.RestoreDateTime * 1000))
+	}
+	if restoreAt < earliest || restoreAt > latest {
+		return nil, &awserr.APIError{Code: "InvalidRestoreTimeException", Message: "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.", Status: http.StatusBadRequest}
+	}
+
+	if existing, err := s.store.GetTable(r.Context(), tx, req.TargetTableName); err == nil {
+		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
+			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
+		}
+		return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	tableToCreate := source
+	tableToCreate.Name = req.TargetTableName
+	tableToCreate.Status = model.TableStatusCreating
+	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
+	tableToCreate.CreatedAt = time.Now().Unix()
+	tableToCreate.Tags = nil
+	tableToCreate.Stream = model.StreamSpecification{}
+	tableToCreate.TimeToLive = model.TimeToLive{Enabled: false, Status: model.TTLStatusDisabled}
+	tableToCreate.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: source.PITR.RecoveryPeriodInDays}
+
+	billingMode := tableToCreate.BillingMode
+	readCapacity := tableToCreate.ReadCapacityUnits
+	writeCapacity := tableToCreate.WriteCapacityUnits
+	if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
+		billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+	}
+	tableToCreate.BillingMode = billingMode
+	tableToCreate.ReadCapacityUnits = readCapacity
+	tableToCreate.WriteCapacityUnits = writeCapacity
+
+	if req.SSESpecificationOverride != nil {
+		normalizedSSE, err := normalizeSSESpecCreate(&struct {
+			Enabled        bool   `json:"Enabled"`
+			SSEType        string `json:"SSEType"`
+			KMSMasterKeyID string `json:"KMSMasterKeyId"`
+		}{
+			Enabled:        req.SSESpecificationOverride.Enabled,
+			SSEType:        req.SSESpecificationOverride.SSEType,
+			KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
+		})
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		tableToCreate.SSE = normalizedSSE
+	}
+	if req.OnDemandThroughputOverride != nil {
+		if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
+			return nil, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
+		}
+	}
+
+	updatedGSIs, err := applyRestoreGSIOverride(tableToCreate.GSIs, req.GlobalSecondaryIndexOverride, tableToCreate.BillingMode)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tableToCreate.GSIs = updatedGSIs
+	updatedLSIs, err := applyRestoreLSIOverride(tableToCreate.LSIs, req.LocalSecondaryIndexOverride)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tableToCreate.LSIs = updatedLSIs
+
+	if err := s.store.CreateTable(r.Context(), tx, tableToCreate); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
+		}
+		return nil, err
+	}
+
+	changes, err := s.store.ListItemChangesUpTo(r.Context(), tx, source.Name, restoreAt)
+	if err != nil {
+		return nil, err
+	}
+	state := map[string]map[string]any{}
+	for _, change := range changes {
+		key := change.PK + "\x00" + change.SK
+		if strings.EqualFold(change.ChangeType, "DELETE") {
+			delete(state, key)
+			continue
+		}
+		if change.Item != nil {
+			state[key] = change.Item
+		}
+	}
+	count := int64(0)
+	for _, item := range state {
+		pk, sk, err := model.ExtractItemKeys(tableToCreate, item)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if err := s.store.PutItem(r.Context(), tx, tableToCreate.Name, pk, sk, item); err != nil {
+			return nil, err
+		}
+		count++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"TableDescription": tableToCreate.Description(count)}, nil
 }
 
 type putItemRequest struct {
@@ -3542,6 +3873,45 @@ func normalizeTableNameIdentifier(v string) string {
 		}
 	}
 	return v
+}
+
+func pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
+	recoveryDays := t.PITR.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	earliest := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
+	if t.PITR.EnabledAt > 0 && t.PITR.EnabledAt > earliest {
+		earliest = t.PITR.EnabledAt
+	}
+	latest := nowMs
+	if latest < earliest {
+		latest = earliest
+	}
+	return earliest, latest
+}
+
+func continuousBackupsDescription(t model.Table, nowMs int64) map[string]any {
+	pitrStatus := model.PointInTimeRecoveryStatusDisabled
+	recoveryDays := t.PITR.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	pitrDesc := map[string]any{
+		"PointInTimeRecoveryStatus": pitrStatus,
+		"RecoveryPeriodInDays":      recoveryDays,
+	}
+	if t.PITR.Enabled {
+		pitrStatus = model.PointInTimeRecoveryStatusEnabled
+		earliest, latest := pitrRestoreWindow(t, nowMs)
+		pitrDesc["PointInTimeRecoveryStatus"] = pitrStatus
+		pitrDesc["EarliestRestorableDateTime"] = float64(earliest) / 1000.0
+		pitrDesc["LatestRestorableDateTime"] = float64(latest) / 1000.0
+	}
+	return map[string]any{
+		"ContinuousBackupsStatus":        model.ContinuousBackupsStatusEnabled,
+		"PointInTimeRecoveryDescription": pitrDesc,
+	}
 }
 
 func localBackupARN(tableName string, backupName string, createdAt int64) string {

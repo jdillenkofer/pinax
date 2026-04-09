@@ -143,10 +143,18 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 		sseEnabled = 1
 	}
 	sseStatus := firstNonEmpty(t.SSE.Status, "DISABLED")
+	pitrEnabled := 0
+	if t.PITR.Enabled {
+		pitrEnabled = 1
+	}
+	pitrRecoveryDays := t.PITR.RecoveryPeriodInDays
+	if pitrRecoveryDays <= 0 {
+		pitrRecoveryDays = 35
+	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt, pitrEnabled, pitrRecoveryDays, t.PITR.EnabledAt)
 	if err != nil {
 		return err
 	}
@@ -179,11 +187,14 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var ttlAttr sql.NullString
 	var ttlStatus string
 	var ttlStatusAt int64
+	var pitrEnabled int
+	var pitrRecoveryDays int64
+	var pitrEnabledAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
+		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt, &pitrEnabled, &pitrRecoveryDays, &pitrEnabledAt)
 	if err != nil {
 		return model.Table{}, err
 	}
@@ -223,6 +234,9 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	t.TimeToLive.AttrName = ttlAttr.String
 	t.TimeToLive.Status = ttlStatus
 	t.TimeToLive.StatusAt = ttlStatusAt
+	t.PITR.Enabled = pitrEnabled == 1
+	t.PITR.RecoveryPeriodInDays = pitrRecoveryDays
+	t.PITR.EnabledAt = pitrEnabledAt
 	return t, nil
 }
 
@@ -330,6 +344,11 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 			return err
 		}
 	}
+	if t.PITR.Enabled {
+		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "PUT", item, time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -338,7 +357,19 @@ func (s *Store) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk st
 	_, err := tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
-	return err
+	if err != nil {
+		return err
+	}
+	t, err := s.GetTable(ctx, tx, tableName)
+	if err != nil {
+		return err
+	}
+	if t.PITR.Enabled {
+		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) QueryByPK(ctx context.Context, tx *sql.Tx, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
@@ -543,6 +574,74 @@ func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName stri
 	_, err := tx.ExecContext(ctx, `
 		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ?, ttl_status = ?, ttl_status_at = ? WHERE name = ?
 	`, ttlEnabled, nullIfEmpty(ttl.AttrName), ttl.Status, ttl.StatusAt, tableName)
+	return err
+}
+
+func (s *Store) UpdatePointInTimeRecovery(ctx context.Context, tx *sql.Tx, tableName string, pitr model.PointInTimeRecovery) error {
+	pitrEnabled := 0
+	if pitr.Enabled {
+		pitrEnabled = 1
+	}
+	recoveryDays := pitr.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE tables SET pitr_enabled = ?, pitr_recovery_period_days = ?, pitr_enabled_at = ? WHERE name = ?
+	`, pitrEnabled, recoveryDays, pitr.EnabledAt, tableName)
+	return err
+}
+
+func (s *Store) ListItemChangesUpTo(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) ([]model.ItemChange, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk, change_type, item_json, changed_at, id
+		FROM item_history
+		WHERE table_name = ? AND changed_at <= ?
+		ORDER BY changed_at ASC, id ASC
+	`, tableName, upTo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]model.ItemChange, 0)
+	for rows.Next() {
+		var change model.ItemChange
+		var raw []byte
+		if err := rows.Scan(&change.PK, &change.SK, &change.ChangeType, &raw, &change.ChangedAt, &change.Sequence); err != nil {
+			return nil, err
+		}
+		change.TableName = tableName
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &change.Item); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) AppendItemChange(ctx context.Context, tx *sql.Tx, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+	return s.appendItemHistory(ctx, tx, tableName, pk, sk, changeType, item, changedAt)
+}
+
+func (s *Store) appendItemHistory(ctx context.Context, tx *sql.Tx, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+	var raw any
+	if item != nil {
+		payload, err := json.Marshal(item)
+		if err != nil {
+			return err
+		}
+		raw = string(payload)
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO item_history(table_name, pk, sk, change_type, item_json, changed_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, tableName, pk, sk, changeType, raw, changedAt)
 	return err
 }
 

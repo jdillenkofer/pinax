@@ -28,6 +28,10 @@ const (
 	TTLStatusEnabling  = "ENABLING"
 	TTLStatusDisabled  = "DISABLED"
 	TTLStatusDisabling = "DISABLING"
+
+	PointInTimeRecoveryStatusEnabled  = "ENABLED"
+	PointInTimeRecoveryStatusDisabled = "DISABLED"
+	ContinuousBackupsStatusEnabled    = "ENABLED"
 )
 
 type TimeToLive struct {
@@ -35,6 +39,14 @@ type TimeToLive struct {
 	AttrName string
 	Status   string
 	StatusAt int64
+}
+
+type PointInTimeRecovery struct {
+	Enabled              bool
+	RecoveryPeriodInDays int64
+	EnabledAt            int64
+	LatestRestorableAt   int64
+	EarliestRestorableAt int64
 }
 
 type Backup struct {
@@ -74,6 +86,17 @@ type Table struct {
 	CreatedAt          int64
 
 	TimeToLive TimeToLive
+	PITR       PointInTimeRecovery
+}
+
+type ItemChange struct {
+	TableName  string
+	PK         string
+	SK         string
+	ChangeType string
+	Item       map[string]any
+	ChangedAt  int64
+	Sequence   int64
 }
 
 type StreamSpecification struct {

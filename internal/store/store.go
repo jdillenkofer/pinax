@@ -25,6 +25,9 @@ type Store interface {
 	UpdateTableBilling(ctx context.Context, tx *sql.Tx, tableName string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
 	UpdateTableOptions(ctx context.Context, tx *sql.Tx, tableName string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error
 	UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName string, ttl model.TimeToLive) error
+	UpdatePointInTimeRecovery(ctx context.Context, tx *sql.Tx, tableName string, pitr model.PointInTimeRecovery) error
+	AppendItemChange(ctx context.Context, tx *sql.Tx, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error
+	ListItemChangesUpTo(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) ([]model.ItemChange, error)
 	GetTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, token string, now int64) (model.TransactWriteIdempotencyRecord, error)
 	PutTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, record model.TransactWriteIdempotencyRecord) error
 	DeleteExpiredTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, now int64) error
