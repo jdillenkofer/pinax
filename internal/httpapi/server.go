@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -195,7 +196,12 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 }
 
 type createTableRequest struct {
-	TableName            string `json:"TableName"`
+	TableName             string `json:"TableName"`
+	BillingMode           string `json:"BillingMode"`
+	ProvisionedThroughput struct {
+		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+	} `json:"ProvisionedThroughput"`
 	AttributeDefinitions []struct {
 		AttributeName string `json:"AttributeName"`
 		AttributeType string `json:"AttributeType"`
@@ -1699,6 +1705,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 
 type transactWriteRequest struct {
 	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
+	ClientRequestToken     string `json:"ClientRequestToken"`
 	TransactItems          []struct {
 		Put struct {
 			TableName                           string            `json:"TableName"`
@@ -2046,8 +2053,14 @@ func decode(body []byte, out any) error {
 	if len(strings.TrimSpace(string(body))) == 0 {
 		body = []byte("{}")
 	}
-	if err := json.Unmarshal(body, out); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("invalid request body: %w", err)
+	}
+	var trailing struct{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("invalid request body: unexpected trailing content")
 	}
 	return nil
 }
