@@ -3,7 +3,9 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -326,10 +328,25 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 type createTableRequest struct {
 	TableName             string `json:"TableName"`
 	BillingMode           string `json:"BillingMode"`
+	TableClass            string `json:"TableClass"`
+	DeletionProtection    bool   `json:"DeletionProtectionEnabled"`
 	ProvisionedThroughput *struct {
 		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
 		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
 	} `json:"ProvisionedThroughput"`
+	StreamSpecification *struct {
+		StreamEnabled  bool   `json:"StreamEnabled"`
+		StreamViewType string `json:"StreamViewType"`
+	} `json:"StreamSpecification"`
+	SSESpecification *struct {
+		Enabled        bool   `json:"Enabled"`
+		SSEType        string `json:"SSEType"`
+		KMSMasterKeyID string `json:"KMSMasterKeyId"`
+	} `json:"SSESpecification"`
+	Tags []struct {
+		Key   string `json:"Key"`
+		Value string `json:"Value"`
+	} `json:"Tags"`
 	AttributeDefinitions []struct {
 		AttributeName string `json:"AttributeName"`
 		AttributeType string `json:"AttributeType"`
@@ -339,7 +356,11 @@ type createTableRequest struct {
 		KeyType       string `json:"KeyType"`
 	} `json:"KeySchema"`
 	GlobalSecondaryIndexes []struct {
-		IndexName string `json:"IndexName"`
+		IndexName             string `json:"IndexName"`
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+			WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+		} `json:"ProvisionedThroughput"`
 		KeySchema []struct {
 			AttributeName string `json:"AttributeName"`
 			KeyType       string `json:"KeyType"`
@@ -399,6 +420,25 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	tableClass, err := normalizeTableClass(req.TableClass)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	streamSpec, err := normalizeStreamSpec(req.StreamSpecification)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if streamSpec.Enabled {
+		setStreamMetadata(&streamSpec, req.TableName)
+	}
+	sseSpec, err := normalizeSSESpecCreate(req.SSESpecification)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	tags, err := normalizeTags(req.Tags)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 
 	now := lifecycleNow()
 	t := model.Table{
@@ -410,8 +450,13 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		BillingMode:        billingMode,
 		ReadCapacityUnits:  readCapacityUnits,
 		WriteCapacityUnits: writeCapacityUnits,
+		TableClass:         tableClass,
+		DeletionProtection: req.DeletionProtection,
 		Status:             model.TableStatusCreating,
 		StatusAt:           now,
+		Stream:             streamSpec,
+		SSE:                sseSpec,
+		Tags:               tags,
 		CreatedAt:          time.Now().Unix(),
 	}
 
@@ -442,6 +487,10 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
+		gReadCapacity, gWriteCapacity, err := normalizeGSIThroughputForCreate(billingMode, g.ProvisionedThroughput)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
 		t.GSIs = append(t.GSIs, model.GlobalSecondaryIndex{
 			IndexName:      g.IndexName,
 			HashKey:        gHash,
@@ -449,6 +498,8 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 			RangeKey:       gRange,
 			RangeType:      attrType[gRange],
 			Status:         model.IndexStatusActive,
+			ReadCapacity:   gReadCapacity,
+			WriteCapacity:  gWriteCapacity,
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -964,17 +1015,33 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 type updateTableRequest struct {
 	TableName             string `json:"TableName"`
 	BillingMode           string `json:"BillingMode"`
+	TableClass            string `json:"TableClass"`
+	DeletionProtection    *bool  `json:"DeletionProtectionEnabled"`
 	ProvisionedThroughput *struct {
 		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
 		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
 	} `json:"ProvisionedThroughput"`
+	StreamSpecification *struct {
+		StreamEnabled  bool   `json:"StreamEnabled"`
+		StreamViewType string `json:"StreamViewType"`
+	} `json:"StreamSpecification"`
+	SSESpecification *struct {
+		Enabled        *bool  `json:"Enabled"`
+		SSEType        string `json:"SSEType"`
+		KMSMasterKeyID string `json:"KMSMasterKeyId"`
+	} `json:"SSESpecification"`
+	ReplicaUpdates       []any `json:"ReplicaUpdates"`
 	AttributeDefinitions []struct {
 		AttributeName string `json:"AttributeName"`
 		AttributeType string `json:"AttributeType"`
 	} `json:"AttributeDefinitions"`
 	GlobalSecondaryIndexUpdates []struct {
 		Create struct {
-			IndexName string `json:"IndexName"`
+			IndexName             string `json:"IndexName"`
+			ProvisionedThroughput *struct {
+				ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+				WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+			} `json:"ProvisionedThroughput"`
 			KeySchema []struct {
 				AttributeName string `json:"AttributeName"`
 				KeyType       string `json:"KeyType"`
@@ -987,6 +1054,13 @@ type updateTableRequest struct {
 		Delete struct {
 			IndexName string `json:"IndexName"`
 		} `json:"Delete"`
+		Update struct {
+			IndexName             string `json:"IndexName"`
+			ProvisionedThroughput *struct {
+				ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+				WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+			} `json:"ProvisionedThroughput"`
+		} `json:"Update"`
 	} `json:"GlobalSecondaryIndexUpdates"`
 }
 
@@ -1015,6 +1089,9 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	if t.Status != model.TableStatusActive {
 		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
 	}
+	if len(req.ReplicaUpdates) > 0 {
+		return nil, awserr.Validation("ReplicaUpdates is not supported")
+	}
 	if strings.TrimSpace(req.BillingMode) != "" || req.ProvisionedThroughput != nil {
 		billingMode, readCapacityUnits, writeCapacityUnits, err := normalizeBillingConfig(req.BillingMode, req.ProvisionedThroughput)
 		if err != nil {
@@ -1028,6 +1105,13 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 		}
 	}
 
+	if err := applyUpdateTableOptions(&t, req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, t.Tags); err != nil {
+		return nil, err
+	}
+
 	if len(req.GlobalSecondaryIndexUpdates) > 0 {
 		attrTypes := map[string]string{}
 		for _, d := range req.AttributeDefinitions {
@@ -1036,7 +1120,7 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 			}
 		}
 		now := lifecycleNow()
-		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes, now)
+		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes, now, t.BillingMode)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
@@ -1188,7 +1272,11 @@ func validateUpdateTablePayload(body []byte) error {
 
 type gsiUpdateRequest struct {
 	Create struct {
-		IndexName string
+		IndexName             string
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64
+			WriteCapacityUnits int64
+		}
 		KeySchema []struct {
 			AttributeName string
 			KeyType       string
@@ -1201,11 +1289,22 @@ type gsiUpdateRequest struct {
 	Delete struct {
 		IndexName string
 	}
+	Update struct {
+		IndexName             string
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64
+			WriteCapacityUnits int64
+		}
+	}
 }
 
 func applyGSIUpdates(table model.Table, updates []struct {
 	Create struct {
-		IndexName string `json:"IndexName"`
+		IndexName             string `json:"IndexName"`
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+			WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+		} `json:"ProvisionedThroughput"`
 		KeySchema []struct {
 			AttributeName string `json:"AttributeName"`
 			KeyType       string `json:"KeyType"`
@@ -1218,14 +1317,32 @@ func applyGSIUpdates(table model.Table, updates []struct {
 	Delete struct {
 		IndexName string `json:"IndexName"`
 	} `json:"Delete"`
-}, attrTypes map[string]string, now int64) ([]model.GlobalSecondaryIndex, error) {
+	Update struct {
+		IndexName             string `json:"IndexName"`
+		ProvisionedThroughput *struct {
+			ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+			WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+		} `json:"ProvisionedThroughput"`
+	} `json:"Update"`
+}, attrTypes map[string]string, now int64, billingMode string) ([]model.GlobalSecondaryIndex, error) {
 	gsis := append([]model.GlobalSecondaryIndex{}, table.GSIs...)
 	touched := map[string]struct{}{}
 	for _, u := range updates {
 		hasCreate := strings.TrimSpace(u.Create.IndexName) != ""
 		hasDelete := strings.TrimSpace(u.Delete.IndexName) != ""
-		if hasCreate == hasDelete {
-			return nil, fmt.Errorf("each GlobalSecondaryIndexUpdates entry must include exactly one of Create or Delete")
+		hasUpdate := strings.TrimSpace(u.Update.IndexName) != "" || u.Update.ProvisionedThroughput != nil
+		actions := 0
+		if hasCreate {
+			actions++
+		}
+		if hasDelete {
+			actions++
+		}
+		if hasUpdate {
+			actions++
+		}
+		if actions != 1 {
+			return nil, fmt.Errorf("each GlobalSecondaryIndexUpdates entry must include exactly one of Create, Update or Delete")
 		}
 		if hasDelete {
 			name := strings.TrimSpace(u.Delete.IndexName)
@@ -1252,6 +1369,42 @@ func applyGSIUpdates(table model.Table, updates []struct {
 				return nil, fmt.Errorf("cannot delete unknown index %q", name)
 			}
 			gsis = next
+			continue
+		}
+		if hasUpdate {
+			name := strings.TrimSpace(u.Update.IndexName)
+			if name == "" {
+				return nil, fmt.Errorf("GSI IndexName is required")
+			}
+			if _, exists := touched[name]; exists {
+				return nil, fmt.Errorf("multiple updates for index %q are not allowed", name)
+			}
+			touched[name] = struct{}{}
+			if strings.TrimSpace(billingMode) != "PROVISIONED" {
+				return nil, fmt.Errorf("GlobalSecondaryIndexUpdates Update is only supported for PROVISIONED billing mode")
+			}
+			if u.Update.ProvisionedThroughput == nil {
+				return nil, fmt.Errorf("ProvisionedThroughput is required for GlobalSecondaryIndexUpdates Update")
+			}
+			if u.Update.ProvisionedThroughput.ReadCapacityUnits <= 0 || u.Update.ProvisionedThroughput.WriteCapacityUnits <= 0 {
+				return nil, fmt.Errorf("ProvisionedThroughput ReadCapacityUnits and WriteCapacityUnits must be greater than 0")
+			}
+			found := false
+			for i := range gsis {
+				if gsis[i].IndexName != name {
+					continue
+				}
+				if gsis[i].Status == model.IndexStatusCreating || gsis[i].Status == model.IndexStatusDeleting {
+					return nil, fmt.Errorf("index %q is currently %s", name, gsis[i].Status)
+				}
+				gsis[i].ReadCapacity = u.Update.ProvisionedThroughput.ReadCapacityUnits
+				gsis[i].WriteCapacity = u.Update.ProvisionedThroughput.WriteCapacityUnits
+				found = true
+				break
+			}
+			if !found {
+				return nil, fmt.Errorf("cannot update unknown index %q", name)
+			}
 			continue
 		}
 
@@ -1299,6 +1452,10 @@ func applyGSIUpdates(table model.Table, updates []struct {
 		if err != nil {
 			return nil, err
 		}
+		gReadCapacity, gWriteCapacity, err := normalizeGSIThroughputForCreate(billingMode, u.Create.ProvisionedThroughput)
+		if err != nil {
+			return nil, err
+		}
 		gsis = append(gsis, model.GlobalSecondaryIndex{
 			IndexName:      name,
 			HashKey:        hashKey,
@@ -1307,6 +1464,8 @@ func applyGSIUpdates(table model.Table, updates []struct {
 			RangeType:      rangeType,
 			Status:         model.IndexStatusCreating,
 			StatusAt:       now + lifecycleDelayMillis(),
+			ReadCapacity:   gReadCapacity,
+			WriteCapacity:  gWriteCapacity,
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -2083,6 +2242,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	if strings.TrimSpace(req.ClientRequestToken) != "" && len(req.ClientRequestToken) > 36 {
+		return nil, awserr.Validation("ClientRequestToken must be between 1 and 36 characters")
+	}
 	if len(req.TransactItems) == 0 {
 		return nil, awserr.Validation("TransactItems is required")
 	}
@@ -2095,6 +2257,29 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		return nil, err
 	}
 	defer tx.Rollback()
+	nowMillis := time.Now().UnixMilli()
+	if strings.TrimSpace(req.ClientRequestToken) != "" {
+		if err := s.store.DeleteExpiredTransactWriteIdempotency(r.Context(), tx, nowMillis); err != nil {
+			return nil, err
+		}
+		rec, err := s.store.GetTransactWriteIdempotency(r.Context(), tx, req.ClientRequestToken, nowMillis)
+		if err == nil {
+			hash, err := transactWriteRequestHash(req)
+			if err != nil {
+				return nil, err
+			}
+			if rec.RequestHash != hash {
+				return nil, awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return rec.Response, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
 
 	seenTargets := map[string]struct{}{}
 	writeByTable := map[string]float64{}
@@ -2341,15 +2526,41 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
 	resp := map[string]any{}
 	for tableName, units := range writeByTable {
 		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
 	}
+	if strings.TrimSpace(req.ClientRequestToken) != "" {
+		hash, err := transactWriteRequestHash(req)
+		if err != nil {
+			return nil, err
+		}
+		record := model.TransactWriteIdempotencyRecord{
+			Token:       req.ClientRequestToken,
+			RequestHash: hash,
+			Response:    resp,
+			CreatedAt:   nowMillis,
+			ExpiresAt:   nowMillis + int64((10*time.Minute)/time.Millisecond),
+		}
+		if err := s.store.PutTransactWriteIdempotency(r.Context(), tx, record); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return resp, nil
+}
+
+func transactWriteRequestHash(req transactWriteRequest) (string, error) {
+	req.ClientRequestToken = ""
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func buildTransactionCancellationReasons(count int, failedIndex int, failed awserr.CancellationReason) []awserr.CancellationReason {
@@ -2562,6 +2773,179 @@ func normalizeIndexProjection(projectionType string, nonKeyAttrs []string) (stri
 	default:
 		return "", nil, fmt.Errorf("unsupported ProjectionType %q", projectionType)
 	}
+}
+
+func normalizeTableClass(tableClass string) (string, error) {
+	tableClass = strings.TrimSpace(tableClass)
+	if tableClass == "" {
+		return "STANDARD", nil
+	}
+	switch tableClass {
+	case "STANDARD", "STANDARD_INFREQUENT_ACCESS":
+		return tableClass, nil
+	default:
+		return "", fmt.Errorf("unsupported TableClass %q", tableClass)
+	}
+}
+
+func normalizeStreamSpec(spec *struct {
+	StreamEnabled  bool   `json:"StreamEnabled"`
+	StreamViewType string `json:"StreamViewType"`
+}) (model.StreamSpecification, error) {
+	if spec == nil {
+		return model.StreamSpecification{}, nil
+	}
+	if !spec.StreamEnabled {
+		if strings.TrimSpace(spec.StreamViewType) != "" {
+			return model.StreamSpecification{}, fmt.Errorf("StreamViewType must not be set when StreamEnabled is false")
+		}
+		return model.StreamSpecification{Enabled: false}, nil
+	}
+	viewType := strings.TrimSpace(spec.StreamViewType)
+	switch viewType {
+	case "KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES":
+		return model.StreamSpecification{Enabled: true, ViewType: viewType}, nil
+	default:
+		return model.StreamSpecification{}, fmt.Errorf("unsupported StreamViewType %q", spec.StreamViewType)
+	}
+}
+
+func setStreamMetadata(spec *model.StreamSpecification, tableName string) {
+	if spec == nil || !spec.Enabled {
+		return
+	}
+	if strings.TrimSpace(spec.Label) == "" {
+		spec.Label = time.Now().UTC().Format("2006-01-02T15:04:05.000")
+	}
+	if strings.TrimSpace(spec.ARN) == "" {
+		spec.ARN = fmt.Sprintf("arn:aws:dynamodb:local:000000000000:table/%s/stream/%s", tableName, spec.Label)
+	}
+}
+
+func normalizeSSESpecCreate(spec *struct {
+	Enabled        bool   `json:"Enabled"`
+	SSEType        string `json:"SSEType"`
+	KMSMasterKeyID string `json:"KMSMasterKeyId"`
+}) (model.SSESpecification, error) {
+	if spec == nil || !spec.Enabled {
+		return model.SSESpecification{Enabled: false, Status: "DISABLED"}, nil
+	}
+	sseType := strings.TrimSpace(spec.SSEType)
+	if sseType == "" {
+		sseType = "AES256"
+	}
+	if sseType != "AES256" && sseType != "KMS" {
+		return model.SSESpecification{}, fmt.Errorf("unsupported SSEType %q", spec.SSEType)
+	}
+	if sseType == "AES256" && strings.TrimSpace(spec.KMSMasterKeyID) != "" {
+		return model.SSESpecification{}, fmt.Errorf("KMSMasterKeyId is only allowed when SSEType is KMS")
+	}
+	return model.SSESpecification{
+		Enabled:        true,
+		SSEType:        sseType,
+		Status:         "ENABLED",
+		KMSMasterKeyID: strings.TrimSpace(spec.KMSMasterKeyID),
+	}, nil
+}
+
+func normalizeTags(in []struct {
+	Key   string `json:"Key"`
+	Value string `json:"Value"`
+}) ([]model.Tag, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]model.Tag, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, tag := range in {
+		key := strings.TrimSpace(tag.Key)
+		if key == "" {
+			return nil, fmt.Errorf("Tag Key is required")
+		}
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("duplicate tag key %q", key)
+		}
+		seen[key] = struct{}{}
+		out = append(out, model.Tag{Key: key, Value: tag.Value})
+	}
+	return out, nil
+}
+
+func normalizeGSIThroughputForCreate(billingMode string, throughput *struct {
+	ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+	WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+}) (int64, int64, error) {
+	if strings.TrimSpace(billingMode) == "PROVISIONED" {
+		if throughput == nil {
+			return 0, 0, fmt.Errorf("ProvisionedThroughput is required for global secondary indexes when table BillingMode is PROVISIONED")
+		}
+		if throughput.ReadCapacityUnits <= 0 || throughput.WriteCapacityUnits <= 0 {
+			return 0, 0, fmt.Errorf("ProvisionedThroughput ReadCapacityUnits and WriteCapacityUnits must be greater than 0")
+		}
+		return throughput.ReadCapacityUnits, throughput.WriteCapacityUnits, nil
+	}
+	if throughput != nil && (throughput.ReadCapacityUnits > 0 || throughput.WriteCapacityUnits > 0) {
+		return 0, 0, fmt.Errorf("ProvisionedThroughput for global secondary indexes is only allowed when table BillingMode is PROVISIONED")
+	}
+	return 0, 0, nil
+}
+
+func applyUpdateTableOptions(t *model.Table, req updateTableRequest) error {
+	if strings.TrimSpace(req.TableClass) != "" {
+		tableClass, err := normalizeTableClass(req.TableClass)
+		if err != nil {
+			return err
+		}
+		t.TableClass = tableClass
+	}
+	if req.DeletionProtection != nil {
+		t.DeletionProtection = *req.DeletionProtection
+	}
+	if req.StreamSpecification != nil {
+		stream, err := normalizeStreamSpec(req.StreamSpecification)
+		if err != nil {
+			return err
+		}
+		if stream.Enabled {
+			if !t.Stream.Enabled || t.Stream.ViewType != stream.ViewType {
+				setStreamMetadata(&stream, t.Name)
+			} else {
+				stream.ARN = t.Stream.ARN
+				stream.Label = t.Stream.Label
+			}
+		}
+		t.Stream = stream
+	}
+	if req.SSESpecification != nil {
+		next := t.SSE
+		if req.SSESpecification.Enabled != nil {
+			next.Enabled = *req.SSESpecification.Enabled
+		}
+		if !next.Enabled {
+			next.Status = "DISABLED"
+			next.SSEType = ""
+			next.KMSMasterKeyID = ""
+		} else {
+			next.Status = "ENABLED"
+			if strings.TrimSpace(req.SSESpecification.SSEType) != "" {
+				next.SSEType = strings.TrimSpace(req.SSESpecification.SSEType)
+			}
+			if next.SSEType == "" {
+				next.SSEType = "AES256"
+			}
+			if next.SSEType != "AES256" && next.SSEType != "KMS" {
+				return fmt.Errorf("unsupported SSEType %q", req.SSESpecification.SSEType)
+			}
+			if strings.TrimSpace(req.SSESpecification.KMSMasterKeyID) != "" {
+				next.KMSMasterKeyID = strings.TrimSpace(req.SSESpecification.KMSMasterKeyID)
+			}
+			if next.SSEType == "AES256" {
+				next.KMSMasterKeyID = ""
+			}
+		}
+		t.SSE = next
+	}
+	return nil
 }
 
 func normalizeBillingConfig(mode string, throughput *struct {

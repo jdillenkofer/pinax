@@ -126,10 +126,27 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 	if strings.TrimSpace(ttlStatus) == "" {
 		ttlStatus = model.TTLStatusDisabled
 	}
+	tagsJSON, err := json.Marshal(t.Tags)
+	if err != nil {
+		return err
+	}
+	deletionProtection := 0
+	if t.DeletionProtection {
+		deletionProtection = 1
+	}
+	streamEnabled := 0
+	if t.Stream.Enabled {
+		streamEnabled = 1
+	}
+	sseEnabled := 0
+	if t.SSE.Enabled {
+		sseEnabled = 1
+	}
+	sseStatus := firstNonEmpty(t.SSE.Status, "DISABLED")
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
 	if err != nil {
 		return err
 	}
@@ -143,6 +160,17 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var tableStatus string
 	var tableStatusAt int64
 	var billingMode string
+	var tableClass string
+	var deletionProtection int
+	var streamEnabled int
+	var streamViewType sql.NullString
+	var streamARN sql.NullString
+	var streamLabel sql.NullString
+	var sseEnabled int
+	var sseType sql.NullString
+	var sseStatus string
+	var sseKMSKeyID sql.NullString
+	var tagsJSON string
 	var readCapacityUnits int64
 	var writeCapacityUnits int64
 	var gsiJSON string
@@ -152,16 +180,31 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var ttlStatus string
 	var ttlStatusAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
+		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
 	if err != nil {
 		return model.Table{}, err
 	}
 	t.RangeKey = rangeKey.String
 	t.RangeType = rangeType.String
 	t.BillingMode = billingMode
+	t.TableClass = tableClass
+	t.DeletionProtection = deletionProtection == 1
+	t.Stream.Enabled = streamEnabled == 1
+	t.Stream.ViewType = streamViewType.String
+	t.Stream.ARN = streamARN.String
+	t.Stream.Label = streamLabel.String
+	t.SSE.Enabled = sseEnabled == 1
+	t.SSE.SSEType = sseType.String
+	t.SSE.Status = sseStatus
+	t.SSE.KMSMasterKeyID = sseKMSKeyID.String
+	if strings.TrimSpace(tagsJSON) != "" {
+		if err := json.Unmarshal([]byte(tagsJSON), &t.Tags); err != nil {
+			return model.Table{}, err
+		}
+	}
 	t.ReadCapacityUnits = readCapacityUnits
 	t.WriteCapacityUnits = writeCapacityUnits
 	t.Status = tableStatus
@@ -459,6 +502,31 @@ func (s *Store) UpdateTableBilling(ctx context.Context, tx *sql.Tx, tableName st
 	return err
 }
 
+func (s *Store) UpdateTableOptions(ctx context.Context, tx *sql.Tx, tableName string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
+	deletionProtectionInt := 0
+	if deletionProtection {
+		deletionProtectionInt = 1
+	}
+	streamEnabled := 0
+	if stream.Enabled {
+		streamEnabled = 1
+	}
+	sseEnabled := 0
+	if sse.Enabled {
+		sseEnabled = 1
+	}
+	tagsJSON, err := json.Marshal(tags)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE tables
+		SET table_class = ?, deletion_protection_enabled = ?, stream_enabled = ?, stream_view_type = ?, stream_arn = ?, stream_label = ?, sse_enabled = ?, sse_type = ?, sse_status = ?, sse_kms_key_id = ?, tags_json = ?
+		WHERE name = ?
+	`, firstNonEmpty(tableClass, "STANDARD"), deletionProtectionInt, streamEnabled, nullIfEmpty(stream.ViewType), nullIfEmpty(stream.ARN), nullIfEmpty(stream.Label), sseEnabled, nullIfEmpty(sse.SSEType), firstNonEmpty(sse.Status, "DISABLED"), nullIfEmpty(sse.KMSMasterKeyID), string(tagsJSON), tableName)
+	return err
+}
+
 func firstNonEmpty(v, fallback string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -475,6 +543,41 @@ func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName stri
 	_, err := tx.ExecContext(ctx, `
 		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ?, ttl_status = ?, ttl_status_at = ? WHERE name = ?
 	`, ttlEnabled, nullIfEmpty(ttl.AttrName), ttl.Status, ttl.StatusAt, tableName)
+	return err
+}
+
+func (s *Store) GetTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, token string, now int64) (model.TransactWriteIdempotencyRecord, error) {
+	var rec model.TransactWriteIdempotencyRecord
+	var responseJSON []byte
+	err := tx.QueryRowContext(ctx, `
+		SELECT token, request_hash, response_json, created_at, expires_at
+		FROM transact_write_idempotency
+		WHERE token = ? AND expires_at > ?
+	`, token, now).Scan(&rec.Token, &rec.RequestHash, &responseJSON, &rec.CreatedAt, &rec.ExpiresAt)
+	if err != nil {
+		return model.TransactWriteIdempotencyRecord{}, err
+	}
+	if err := json.Unmarshal(responseJSON, &rec.Response); err != nil {
+		return model.TransactWriteIdempotencyRecord{}, err
+	}
+	return rec, nil
+}
+
+func (s *Store) PutTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, record model.TransactWriteIdempotencyRecord) error {
+	responseJSON, err := json.Marshal(record.Response)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO transact_write_idempotency(token, request_hash, response_json, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(token) DO UPDATE SET request_hash = excluded.request_hash, response_json = excluded.response_json, created_at = excluded.created_at, expires_at = excluded.expires_at
+	`, record.Token, record.RequestHash, responseJSON, record.CreatedAt, record.ExpiresAt)
+	return err
+}
+
+func (s *Store) DeleteExpiredTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, now int64) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM transact_write_idempotency WHERE expires_at <= ?`, now)
 	return err
 }
 

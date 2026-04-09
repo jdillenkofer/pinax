@@ -40,13 +40,45 @@ type Table struct {
 	BillingMode        string
 	ReadCapacityUnits  int64
 	WriteCapacityUnits int64
+	TableClass         string
+	DeletionProtection bool
 	Status             string
 	StatusAt           int64
 	GSIs               []GlobalSecondaryIndex
 	LSIs               []LocalSecondaryIndex
+	Stream             StreamSpecification
+	SSE                SSESpecification
+	Tags               []Tag
 	CreatedAt          int64
 
 	TimeToLive TimeToLive
+}
+
+type StreamSpecification struct {
+	Enabled  bool
+	ViewType string
+	ARN      string
+	Label    string
+}
+
+type SSESpecification struct {
+	Enabled        bool
+	SSEType        string
+	Status         string
+	KMSMasterKeyID string
+}
+
+type Tag struct {
+	Key   string
+	Value string
+}
+
+type TransactWriteIdempotencyRecord struct {
+	Token       string
+	RequestHash string
+	Response    map[string]any
+	CreatedAt   int64
+	ExpiresAt   int64
 }
 
 type GlobalSecondaryIndex struct {
@@ -57,6 +89,8 @@ type GlobalSecondaryIndex struct {
 	RangeType      string
 	Status         string
 	StatusAt       int64
+	ReadCapacity   int64
+	WriteCapacity  int64
 	ProjectionType string
 	NonKeyAttrs    []string
 }
@@ -97,6 +131,13 @@ func (t Table) Description(itemCount int64) map[string]any {
 			"KeySchema":   keySchema,
 			"IndexStatus": firstNonEmpty(g.Status, IndexStatusActive),
 		})
+		if g.ReadCapacity > 0 || g.WriteCapacity > 0 {
+			gsis[len(gsis)-1]["ProvisionedThroughput"] = map[string]any{
+				"NumberOfDecreasesToday": 0,
+				"ReadCapacityUnits":      g.ReadCapacity,
+				"WriteCapacityUnits":     g.WriteCapacity,
+			}
+		}
 		projection := map[string]any{"ProjectionType": g.ProjectionType}
 		if g.ProjectionType == "INCLUDE" {
 			projection["NonKeyAttributes"] = g.NonKeyAttrs
@@ -134,9 +175,37 @@ func (t Table) Description(itemCount int64) map[string]any {
 			"ReadCapacityUnits":      t.ReadCapacityUnits,
 			"WriteCapacityUnits":     t.WriteCapacityUnits,
 		},
-		"BillingModeSummary":     map[string]any{"BillingMode": firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST")},
-		"GlobalSecondaryIndexes": gsis,
-		"LocalSecondaryIndexes":  lsis,
+		"BillingModeSummary":        map[string]any{"BillingMode": firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST")},
+		"GlobalSecondaryIndexes":    gsis,
+		"LocalSecondaryIndexes":     lsis,
+		"TableClassSummary":         map[string]any{"TableClass": firstNonEmpty(t.TableClass, "STANDARD")},
+		"DeletionProtectionEnabled": t.DeletionProtection,
+	}
+
+	if t.Stream.Enabled {
+		desc["StreamSpecification"] = map[string]any{
+			"StreamEnabled":  true,
+			"StreamViewType": t.Stream.ViewType,
+		}
+		if strings.TrimSpace(t.Stream.ARN) != "" {
+			desc["LatestStreamArn"] = t.Stream.ARN
+		}
+		if strings.TrimSpace(t.Stream.Label) != "" {
+			desc["LatestStreamLabel"] = t.Stream.Label
+		}
+	}
+
+	if t.SSE.Enabled || strings.TrimSpace(t.SSE.Status) != "" || strings.TrimSpace(t.SSE.SSEType) != "" || strings.TrimSpace(t.SSE.KMSMasterKeyID) != "" {
+		sse := map[string]any{
+			"Status": firstNonEmpty(t.SSE.Status, "DISABLED"),
+		}
+		if strings.TrimSpace(t.SSE.SSEType) != "" {
+			sse["SSEType"] = t.SSE.SSEType
+		}
+		if strings.TrimSpace(t.SSE.KMSMasterKeyID) != "" {
+			sse["KMSMasterKeyArn"] = t.SSE.KMSMasterKeyID
+		}
+		desc["SSEDescription"] = sse
 	}
 
 	if t.TimeToLive.Enabled || strings.TrimSpace(t.TimeToLive.Status) != "" || strings.TrimSpace(t.TimeToLive.AttrName) != "" {

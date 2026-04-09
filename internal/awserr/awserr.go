@@ -39,6 +39,10 @@ func ProvisionedThroughputExceeded(msg string) *APIError {
 	return &APIError{Code: "ProvisionedThroughputExceededException", Message: msg, Status: http.StatusBadRequest}
 }
 
+func IdempotentParameterMismatch(msg string) *APIError {
+	return &APIError{Code: "IdempotentParameterMismatchException", Message: msg, Status: http.StatusBadRequest}
+}
+
 type CancellationReason struct {
 	Code    string         `json:"Code"`
 	Message string         `json:"Message,omitempty"`
