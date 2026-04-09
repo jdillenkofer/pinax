@@ -122,10 +122,14 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 	if t.TimeToLive.Enabled {
 		ttlEnabled = 1
 	}
+	ttlStatus := t.TimeToLive.Status
+	if strings.TrimSpace(ttlStatus) == "" {
+		ttlStatus = model.TTLStatusDisabled
+	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
 	if err != nil {
 		return err
 	}
@@ -142,11 +146,13 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var lsiJSON string
 	var ttlEnabled int
 	var ttlAttr sql.NullString
+	var ttlStatus string
+	var ttlStatusAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute
+		SELECT name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
 	if err != nil {
 		return model.Table{}, err
 	}
@@ -166,6 +172,8 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	}
 	t.TimeToLive.Enabled = ttlEnabled == 1
 	t.TimeToLive.AttrName = ttlAttr.String
+	t.TimeToLive.Status = ttlStatus
+	t.TimeToLive.StatusAt = ttlStatusAt
 	return t, nil
 }
 
@@ -450,8 +458,8 @@ func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName stri
 		ttlEnabled = 1
 	}
 	_, err := tx.ExecContext(ctx, `
-		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ? WHERE name = ?
-	`, ttlEnabled, nullIfEmpty(ttl.AttrName), tableName)
+		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ?, ttl_status = ?, ttl_status_at = ? WHERE name = ?
+	`, ttlEnabled, nullIfEmpty(ttl.AttrName), ttl.Status, ttl.StatusAt, tableName)
 	return err
 }
 

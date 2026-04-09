@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -159,5 +161,62 @@ func TestQueryNumericSortKeyOrdering(t *testing.T) {
 	}
 	if out.Items[0]["sk"].(*types.AttributeValueMemberN).Value != "2" || out.Items[2]["sk"].(*types.AttributeValueMemberN).Value != "10" {
 		t.Fatalf("expected numeric ordering 2,3,10 got %+v %+v %+v", out.Items[0]["sk"], out.Items[1]["sk"], out.Items[2]["sk"])
+	}
+}
+
+func TestGetItemRejectsWrongKeyType(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("keytype1"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeN}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("keytype1"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "wrong"}},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for wrong key type")
+	}
+	var vErr *types.ConditionalCheckFailedException
+	if errors.As(err, &vErr) {
+		t.Fatalf("expected validation error, got conditional failure: %v", err)
+	}
+}
+
+func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("dellife"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String("dellife")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.TableDescription == nil || out.TableDescription.TableStatus != types.TableStatusDeleting {
+		t.Fatalf("expected DELETING status from DeleteTable, got %+v", out.TableDescription)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	_, err = client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("dellife")})
+	if err == nil {
+		t.Fatal("expected table to be removed after deletion transition")
 	}
 }

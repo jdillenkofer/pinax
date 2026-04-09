@@ -268,14 +268,16 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		return nil, awserr.Validation("AttributeDefinitions missing HASH key type")
 	}
 
+	now := time.Now().Unix()
 	t := model.Table{
 		Name:      req.TableName,
 		HashKey:   hashKey,
 		HashType:  hashType,
 		RangeKey:  rangeKey,
 		RangeType: attrType[rangeKey],
-		Status:    model.TableStatusActive,
-		CreatedAt: time.Now().Unix(),
+		Status:    model.TableStatusCreating,
+		StatusAt:  now,
+		CreatedAt: now,
 	}
 
 	indexNames := map[string]struct{}{}
@@ -396,14 +398,8 @@ func (s *Server) describeTable(r *http.Request, body []byte) (map[string]any, er
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
-		return nil, err
-	}
-	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
 		return nil, err
 	}
 	count, err := s.store.CountItems(r.Context(), tx, t.Name)
@@ -461,18 +457,20 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
+	}
+	if t.Status == model.TableStatusDeleting {
+		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
 	}
 	count, err := s.store.CountItems(r.Context(), tx, req.TableName)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.DeleteTable(r.Context(), tx, req.TableName); err != nil {
+	t.Status = model.TableStatusDeleting
+	t.StatusAt = time.Now().Unix() + 1
+	if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
 		return nil, err
 	}
 
@@ -508,11 +506,8 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 	pk, sk, err := model.ExtractItemKeys(t, req.Item)
@@ -580,11 +575,8 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 	pk, sk, err := model.ExtractKey(t, req.Key)
@@ -634,11 +626,8 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 	pk, sk, err := model.ExtractKey(t, req.Key)
@@ -707,11 +696,8 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 	pk, sk, err := model.ExtractKey(t, req.Key)
@@ -842,18 +828,12 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
-	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
-		return nil, err
-	}
-	if t.Status == model.TableStatusUpdating {
-		return nil, awserr.ResourceInUse("Table is currently UPDATING")
+	if t.Status != model.TableStatusActive {
+		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
 	}
 
 	if len(req.GlobalSecondaryIndexUpdates) > 0 {
@@ -902,10 +882,49 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 }
 
 func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
-	if !advanceTableLifecycle(t, time.Now().Unix()) {
+	now := time.Now().Unix()
+	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
+		if err := s.store.DeleteTable(ctx, tx, t.Name); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if t.Status == model.TableStatusCreating && t.StatusAt > 0 && now >= t.StatusAt {
+		t.Status = model.TableStatusActive
+		t.StatusAt = 0
+	}
+	if !advanceTableLifecycle(t, now) {
 		return nil
 	}
 	return s.store.UpdateTableIndexes(ctx, tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
+}
+
+func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
+	t, err := s.store.GetTable(ctx, tx, tableName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return model.Table{}, err
+	}
+	if err := s.refreshTableLifecycle(ctx, tx, &t); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return model.Table{}, err
+	}
+	return t, nil
+}
+
+func (s *Server) getActiveTable(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
+	t, err := s.getTableWithLifecycle(ctx, tx, tableName)
+	if err != nil {
+		return model.Table{}, err
+	}
+	if t.Status != model.TableStatusActive {
+		return model.Table{}, awserr.ResourceInUse("Table is currently " + t.Status)
+	}
+	return t, nil
 }
 
 func advanceTableLifecycle(t *model.Table, now int64) bool {
@@ -1131,11 +1150,8 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
@@ -1147,6 +1163,8 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	targetHashKey := t.HashKey
 	targetRangeKey := t.RangeKey
+	targetHashType := t.HashType
+	targetRangeType := t.RangeType
 	var queryGSI *model.GlobalSecondaryIndex
 	var queryLSI *model.LocalSecondaryIndex
 	if strings.TrimSpace(req.IndexName) != "" {
@@ -1161,6 +1179,8 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 			queryGSI = &gsi
 			targetHashKey = gsi.HashKey
 			targetRangeKey = gsi.RangeKey
+			targetHashType = gsi.HashType
+			targetRangeType = gsi.RangeType
 		} else {
 			lsi, ok := t.GetLSI(req.IndexName)
 			if !ok {
@@ -1169,6 +1189,8 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 			queryLSI = &lsi
 			targetHashKey = t.HashKey
 			targetRangeKey = lsi.RangeKey
+			targetHashType = t.HashType
+			targetRangeType = lsi.RangeType
 		}
 	}
 
@@ -1182,6 +1204,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	pkValue, ok := req.ExpressionAttributeValues[pkToken.value]
 	if !ok {
 		return nil, awserr.Validation("missing partition key expression value")
+	}
+	if err := model.ValidateKeyAttributeType(pkValue, targetHashType, targetHashKey); err != nil {
+		return nil, awserr.Validation(err.Error())
 	}
 	pk, err := model.SerializeKeyValue(pkValue)
 	if err != nil {
@@ -1263,7 +1288,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 
 		if skToken != nil {
-			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues, targetRangeType)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
@@ -1333,11 +1358,8 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 
@@ -1439,11 +1461,8 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		if len(itemReq.Keys) == 0 {
 			return nil, awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
 		}
-		t, err := s.store.GetTable(r.Context(), tx, tableName)
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-			}
 			return nil, err
 		}
 		seenKeys := map[string]struct{}{}
@@ -1557,11 +1576,8 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		if len(ops) == 0 {
 			return nil, awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
 		}
-		t, err := s.store.GetTable(r.Context(), tx, tableName)
+		t, err := s.getActiveTable(r.Context(), tx, tableName)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-			}
 			return nil, err
 		}
 
@@ -1669,11 +1685,8 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 	readByTable := map[string]float64{}
 	for _, txItem := range req.TransactItems {
 		g := txItem.Get
-		t, err := s.store.GetTable(r.Context(), tx, g.TableName)
+		t, err := s.getActiveTable(r.Context(), tx, g.TableName)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-			}
 			return nil, err
 		}
 		pk, sk, err := model.ExtractKey(t, g.Key)
@@ -1769,11 +1782,8 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			t, err := s.store.GetTable(r.Context(), tx, txItem.Put.TableName)
+			t, err := s.getActiveTable(r.Context(), tx, txItem.Put.TableName)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-				}
 				return nil, err
 			}
 			pk, sk, err := model.ExtractItemKeys(t, txItem.Put.Item)
@@ -1825,11 +1835,8 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := validateReturnValuesOnConditionCheckFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure); err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			t, err := s.store.GetTable(r.Context(), tx, txItem.Delete.TableName)
+			t, err := s.getActiveTable(r.Context(), tx, txItem.Delete.TableName)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-				}
 				return nil, err
 			}
 			pk, sk, err := model.ExtractKey(t, txItem.Delete.Key)
@@ -1878,11 +1885,8 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := validateReturnValuesOnConditionCheckFailure(txItem.Update.ReturnValuesOnConditionCheckFailure); err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			t, err := s.store.GetTable(r.Context(), tx, txItem.Update.TableName)
+			t, err := s.getActiveTable(r.Context(), tx, txItem.Update.TableName)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-				}
 				return nil, err
 			}
 			pk, sk, err := model.ExtractKey(t, txItem.Update.Key)
@@ -1954,11 +1958,8 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := validateReturnValuesOnConditionCheckFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure); err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			t, err := s.store.GetTable(r.Context(), tx, txItem.ConditionCheck.TableName)
+			t, err := s.getActiveTable(r.Context(), tx, txItem.ConditionCheck.TableName)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-				}
 				return nil, err
 			}
 			pk, sk, err := model.ExtractKey(t, txItem.ConditionCheck.Key)
@@ -2516,17 +2517,20 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
 	}
 
 	ttl := model.TimeToLive{
 		Enabled:  req.TimeToLiveSpecification.Enabled,
 		AttrName: req.TimeToLiveSpecification.AttributeName,
+		StatusAt: time.Now().Unix() + 1,
+	}
+	if ttl.Enabled {
+		ttl.Status = model.TTLStatusEnabling
+	} else {
+		ttl.Status = model.TTLStatusDisabling
 	}
 	if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, ttl); err != nil {
 		return nil, err
@@ -2537,13 +2541,9 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 	}
 
 	t.TimeToLive = ttl
-	status := "DISABLED"
-	if ttl.Enabled {
-		status = "ENABLED"
-	}
 	return map[string]any{
 		"TimeToLiveDescription": map[string]any{
-			"TimeToLiveStatus": status,
+			"TimeToLiveStatus": ttl.Status,
 			"AttributeName":    ttl.AttrName,
 		},
 	}, nil
@@ -2568,21 +2568,39 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(r.Context(), tx, req.TableName)
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
 		return nil, err
+	}
+	now := time.Now().Unix()
+	if t.TimeToLive.Status == model.TTLStatusEnabling && t.TimeToLive.StatusAt > 0 && now >= t.TimeToLive.StatusAt {
+		t.TimeToLive.Status = model.TTLStatusEnabled
+		t.TimeToLive.StatusAt = 0
+		t.TimeToLive.Enabled = true
+		if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, t.TimeToLive); err != nil {
+			return nil, err
+		}
+	}
+	if t.TimeToLive.Status == model.TTLStatusDisabling && t.TimeToLive.StatusAt > 0 && now >= t.TimeToLive.StatusAt {
+		t.TimeToLive.Status = model.TTLStatusDisabled
+		t.TimeToLive.StatusAt = 0
+		t.TimeToLive.Enabled = false
+		if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, t.TimeToLive); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	status := "DISABLED"
-	if t.TimeToLive.Enabled {
-		status = "ENABLED"
+	status := t.TimeToLive.Status
+	if strings.TrimSpace(status) == "" {
+		if t.TimeToLive.Enabled {
+			status = model.TTLStatusEnabled
+		} else {
+			status = model.TTLStatusDisabled
+		}
 	}
 	return map[string]any{
 		"TimeToLiveDescription": map[string]any{

@@ -133,7 +133,21 @@ func evaluateSingle(condition string, item map[string]any, names map[string]stri
 		if lOK && rOK {
 			return strings.Contains(ls, rs), nil
 		}
-		return false, fmt.Errorf("contains currently supports string operands")
+		if listMap, ok := left.(map[string]any); ok {
+			if list, ok := listMap["L"].([]any); ok {
+				for _, elem := range list {
+					match, err := compare(elem, right, "=")
+					if err != nil {
+						continue
+					}
+					if match {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("contains supports string and list operands")
 	}
 
 	if strings.HasPrefix(condition, "attribute_type(") && strings.HasSuffix(condition, ")") {

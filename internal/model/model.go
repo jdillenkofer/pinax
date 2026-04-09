@@ -9,17 +9,26 @@ import (
 const NoSortKey = "__PINAX_NO_SORT_KEY__"
 
 const (
+	TableStatusCreating = "CREATING"
 	TableStatusActive   = "ACTIVE"
 	TableStatusUpdating = "UPDATING"
+	TableStatusDeleting = "DELETING"
 
 	IndexStatusActive   = "ACTIVE"
 	IndexStatusCreating = "CREATING"
 	IndexStatusDeleting = "DELETING"
+
+	TTLStatusEnabled   = "ENABLED"
+	TTLStatusEnabling  = "ENABLING"
+	TTLStatusDisabled  = "DISABLED"
+	TTLStatusDisabling = "DISABLING"
 )
 
 type TimeToLive struct {
 	Enabled  bool
 	AttrName string
+	Status   string
+	StatusAt int64
 }
 
 type Table struct {
@@ -129,7 +138,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 
 	if t.TimeToLive.Enabled {
 		desc["TimeToLive"] = map[string]any{
-			"TimeToLiveStatus": "ENABLED",
+			"TimeToLiveStatus": firstNonEmpty(t.TimeToLive.Status, "ENABLED"),
 			"AttributeName":    t.TimeToLive.AttrName,
 		}
 	}
@@ -154,6 +163,31 @@ func firstNonEmpty(v, fallback string) string {
 	return v
 }
 
+func AttributeValueType(v any) string {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 1 {
+		return ""
+	}
+	for k := range m {
+		return k
+	}
+	return ""
+}
+
+func ValidateKeyAttributeType(v any, expectedType string, attrName string) error {
+	if strings.TrimSpace(expectedType) == "" {
+		return nil
+	}
+	actual := AttributeValueType(v)
+	if actual == "" {
+		return fmt.Errorf("invalid key attribute %q", attrName)
+	}
+	if actual != expectedType {
+		return fmt.Errorf("type mismatch for key attribute %q: expected %s, got %s", attrName, expectedType, actual)
+	}
+	return nil
+}
+
 func (t Table) GetLSI(indexName string) (LocalSecondaryIndex, bool) {
 	for _, l := range t.LSIs {
 		if l.IndexName == indexName {
@@ -172,6 +206,9 @@ func ExtractItemKeys(t Table, item map[string]any) (pk string, sk string, err er
 	if err != nil {
 		return "", "", fmt.Errorf("invalid partition key %q: %w", t.HashKey, err)
 	}
+	if err := ValidateKeyAttributeType(pv, t.HashType, t.HashKey); err != nil {
+		return "", "", err
+	}
 	if t.RangeKey == "" {
 		return pk, NoSortKey, nil
 	}
@@ -182,6 +219,9 @@ func ExtractItemKeys(t Table, item map[string]any) (pk string, sk string, err er
 	sk, err = SerializeKeyValue(sv)
 	if err != nil {
 		return "", "", fmt.Errorf("invalid sort key %q: %w", t.RangeKey, err)
+	}
+	if err := ValidateKeyAttributeType(sv, t.RangeType, t.RangeKey); err != nil {
+		return "", "", err
 	}
 	return pk, sk, nil
 }
@@ -195,6 +235,9 @@ func ExtractKey(t Table, key map[string]any) (pk string, sk string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("invalid partition key %q: %w", t.HashKey, err)
 	}
+	if err := ValidateKeyAttributeType(pv, t.HashType, t.HashKey); err != nil {
+		return "", "", err
+	}
 	if t.RangeKey == "" {
 		return pk, NoSortKey, nil
 	}
@@ -205,6 +248,9 @@ func ExtractKey(t Table, key map[string]any) (pk string, sk string, err error) {
 	sk, err = SerializeKeyValue(sv)
 	if err != nil {
 		return "", "", fmt.Errorf("invalid sort key %q: %w", t.RangeKey, err)
+	}
+	if err := ValidateKeyAttributeType(sv, t.RangeType, t.RangeKey); err != nil {
+		return "", "", err
 	}
 	return pk, sk, nil
 }

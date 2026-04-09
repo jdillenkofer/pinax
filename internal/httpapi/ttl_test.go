@@ -100,8 +100,17 @@ end
 	if descResp.TimeToLiveDescription.AttributeName == nil || *descResp.TimeToLiveDescription.AttributeName != "expires_at" {
 		t.Errorf("expected attribute name expires_at, got %v", descResp.TimeToLiveDescription.AttributeName)
 	}
+	if descResp.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusEnabled && descResp.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusEnabling {
+		t.Errorf("expected status ENABLED or ENABLING, got %s", descResp.TimeToLiveDescription.TimeToLiveStatus)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	descResp, err = client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{TableName: aws.String("test-ttl")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if descResp.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusEnabled {
-		t.Errorf("expected status ENABLED, got %s", descResp.TimeToLiveDescription.TimeToLiveStatus)
+		t.Errorf("expected status ENABLED after transition, got %s", descResp.TimeToLiveDescription.TimeToLiveStatus)
 	}
 }
 
@@ -206,5 +215,81 @@ func TestTTLSweeper(t *testing.T) {
 	}
 	if out.Item == nil {
 		t.Error("valid item was deleted")
+	}
+}
+
+func TestTTLDisableTransition(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(NewServer(store, nil))
+	t.Cleanup(srv.Close)
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String(srv.URL)
+	})
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("disable-ttl"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
+		TableName: aws.String("disable-ttl"),
+		TimeToLiveSpecification: &types.TimeToLiveSpecification{
+			Enabled:       aws.Bool(true),
+			AttributeName: aws.String("ttl"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
+		TableName: aws.String("disable-ttl"),
+		TimeToLiveSpecification: &types.TimeToLiveSpecification{
+			Enabled:       aws.Bool(false),
+			AttributeName: aws.String("ttl"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc, err := client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{TableName: aws.String("disable-ttl")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusDisabling && desc.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusDisabled {
+		t.Fatalf("expected DISABLING or DISABLED, got %s", desc.TimeToLiveDescription.TimeToLiveStatus)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	desc, err = client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{TableName: aws.String("disable-ttl")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.TimeToLiveDescription.TimeToLiveStatus != types.TimeToLiveStatusDisabled {
+		t.Fatalf("expected DISABLED after transition, got %s", desc.TimeToLiveDescription.TimeToLiveStatus)
 	}
 }

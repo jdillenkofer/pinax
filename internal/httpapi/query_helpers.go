@@ -121,7 +121,7 @@ func parseSortCondition(s string) (sortKeyCondition, error) {
 	return sortKeyCondition{}, fmt.Errorf("unsupported sort key condition")
 }
 
-func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map[string]string, values map[string]any) (bool, error) {
+func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map[string]string, values map[string]any, expectedType string) (bool, error) {
 	if cond == nil {
 		return true, nil
 	}
@@ -133,6 +133,9 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 	if !ok {
 		return false, nil
 	}
+	if err := model.ValidateKeyAttributeType(raw, expectedType, attr); err != nil {
+		return false, err
+	}
 
 	left, err := model.SerializeKeyValue(raw)
 	if err != nil {
@@ -142,6 +145,9 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 	v1, ok := values[cond.value1]
 	if !ok {
 		return false, fmt.Errorf("missing sort key expression value %q", cond.value1)
+	}
+	if err := model.ValidateKeyAttributeType(v1, expectedType, attr); err != nil {
+		return false, err
 	}
 	right1, err := model.SerializeKeyValue(v1)
 	if err != nil {
@@ -182,6 +188,9 @@ func sortConditionMatches(item map[string]any, cond *sortKeyCondition, names map
 		v2, ok := values[cond.value2]
 		if !ok {
 			return false, fmt.Errorf("missing sort key expression value %q", cond.value2)
+		}
+		if err := model.ValidateKeyAttributeType(v2, expectedType, attr); err != nil {
+			return false, err
 		}
 		right2, err := model.SerializeKeyValue(v2)
 		if err != nil {
