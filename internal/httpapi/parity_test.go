@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 )
 
@@ -475,5 +476,165 @@ func TestScanFilterLimitReturnsLastEvaluatedKeyByScannedItems(t *testing.T) {
 	}
 	if out.LastEvaluatedKey == nil {
 		t.Fatal("expected LastEvaluatedKey based on scanned limit")
+	}
+}
+
+func TestDescribeContinuousBackupsMissingTableReturnsTableNotFound(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.DescribeContinuousBackups(ctx, &dynamodb.DescribeContinuousBackupsInput{TableName: aws.String("missing-pitr")})
+	if err == nil {
+		t.Fatal("expected TableNotFoundException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "TableNotFoundException" {
+		t.Fatalf("expected TableNotFoundException, got %q", apiErr.ErrorCode())
+	}
+}
+
+func TestRestoreTableToPointInTimeRejectsConflictingTimeSelectors(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_LIFECYCLE_DELAY_MS", "0")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("pitrconflict"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.UpdateContinuousBackups(ctx, &dynamodb.UpdateContinuousBackupsInput{
+		TableName: aws.String("pitrconflict"),
+		PointInTimeRecoverySpecification: &types.PointInTimeRecoverySpecification{
+			PointInTimeRecoveryEnabled: aws.Bool(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	_, err = client.RestoreTableToPointInTime(ctx, &dynamodb.RestoreTableToPointInTimeInput{
+		SourceTableName:         aws.String("pitrconflict"),
+		TargetTableName:         aws.String("pitrconflictcopy"),
+		UseLatestRestorableTime: aws.Bool(true),
+		RestoreDateTime:         aws.Time(now),
+	})
+	if err == nil {
+		t.Fatal("expected validation error for conflicting time selectors")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException, got %q", apiErr.ErrorCode())
+	}
+}
+
+func TestRestoreTableToPointInTimeOutOfWindowReturnsInvalidRestoreTime(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_LIFECYCLE_DELAY_MS", "0")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("pitrwindow"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.UpdateContinuousBackups(ctx, &dynamodb.UpdateContinuousBackupsInput{
+		TableName: aws.String("pitrwindow"),
+		PointInTimeRecoverySpecification: &types.PointInTimeRecoverySpecification{
+			PointInTimeRecoveryEnabled: aws.Bool(true),
+			RecoveryPeriodInDays:       aws.Int32(1),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tooOld := time.Now().UTC().Add(-48 * time.Hour)
+	_, err = client.RestoreTableToPointInTime(ctx, &dynamodb.RestoreTableToPointInTimeInput{
+		SourceTableName: aws.String("pitrwindow"),
+		TargetTableName: aws.String("pitrwindowcopy"),
+		RestoreDateTime: aws.Time(tooOld),
+	})
+	if err == nil {
+		t.Fatal("expected InvalidRestoreTimeException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "InvalidRestoreTimeException" {
+		t.Fatalf("expected InvalidRestoreTimeException, got %q", apiErr.ErrorCode())
+	}
+}
+
+func TestCreateBackupDuplicateNameReturnsBackupInUse(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("backupparity"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateBackup(ctx, &dynamodb.CreateBackupInput{TableName: aws.String("backupparity"), BackupName: aws.String("same-name")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateBackup(ctx, &dynamodb.CreateBackupInput{TableName: aws.String("backupparity"), BackupName: aws.String("same-name")})
+	if err == nil {
+		t.Fatal("expected BackupInUseException for duplicate backup name")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "BackupInUseException" {
+		t.Fatalf("expected BackupInUseException, got %q", apiErr.ErrorCode())
+	}
+}
+
+func TestCreateBackupMissingTableReturnsTableNotFound(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateBackup(ctx, &dynamodb.CreateBackupInput{TableName: aws.String("does-not-exist"), BackupName: aws.String("backup-missing-table")})
+	if err == nil {
+		t.Fatal("expected TableNotFoundException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "TableNotFoundException" {
+		t.Fatalf("expected TableNotFoundException, got %q", apiErr.ErrorCode())
 	}
 }
