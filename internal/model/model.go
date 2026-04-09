@@ -32,6 +32,7 @@ type GlobalSecondaryIndex struct {
 	RangeKey       string
 	RangeType      string
 	ProjectionType string
+	NonKeyAttrs    []string
 }
 
 func (t Table) AttributeDefinitions() []map[string]any {
@@ -60,9 +61,13 @@ func (t Table) Description(itemCount int64) map[string]any {
 		gsis = append(gsis, map[string]any{
 			"IndexName":   g.IndexName,
 			"KeySchema":   keySchema,
-			"Projection":  map[string]any{"ProjectionType": g.ProjectionType},
 			"IndexStatus": "ACTIVE",
 		})
+		projection := map[string]any{"ProjectionType": g.ProjectionType}
+		if g.ProjectionType == "INCLUDE" {
+			projection["NonKeyAttributes"] = g.NonKeyAttrs
+		}
+		gsis[len(gsis)-1]["Projection"] = projection
 	}
 
 	desc := map[string]any{

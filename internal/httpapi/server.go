@@ -208,7 +208,8 @@ type createTableRequest struct {
 			KeyType       string `json:"KeyType"`
 		} `json:"KeySchema"`
 		Projection struct {
-			ProjectionType string `json:"ProjectionType"`
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
 		} `json:"Projection"`
 	} `json:"GlobalSecondaryIndexes"`
 }
@@ -273,13 +274,18 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		if g.IndexName == "" {
 			return nil, awserr.Validation("GSI IndexName is required")
 		}
+		projectionType, nonKeyAttrs, err := normalizeGSIProjection(g.Projection.ProjectionType, g.Projection.NonKeyAttributes)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
 		t.GSIs = append(t.GSIs, model.GlobalSecondaryIndex{
 			IndexName:      g.IndexName,
 			HashKey:        gHash,
 			HashType:       attrType[gHash],
 			RangeKey:       gRange,
 			RangeType:      attrType[gRange],
-			ProjectionType: firstNonEmpty(g.Projection.ProjectionType, "ALL"),
+			ProjectionType: projectionType,
+			NonKeyAttrs:    nonKeyAttrs,
 		})
 	}
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -784,11 +790,13 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	targetHashKey := t.HashKey
 	targetRangeKey := t.RangeKey
+	var queryGSI *model.GlobalSecondaryIndex
 	if strings.TrimSpace(req.IndexName) != "" {
 		gsi, ok := t.GetGSI(req.IndexName)
 		if !ok {
 			return nil, awserr.Validation("unknown index " + req.IndexName)
 		}
+		queryGSI = &gsi
 		targetHashKey = gsi.HashKey
 		targetRangeKey = gsi.RangeKey
 	}
@@ -858,8 +866,13 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	var lastScanned map[string]any
 
 	for _, item := range items {
+		queryItem := item
+		if queryGSI != nil {
+			queryItem = projectItemForGSI(item, t, *queryGSI)
+		}
+
 		if strings.TrimSpace(req.IndexName) != "" {
-			raw, ok := item[targetHashKey]
+			raw, ok := queryItem[targetHashKey]
 			if !ok {
 				continue
 			}
@@ -870,7 +883,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 
 		if skToken != nil {
-			ok, err := sortConditionMatches(item, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
@@ -880,14 +893,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 
 		scanned++
-		lastScanned = keyFromItem(t, item)
+		lastScanned = keyFromItem(t, queryItem)
 
-		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
 		if matches {
-			projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+			projected, err := applyProjection(queryItem, req.ProjectionExpression, req.ExpressionAttributeNames)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
@@ -1559,6 +1572,74 @@ func resolveNameStrict(v string, names map[string]string) (string, error) {
 		return "", fmt.Errorf("missing expression name %q", v)
 	}
 	return v, nil
+}
+
+func normalizeGSIProjection(projectionType string, nonKeyAttrs []string) (string, []string, error) {
+	projectionType = strings.TrimSpace(projectionType)
+	if projectionType == "" {
+		projectionType = "ALL"
+	}
+
+	cleaned := make([]string, 0, len(nonKeyAttrs))
+	seen := map[string]struct{}{}
+	for _, attr := range nonKeyAttrs {
+		name := strings.TrimSpace(attr)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		cleaned = append(cleaned, name)
+	}
+
+	switch projectionType {
+	case "ALL":
+		if len(cleaned) > 0 {
+			return "", nil, fmt.Errorf("NonKeyAttributes is only allowed when ProjectionType is INCLUDE")
+		}
+		return projectionType, nil, nil
+	case "KEYS_ONLY":
+		if len(cleaned) > 0 {
+			return "", nil, fmt.Errorf("NonKeyAttributes is only allowed when ProjectionType is INCLUDE")
+		}
+		return projectionType, nil, nil
+	case "INCLUDE":
+		if len(cleaned) == 0 {
+			return "", nil, fmt.Errorf("NonKeyAttributes must be provided when ProjectionType is INCLUDE")
+		}
+		return projectionType, cleaned, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported GSI ProjectionType %q", projectionType)
+	}
+}
+
+func projectItemForGSI(item map[string]any, t model.Table, g model.GlobalSecondaryIndex) map[string]any {
+	if g.ProjectionType == "ALL" {
+		return item
+	}
+
+	projected := map[string]any{}
+	keys := []string{t.HashKey, t.RangeKey, g.HashKey, g.RangeKey}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if value, ok := item[key]; ok {
+			projected[key] = value
+		}
+	}
+
+	if g.ProjectionType == "INCLUDE" {
+		for _, attr := range g.NonKeyAttrs {
+			if value, ok := item[attr]; ok {
+				projected[attr] = value
+			}
+		}
+	}
+
+	return projected
 }
 
 func firstNonEmpty(v string, fallback string) string {
