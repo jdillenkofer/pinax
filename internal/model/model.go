@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 )
@@ -127,13 +128,18 @@ func (t Table) Description(itemCount int64) map[string]any {
 			keySchema = append(keySchema, map[string]any{"AttributeName": g.RangeKey, "KeyType": "RANGE"})
 		}
 		gsis = append(gsis, map[string]any{
-			"IndexName":   g.IndexName,
-			"KeySchema":   keySchema,
-			"IndexStatus": firstNonEmpty(g.Status, IndexStatusActive),
+			"IndexName":      g.IndexName,
+			"KeySchema":      keySchema,
+			"IndexStatus":    firstNonEmpty(g.Status, IndexStatusActive),
+			"IndexSizeBytes": int64(0),
+			"ItemCount":      int64(0),
+			"IndexArn":       localIndexARN(t.Name, g.IndexName),
 		})
 		if g.ReadCapacity > 0 || g.WriteCapacity > 0 {
 			gsis[len(gsis)-1]["ProvisionedThroughput"] = map[string]any{
 				"NumberOfDecreasesToday": 0,
+				"LastIncreaseDateTime":   0,
+				"LastDecreaseDateTime":   0,
 				"ReadCapacityUnits":      g.ReadCapacity,
 				"WriteCapacityUnits":     g.WriteCapacity,
 			}
@@ -157,14 +163,19 @@ func (t Table) Description(itemCount int64) map[string]any {
 				{"AttributeName": t.HashKey, "KeyType": "HASH"},
 				{"AttributeName": l.RangeKey, "KeyType": "RANGE"},
 			},
-			"Projection":  projection,
-			"IndexStatus": "ACTIVE",
+			"Projection":     projection,
+			"IndexStatus":    "ACTIVE",
+			"IndexSizeBytes": int64(0),
+			"ItemCount":      int64(0),
+			"IndexArn":       localIndexARN(t.Name, l.IndexName),
 		})
 	}
 
 	desc := map[string]any{
 		"AttributeDefinitions": t.AttributeDefinitions(),
 		"TableName":            t.Name,
+		"TableArn":             localTableARN(t.Name),
+		"TableId":              localTableID(t.Name),
 		"KeySchema":            t.KeySchema(),
 		"TableStatus":          firstNonEmpty(t.Status, TableStatusActive),
 		"CreationDateTime":     t.CreatedAt,
@@ -172,13 +183,15 @@ func (t Table) Description(itemCount int64) map[string]any {
 		"TableSizeBytes":       0,
 		"ProvisionedThroughput": map[string]any{
 			"NumberOfDecreasesToday": 0,
+			"LastIncreaseDateTime":   0,
+			"LastDecreaseDateTime":   0,
 			"ReadCapacityUnits":      t.ReadCapacityUnits,
 			"WriteCapacityUnits":     t.WriteCapacityUnits,
 		},
 		"BillingModeSummary":        map[string]any{"BillingMode": firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST")},
 		"GlobalSecondaryIndexes":    gsis,
 		"LocalSecondaryIndexes":     lsis,
-		"TableClassSummary":         map[string]any{"TableClass": firstNonEmpty(t.TableClass, "STANDARD")},
+		"TableClassSummary":         map[string]any{"TableClass": firstNonEmpty(t.TableClass, "STANDARD"), "LastUpdateDateTime": t.CreatedAt},
 		"DeletionProtectionEnabled": t.DeletionProtection,
 	}
 
@@ -233,6 +246,21 @@ func firstNonEmpty(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func localTableARN(tableName string) string {
+	return "arn:aws:dynamodb:local:000000000000:table/" + tableName
+}
+
+func localIndexARN(tableName string, indexName string) string {
+	return localTableARN(tableName) + "/index/" + indexName
+}
+
+func localTableID(tableName string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(tableName))
+	sum := h.Sum64()
+	return fmt.Sprintf("00000000-0000-0000-%04x-%012x", sum>>48, sum&0x0000ffffffffffff)
 }
 
 func AttributeValueType(v any) string {

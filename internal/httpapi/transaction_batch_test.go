@@ -53,6 +53,93 @@ func TestTransactWriteAndGet(t *testing.T) {
 	}
 }
 
+func TestTransactGetAppliesPerItemProjection(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txproj"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("txproj"),
+		Item: map[string]types.AttributeValue{
+			"pk":     &types.AttributeValueMemberS{Value: "a"},
+			"hidden": &types.AttributeValueMemberS{Value: "x"},
+			"shown":  &types.AttributeValueMemberS{Value: "y"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: []types.TransactGetItem{{
+		Get: &types.Get{
+			TableName:            aws.String("txproj"),
+			Key:                  map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}},
+			ProjectionExpression: aws.String("pk, #s"),
+			ExpressionAttributeNames: map[string]string{
+				"#s": "shown",
+			},
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(out.Responses))
+	}
+	item := out.Responses[0].Item
+	if _, ok := item["shown"]; !ok {
+		t.Fatalf("expected shown attribute in projection, got %+v", item)
+	}
+	if _, ok := item["hidden"]; ok {
+		t.Fatalf("did not expect hidden attribute in projection, got %+v", item)
+	}
+}
+
+func TestTransactGetProjectionRequiresExpressionNames(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txproj2"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: []types.TransactGetItem{{
+		Get: &types.Get{
+			TableName:            aws.String("txproj2"),
+			Key:                  map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "missing"}},
+			ProjectionExpression: aws.String("#missing"),
+		},
+	}}})
+	if err == nil {
+		t.Fatal("expected validation error for missing expression name")
+	}
+}
+
 func TestBatchWriteLimitValidation(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)

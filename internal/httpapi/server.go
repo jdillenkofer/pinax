@@ -35,6 +35,13 @@ import (
 
 const targetPrefix = "DynamoDB_20120810."
 
+const (
+	defaultAccountMaxReadCapacityUnits  int64 = 80000
+	defaultAccountMaxWriteCapacityUnits int64 = 80000
+	defaultTableMaxReadCapacityUnits    int64 = 40000
+	defaultTableMaxWriteCapacityUnits   int64 = 40000
+)
+
 var (
 	httpRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -290,6 +297,8 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.createTable(r, body)
 	case "DescribeTable":
 		return s.describeTable(r, body)
+	case "DescribeLimits":
+		return s.describeLimits(r, body)
 	case "ListTables":
 		return s.listTables(r, body)
 	case "DeleteTable":
@@ -600,6 +609,19 @@ func (s *Server) describeTable(r *http.Request, body []byte) (map[string]any, er
 	return map[string]any{"Table": t.Description(count)}, nil
 }
 
+func (s *Server) describeLimits(_ *http.Request, body []byte) (map[string]any, error) {
+	var req struct{}
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	return map[string]any{
+		"AccountMaxReadCapacityUnits":  defaultAccountMaxReadCapacityUnits,
+		"AccountMaxWriteCapacityUnits": defaultAccountMaxWriteCapacityUnits,
+		"TableMaxReadCapacityUnits":    defaultTableMaxReadCapacityUnits,
+		"TableMaxWriteCapacityUnits":   defaultTableMaxWriteCapacityUnits,
+	}, nil
+}
+
 type listTablesRequest struct {
 	ExclusiveStartTableName string `json:"ExclusiveStartTableName"`
 	Limit                   int    `json:"Limit"`
@@ -680,13 +702,14 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 }
 
 type putItemRequest struct {
-	TableName                 string            `json:"TableName"`
-	Item                      map[string]any    `json:"Item"`
-	ReturnValues              string            `json:"ReturnValues"`
-	ConditionExpression       string            `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
-	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
+	TableName                           string            `json:"TableName"`
+	Item                                map[string]any    `json:"Item"`
+	ReturnValues                        string            `json:"ReturnValues"`
+	ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+	ConditionExpression                 string            `json:"ConditionExpression"`
+	ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
+	ReturnConsumedCapacity              string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
@@ -696,6 +719,9 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	}
 	if model.ItemTooLarge(req.Item) {
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
+	}
+	if err := validateReturnValuesOnConditionCheckFailure(req.ReturnValuesOnConditionCheckFailure); err != nil {
+		return nil, awserr.Validation(err.Error())
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -730,7 +756,8 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 	if !ok {
-		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
+		return nil, awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item))
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
@@ -820,18 +847,22 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 }
 
 type deleteItemRequest struct {
-	TableName                 string            `json:"TableName"`
-	Key                       map[string]any    `json:"Key"`
-	ReturnValues              string            `json:"ReturnValues"`
-	ConditionExpression       string            `json:"ConditionExpression"`
-	ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
-	ExpressionAttributeValues map[string]any    `json:"ExpressionAttributeValues"`
-	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
+	TableName                           string            `json:"TableName"`
+	Key                                 map[string]any    `json:"Key"`
+	ReturnValues                        string            `json:"ReturnValues"`
+	ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
+	ConditionExpression                 string            `json:"ConditionExpression"`
+	ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+	ExpressionAttributeValues           map[string]any    `json:"ExpressionAttributeValues"`
+	ReturnConsumedCapacity              string            `json:"ReturnConsumedCapacity"`
 }
 
 func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error) {
 	var req deleteItemRequest
 	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if err := validateReturnValuesOnConditionCheckFailure(req.ReturnValuesOnConditionCheckFailure); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
 
@@ -863,7 +894,8 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation(err.Error())
 	}
 	if !ok {
-		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
+		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
+		return nil, awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
@@ -2128,8 +2160,10 @@ type transactGetRequest struct {
 	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
 	TransactItems          []struct {
 		Get struct {
-			TableName string         `json:"TableName"`
-			Key       map[string]any `json:"Key"`
+			TableName                string            `json:"TableName"`
+			Key                      map[string]any    `json:"Key"`
+			ProjectionExpression     string            `json:"ProjectionExpression"`
+			ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
 		} `json:"Get"`
 	} `json:"TransactItems"`
 }
@@ -2167,14 +2201,21 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		item, err := s.store.GetItem(r.Context(), tx, g.TableName, pk, sk)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
+				if _, err := applyProjection(map[string]any{}, g.ProjectionExpression, g.ExpressionAttributeNames); err != nil {
+					return nil, awserr.Validation(err.Error())
+				}
 				readByTable[g.TableName] += model.CalculateReadCapacityUnits(1, true)
 				responses = append(responses, map[string]any{})
 				continue
 			}
 			return nil, err
 		}
+		projected, err := applyProjection(item, g.ProjectionExpression, g.ExpressionAttributeNames)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
 		readByTable[g.TableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), true)
-		responses = append(responses, map[string]any{"Item": item})
+		responses = append(responses, map[string]any{"Item": projected})
 	}
 	for tableName, units := range readByTable {
 		t, err := s.getActiveTable(r.Context(), tx, tableName)

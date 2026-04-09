@@ -35,6 +35,14 @@ func ConditionalCheckFailed(msg string) *APIError {
 	return &APIError{Code: "ConditionalCheckFailedException", Message: msg, Status: http.StatusBadRequest}
 }
 
+func ConditionalCheckFailedWithItem(msg string, item map[string]any) *APIError {
+	err := ConditionalCheckFailed(msg)
+	if item != nil {
+		err.Details = map[string]any{"Item": item}
+	}
+	return err
+}
+
 func ProvisionedThroughputExceeded(msg string) *APIError {
 	return &APIError{Code: "ProvisionedThroughputExceededException", Message: msg, Status: http.StatusBadRequest}
 }

@@ -91,6 +91,64 @@ func TestBatchGetAppliesProjectionExpression(t *testing.T) {
 	}
 }
 
+func TestDescribeLimitsReturnsCapacityFields(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	out, err := client.DescribeLimits(ctx, &dynamodb.DescribeLimitsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountMaxReadCapacityUnits == nil || *out.AccountMaxReadCapacityUnits <= 0 {
+		t.Fatalf("expected AccountMaxReadCapacityUnits to be set, got %+v", out)
+	}
+	if out.AccountMaxWriteCapacityUnits == nil || *out.AccountMaxWriteCapacityUnits <= 0 {
+		t.Fatalf("expected AccountMaxWriteCapacityUnits to be set, got %+v", out)
+	}
+	if out.TableMaxReadCapacityUnits == nil || *out.TableMaxReadCapacityUnits <= 0 {
+		t.Fatalf("expected TableMaxReadCapacityUnits to be set, got %+v", out)
+	}
+	if out.TableMaxWriteCapacityUnits == nil || *out.TableMaxWriteCapacityUnits <= 0 {
+		t.Fatalf("expected TableMaxWriteCapacityUnits to be set, got %+v", out)
+	}
+}
+
+func TestDescribeTableIncludesExtendedParityFields(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("descparity"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("descparity")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Table == nil {
+		t.Fatal("expected table description")
+	}
+	if out.Table.TableArn == nil || *out.Table.TableArn == "" {
+		t.Fatalf("expected TableArn to be set, got %+v", out.Table)
+	}
+	if out.Table.TableId == nil || *out.Table.TableId == "" {
+		t.Fatalf("expected TableId to be set, got %+v", out.Table)
+	}
+	if out.Table.ProvisionedThroughput == nil || out.Table.ProvisionedThroughput.LastIncreaseDateTime == nil || out.Table.ProvisionedThroughput.LastDecreaseDateTime == nil {
+		t.Fatalf("expected LastIncreaseDateTime and LastDecreaseDateTime in provisioned throughput, got %+v", out.Table.ProvisionedThroughput)
+	}
+}
+
 func TestListTablesReturnsLastEvaluatedTableName(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 	client, cleanup := newTestClient(t)

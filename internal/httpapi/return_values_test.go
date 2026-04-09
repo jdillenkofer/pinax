@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http/httptest"
 	"testing"
 
@@ -157,5 +158,101 @@ func TestUpdateReturnValuesUpdatedNew(t *testing.T) {
 	}
 	if _, ok := out.Attributes["count"]; !ok {
 		t.Fatal("expected count in UPDATED_NEW")
+	}
+}
+
+func TestPutReturnValuesOnConditionCheckFailureAllOld(t *testing.T) {
+	ctx := context.Background()
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("rv3"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("rv3"),
+		Item: map[string]types.AttributeValue{
+			"pk":   &types.AttributeValueMemberS{Value: "k1"},
+			"name": &types.AttributeValueMemberS{Value: "Jane"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:                           aws.String("rv3"),
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		ConditionExpression:                 aws.String("attribute_not_exists(pk)"),
+		Item: map[string]types.AttributeValue{
+			"pk":   &types.AttributeValueMemberS{Value: "k1"},
+			"name": &types.AttributeValueMemberS{Value: "Janet"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected conditional check failure")
+	}
+	var condErr *types.ConditionalCheckFailedException
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected ConditionalCheckFailedException, got %T: %v", err, err)
+	}
+	if _, ok := condErr.Item["name"]; !ok {
+		t.Fatalf("expected old item in conditional check failure, got %+v", condErr.Item)
+	}
+}
+
+func TestDeleteReturnValuesOnConditionCheckFailureAllOld(t *testing.T) {
+	ctx := context.Background()
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("rv4"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("rv4"),
+		Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: "k1"},
+			"version": &types.AttributeValueMemberN{Value: "2"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:                           aws.String("rv4"),
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		ConditionExpression:                 aws.String("version = :expected"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":expected": &types.AttributeValueMemberN{Value: "1"},
+		},
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "k1"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected conditional check failure")
+	}
+	var condErr *types.ConditionalCheckFailedException
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected ConditionalCheckFailedException, got %T: %v", err, err)
+	}
+	if _, ok := condErr.Item["version"]; !ok {
+		t.Fatalf("expected old item in conditional check failure, got %+v", condErr.Item)
 	}
 }
