@@ -517,6 +517,39 @@ func TestTransactGetReturnConsumedCapacity(t *testing.T) {
 	}
 }
 
+func TestTransactGetNotFoundStillReturnsConsumedCapacity(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txccmissing"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		TransactItems: []types.TransactGetItem{{
+			Get: &types.Get{TableName: aws.String("txccmissing"), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "missing"}}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ConsumedCapacity) == 0 {
+		t.Fatal("expected consumed capacity for missing transact get item")
+	}
+}
+
 func TestTransactWriteReturnConsumedCapacity(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 
