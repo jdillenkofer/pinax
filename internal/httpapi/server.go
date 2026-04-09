@@ -1063,18 +1063,24 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	startSK := ""
-	if len(req.ExclusiveStartKey) > 0 {
-		_, startSK, err = model.ExtractKey(t, req.ExclusiveStartKey)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
+	if queryGSI == nil && queryLSI == nil {
+		if len(req.ExclusiveStartKey) > 0 {
+			_, startSK, err = model.ExtractKey(t, req.ExclusiveStartKey)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+		} else if !scanForward {
+			startSK = "~"
 		}
-	} else if !scanForward {
-		startSK = "~"
 	}
 
 	var items []map[string]any
 	if queryGSI != nil {
-		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, startSK, scanForward, 0)
+		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, "", true, 0)
+		if err != nil {
+			return nil, err
+		}
+		items, err = orderItemsForGSI(items, t, *queryGSI, req.ExclusiveStartKey, scanForward)
 	} else if queryLSI != nil {
 		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, "", true, 0)
 		if err != nil {
@@ -1141,7 +1147,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 
 		scanned++
-		lastScanned = keyFromItem(t, queryItem)
+		lastScanned = keyFromItem(t, item)
 
 		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
@@ -1915,6 +1921,91 @@ func projectItemForLSI(item map[string]any, t model.Table, l model.LocalSecondar
 	}
 
 	return projected
+}
+
+func orderItemsForGSI(items []map[string]any, t model.Table, g model.GlobalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	type entry struct {
+		item map[string]any
+		idx  string
+		pk   string
+		sk   string
+	}
+
+	entries := make([]entry, 0, len(items))
+	for _, item := range items {
+		idx := ""
+		if g.RangeKey != "" {
+			raw, ok := item[g.RangeKey]
+			if !ok {
+				continue
+			}
+			v, err := model.SerializeKeyValue(raw)
+			if err != nil {
+				continue
+			}
+			idx = v
+		}
+
+		pkRaw, ok := item[t.HashKey]
+		if !ok {
+			continue
+		}
+		pk, err := model.SerializeKeyValue(pkRaw)
+		if err != nil {
+			continue
+		}
+		sk := model.NoSortKey
+		if t.RangeKey != "" {
+			skRaw, ok := item[t.RangeKey]
+			if !ok {
+				continue
+			}
+			sk, err = model.SerializeKeyValue(skRaw)
+			if err != nil {
+				continue
+			}
+		}
+		entries = append(entries, entry{item: item, idx: idx, pk: pk, sk: sk})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].idx == entries[j].idx {
+			if entries[i].pk == entries[j].pk {
+				if scanForward {
+					return entries[i].sk < entries[j].sk
+				}
+				return entries[i].sk > entries[j].sk
+			}
+			if scanForward {
+				return entries[i].pk < entries[j].pk
+			}
+			return entries[i].pk > entries[j].pk
+		}
+		if scanForward {
+			return entries[i].idx < entries[j].idx
+		}
+		return entries[i].idx > entries[j].idx
+	})
+
+	start := 0
+	if len(exclusiveStartKey) > 0 {
+		startPK, startSK, err := model.ExtractKey(t, exclusiveStartKey)
+		if err != nil {
+			return nil, err
+		}
+		for i, e := range entries {
+			if e.pk == startPK && e.sk == startSK {
+				start = i + 1
+				break
+			}
+		}
+	}
+
+	out := make([]map[string]any, 0, len(entries)-start)
+	for i := start; i < len(entries); i++ {
+		out = append(out, entries[i].item)
+	}
+	return out, nil
 }
 
 func orderItemsForLSI(items []map[string]any, t model.Table, l model.LocalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {

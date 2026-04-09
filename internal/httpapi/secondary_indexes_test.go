@@ -615,3 +615,179 @@ func TestUpdateTableRejectsUnknownGSIDelete(t *testing.T) {
 		t.Fatalf("expected validation error, got resource not found: %v", err)
 	}
 }
+
+func TestQueryGSIPaginationUsesExclusiveStartKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_gsi_page"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
+			IndexName:  aws.String("status-index"),
+			KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("status"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_gsi_page"), Item: map[string]types.AttributeValue{
+			"pk":     &types.AttributeValueMemberS{Value: "u#1"},
+			"sk":     &types.AttributeValueMemberN{Value: string(rune('0' + i))},
+			"status": &types.AttributeValueMemberS{Value: "OPEN"},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page1, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_gsi_page"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :s"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":s": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+		Limit: aws.Int32(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page1.LastEvaluatedKey == nil || page1.Count != 1 {
+		t.Fatalf("expected first page with LEK and count 1, got count=%d lek=%v", page1.Count, page1.LastEvaluatedKey)
+	}
+
+	page2, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_gsi_page"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :s"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":s": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+		ExclusiveStartKey: page1.LastEvaluatedKey,
+		Limit:             aws.Int32(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page2.Count != 2 {
+		t.Fatalf("expected second page count 2, got %d", page2.Count)
+	}
+}
+
+func TestQueryLSIPaginationUsesExclusiveStartKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_lsi_page"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{{
+			IndexName:  aws.String("status-lsi"),
+			KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("status"), KeyType: types.KeyTypeRange}},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_lsi_page"), Item: map[string]types.AttributeValue{
+			"pk":     &types.AttributeValueMemberS{Value: "u#1"},
+			"sk":     &types.AttributeValueMemberN{Value: string(rune('0' + i))},
+			"status": &types.AttributeValueMemberS{Value: string(rune('A' + i - 1))},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page1, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_lsi_page"),
+		IndexName:              aws.String("status-lsi"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+		Limit: aws.Int32(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page1.LastEvaluatedKey == nil || page1.Count != 1 {
+		t.Fatalf("expected first page with LEK and count 1, got count=%d lek=%v", page1.Count, page1.LastEvaluatedKey)
+	}
+
+	page2, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_lsi_page"),
+		IndexName:              aws.String("status-lsi"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+		ExclusiveStartKey: page1.LastEvaluatedKey,
+		Limit:             aws.Int32(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page2.Count != 2 {
+		t.Fatalf("expected second page count 2, got %d", page2.Count)
+	}
+}
