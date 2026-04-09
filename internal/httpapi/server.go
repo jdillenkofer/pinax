@@ -24,6 +24,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/store"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const targetPrefix = "DynamoDB_20120810."
@@ -33,6 +34,7 @@ type Server struct {
 	requestAuthorizer authorization.RequestAuthorizer
 	capMu             sync.Mutex
 	capacityWindows   map[string]capacityWindow
+	metricsHandler    http.Handler
 }
 
 type capacityWindow struct {
@@ -42,10 +44,21 @@ type capacityWindow struct {
 }
 
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer) *Server {
-	return &Server{store: store, requestAuthorizer: requestAuthorizer, capacityWindows: map[string]capacityWindow{}}
+	return &Server{store: store, requestAuthorizer: requestAuthorizer, capacityWindows: map[string]capacityWindow{}, metricsHandler: promhttp.Handler()}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/health":
+			s.serveHealth(w, r)
+			return
+		case "/metrics":
+			s.metricsHandler.ServeHTTP(w, r)
+			return
+		}
+	}
+
 	if r.Method != http.MethodPost || r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -80,6 +93,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		slog.Error("encode response", "operation", op, "err", err)
 	}
+}
+
+func (s *Server) serveHealth(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DB().PingContext(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("Unhealthy"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("Healthy"))
 }
 
 func (s *Server) authorizeRequest(r *http.Request, operation string, body []byte) error {
@@ -1947,7 +1970,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -1958,10 +1981,10 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			if model.ItemTooLarge(txItem.Put.Item) {
-				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, "Item size has exceeded the maximum allowed size (400KB)")
 			}
 			if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
 				return nil, err
@@ -2003,7 +2026,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -2065,7 +2088,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -2077,17 +2100,17 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			updated, _, err := applyUpdatePlan(current, plan)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if model.ItemTooLarge(updated) {
-				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, "Item size has exceeded the maximum allowed size (400KB)")
 			}
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
 				return nil, err
@@ -2129,7 +2152,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
 			if err != nil {
-				return nil, awserr.Validation(err.Error())
+				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if !ok {
 				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
@@ -2172,6 +2195,14 @@ func buildTransactionCancellationReasons(count int, failedIndex int, failed awse
 	}
 	reasons[failedIndex] = failed
 	return reasons
+}
+
+func transactionValidationCanceled(count int, failedIndex int, msg string) error {
+	reasons := buildTransactionCancellationReasons(count, failedIndex, awserr.CancellationReason{
+		Code:    "ValidationError",
+		Message: msg,
+	})
+	return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]", reasons)
 }
 
 func validateReturnValuesOnConditionCheckFailure(v string) error {

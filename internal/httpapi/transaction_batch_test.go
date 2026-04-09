@@ -356,6 +356,52 @@ func TestTransactWriteRejectsMultipleOperationsInOneItem(t *testing.T) {
 	}
 }
 
+func TestTransactWriteInvalidUpdateExpressionReturnsValidationReason(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("txvalreason"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: aws.String("txvalreason"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}}},
+		{Update: &types.Update{
+			TableName:        aws.String("txvalreason"),
+			Key:              map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "b"}},
+			UpdateExpression: aws.String("SET #v = "),
+			ExpressionAttributeNames: map[string]string{
+				"#v": "v",
+			},
+		}},
+	}})
+	if err == nil {
+		t.Fatal("expected transaction canceled error")
+	}
+	var txErr *types.TransactionCanceledException
+	if !errors.As(err, &txErr) {
+		t.Fatalf("expected TransactionCanceledException, got %T: %v", err, err)
+	}
+	if len(txErr.CancellationReasons) != 2 {
+		t.Fatalf("expected 2 cancellation reasons, got %d", len(txErr.CancellationReasons))
+	}
+	if txErr.CancellationReasons[0].Code == nil || *txErr.CancellationReasons[0].Code != "None" {
+		t.Fatalf("expected first reason None, got %+v", txErr.CancellationReasons[0])
+	}
+	if txErr.CancellationReasons[1].Code == nil || *txErr.CancellationReasons[1].Code != "ValidationError" {
+		t.Fatalf("expected second reason ValidationError, got %+v", txErr.CancellationReasons[1])
+	}
+}
+
 func TestTransactWriteConditionFailureReturnsCancellationReasons(t *testing.T) {
 	testutils.SkipIfIntegration(t)
 
