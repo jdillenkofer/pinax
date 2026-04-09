@@ -32,16 +32,19 @@ type TimeToLive struct {
 }
 
 type Table struct {
-	Name      string
-	HashKey   string
-	HashType  string
-	RangeKey  string
-	RangeType string
-	Status    string
-	StatusAt  int64
-	GSIs      []GlobalSecondaryIndex
-	LSIs      []LocalSecondaryIndex
-	CreatedAt int64
+	Name               string
+	HashKey            string
+	HashType           string
+	RangeKey           string
+	RangeType          string
+	BillingMode        string
+	ReadCapacityUnits  int64
+	WriteCapacityUnits int64
+	Status             string
+	StatusAt           int64
+	GSIs               []GlobalSecondaryIndex
+	LSIs               []LocalSecondaryIndex
+	CreatedAt          int64
 
 	TimeToLive TimeToLive
 }
@@ -128,17 +131,17 @@ func (t Table) Description(itemCount int64) map[string]any {
 		"TableSizeBytes":       0,
 		"ProvisionedThroughput": map[string]any{
 			"NumberOfDecreasesToday": 0,
-			"ReadCapacityUnits":      0,
-			"WriteCapacityUnits":     0,
+			"ReadCapacityUnits":      t.ReadCapacityUnits,
+			"WriteCapacityUnits":     t.WriteCapacityUnits,
 		},
-		"BillingModeSummary":     map[string]any{"BillingMode": "PAY_PER_REQUEST"},
+		"BillingModeSummary":     map[string]any{"BillingMode": firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST")},
 		"GlobalSecondaryIndexes": gsis,
 		"LocalSecondaryIndexes":  lsis,
 	}
 
-	if t.TimeToLive.Enabled {
+	if t.TimeToLive.Enabled || strings.TrimSpace(t.TimeToLive.Status) != "" || strings.TrimSpace(t.TimeToLive.AttrName) != "" {
 		desc["TimeToLive"] = map[string]any{
-			"TimeToLiveStatus": firstNonEmpty(t.TimeToLive.Status, "ENABLED"),
+			"TimeToLiveStatus": firstNonEmpty(t.TimeToLive.Status, TTLStatusEnabled),
 			"AttributeName":    t.TimeToLive.AttrName,
 		}
 	}
@@ -184,6 +187,35 @@ func ValidateKeyAttributeType(v any, expectedType string, attrName string) error
 	}
 	if actual != expectedType {
 		return fmt.Errorf("type mismatch for key attribute %q: expected %s, got %s", attrName, expectedType, actual)
+	}
+	return nil
+}
+
+func ValidateSecondaryIndexKeyTypes(t Table, item map[string]any) error {
+	for _, g := range t.GSIs {
+		if g.HashKey != "" {
+			if v, ok := item[g.HashKey]; ok {
+				if err := ValidateKeyAttributeType(v, g.HashType, g.HashKey); err != nil {
+					return err
+				}
+			}
+		}
+		if g.RangeKey != "" {
+			if v, ok := item[g.RangeKey]; ok {
+				if err := ValidateKeyAttributeType(v, g.RangeType, g.RangeKey); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, l := range t.LSIs {
+		if l.RangeKey != "" {
+			if v, ok := item[l.RangeKey]; ok {
+				if err := ValidateKeyAttributeType(v, l.RangeType, l.RangeKey); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }

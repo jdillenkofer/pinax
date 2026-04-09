@@ -198,7 +198,7 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 type createTableRequest struct {
 	TableName             string `json:"TableName"`
 	BillingMode           string `json:"BillingMode"`
-	ProvisionedThroughput struct {
+	ProvisionedThroughput *struct {
 		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
 		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
 	} `json:"ProvisionedThroughput"`
@@ -267,17 +267,24 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 	if hashType == "" {
 		return nil, awserr.Validation("AttributeDefinitions missing HASH key type")
 	}
+	billingMode, readCapacityUnits, writeCapacityUnits, err := normalizeBillingConfig(req.BillingMode, req.ProvisionedThroughput)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 
 	now := time.Now().Unix()
 	t := model.Table{
-		Name:      req.TableName,
-		HashKey:   hashKey,
-		HashType:  hashType,
-		RangeKey:  rangeKey,
-		RangeType: attrType[rangeKey],
-		Status:    model.TableStatusCreating,
-		StatusAt:  now,
-		CreatedAt: now,
+		Name:               req.TableName,
+		HashKey:            hashKey,
+		HashType:           hashType,
+		RangeKey:           rangeKey,
+		RangeType:          attrType[rangeKey],
+		BillingMode:        billingMode,
+		ReadCapacityUnits:  readCapacityUnits,
+		WriteCapacityUnits: writeCapacityUnits,
+		Status:             model.TableStatusCreating,
+		StatusAt:           now,
+		CreatedAt:          now,
 	}
 
 	indexNames := map[string]struct{}{}
@@ -514,6 +521,9 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	if err := model.ValidateSecondaryIndexKeyTypes(t, req.Item); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 
 	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	existed := true
@@ -586,7 +596,9 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	item, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return map[string]any{}, nil
+			resp := map[string]any{}
+			setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, model.CalculateReadCapacityUnits(1, req.ConsistentRead), 0)
+			return resp, nil
 		}
 		return nil, err
 	}
@@ -738,6 +750,9 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 	if model.ItemTooLarge(updated) {
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
@@ -787,7 +802,12 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 }
 
 type updateTableRequest struct {
-	TableName            string `json:"TableName"`
+	TableName             string `json:"TableName"`
+	BillingMode           string `json:"BillingMode"`
+	ProvisionedThroughput *struct {
+		ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+		WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+	} `json:"ProvisionedThroughput"`
 	AttributeDefinitions []struct {
 		AttributeName string `json:"AttributeName"`
 		AttributeType string `json:"AttributeType"`
@@ -834,6 +854,18 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 	if t.Status != model.TableStatusActive {
 		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
+	}
+	if strings.TrimSpace(req.BillingMode) != "" || req.ProvisionedThroughput != nil {
+		billingMode, readCapacityUnits, writeCapacityUnits, err := normalizeBillingConfig(req.BillingMode, req.ProvisionedThroughput)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		t.BillingMode = billingMode
+		t.ReadCapacityUnits = readCapacityUnits
+		t.WriteCapacityUnits = writeCapacityUnits
+		if err := s.store.UpdateTableBilling(r.Context(), tx, t.Name, billingMode, readCapacityUnits, writeCapacityUnits); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(req.GlobalSecondaryIndexUpdates) > 0 {
@@ -1488,6 +1520,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			item, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
+					readByTable[tableName] += model.CalculateReadCapacityUnits(1, itemReq.ConsistentRead)
 					continue
 				}
 				return nil, err
@@ -1605,6 +1638,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if err != nil {
 					return nil, awserr.Validation(err.Error())
 				}
+				if err := model.ValidateSecondaryIndexKeyTypes(t, op.PutRequest.Item); err != nil {
+					return nil, awserr.Validation(err.Error())
+				}
 				k := tableName + "|" + pk + "|" + sk
 				if _, exists := seenKeys[k]; exists {
 					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
@@ -1696,6 +1732,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		item, err := s.store.GetItem(r.Context(), tx, g.TableName, pk, sk)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
+				readByTable[g.TableName] += model.CalculateReadCapacityUnits(1, true)
 				responses = append(responses, map[string]any{})
 				continue
 			}
@@ -1824,6 +1861,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if model.ItemTooLarge(txItem.Put.Item) {
 				return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 			}
+			if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
 				return nil, err
 			}
@@ -1942,6 +1982,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			updated, _, err := applyUpdatePlan(current, plan)
 			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
 			if model.ItemTooLarge(updated) {
@@ -2125,6 +2168,37 @@ func normalizeIndexProjection(projectionType string, nonKeyAttrs []string) (stri
 		return projectionType, cleaned, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported ProjectionType %q", projectionType)
+	}
+}
+
+func normalizeBillingConfig(mode string, throughput *struct {
+	ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+	WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+}) (string, int64, int64, error) {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		if throughput != nil {
+			mode = "PROVISIONED"
+		} else {
+			mode = "PAY_PER_REQUEST"
+		}
+	}
+	switch mode {
+	case "PAY_PER_REQUEST":
+		if throughput != nil && (throughput.ReadCapacityUnits > 0 || throughput.WriteCapacityUnits > 0) {
+			return "", 0, 0, fmt.Errorf("ProvisionedThroughput must not be set when BillingMode is PAY_PER_REQUEST")
+		}
+		return mode, 0, 0, nil
+	case "PROVISIONED":
+		if throughput == nil {
+			return "", 0, 0, fmt.Errorf("ProvisionedThroughput is required when BillingMode is PROVISIONED")
+		}
+		if throughput.ReadCapacityUnits <= 0 || throughput.WriteCapacityUnits <= 0 {
+			return "", 0, 0, fmt.Errorf("ProvisionedThroughput ReadCapacityUnits and WriteCapacityUnits must be greater than 0")
+		}
+		return mode, throughput.ReadCapacityUnits, throughput.WriteCapacityUnits, nil
+	default:
+		return "", 0, 0, fmt.Errorf("unsupported BillingMode %q", mode)
 	}
 }
 
