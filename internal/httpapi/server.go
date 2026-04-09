@@ -643,7 +643,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation(err.Error())
 	}
 	if model.ItemTooLarge(req.Item) {
-		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+		return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -909,7 +909,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation(err.Error())
 	}
 	if model.ItemTooLarge(updated) {
-		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+		return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
@@ -1807,7 +1807,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 
 			if len(op.PutRequest.Item) > 0 {
 				if model.ItemTooLarge(op.PutRequest.Item) {
-					return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
+					return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 				}
 				pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
 				if err != nil {
@@ -2046,11 +2046,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "TransactionConflict",
-					Message: "Transaction request cannot include multiple operations on one item",
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
+				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
 			}
 			seenTargets[target] = struct{}{}
 
@@ -2076,7 +2072,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
 			}
 			if model.ItemTooLarge(txItem.Put.Item) {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, "Item size has exceeded the maximum allowed size (400KB)")
+				return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 			}
 			if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
 				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
@@ -2102,11 +2098,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "TransactionConflict",
-					Message: "Transaction request cannot include multiple operations on one item",
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
+				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
 			}
 			seenTargets[target] = struct{}{}
 
@@ -2152,11 +2144,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "TransactionConflict",
-					Message: "Transaction request cannot include multiple operations on one item",
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
+				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
 			}
 			seenTargets[target] = struct{}{}
 
@@ -2205,7 +2193,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
 			}
 			if model.ItemTooLarge(updated) {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, "Item size has exceeded the maximum allowed size (400KB)")
+				return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 			}
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
 				return nil, err
@@ -2228,11 +2216,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			target := t.Name + "|" + pk + "|" + sk
 			if _, exists := seenTargets[target]; exists {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "TransactionConflict",
-					Message: "Transaction request cannot include multiple operations on one item",
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]", reasons)
+				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
 			}
 			seenTargets[target] = struct{}{}
 

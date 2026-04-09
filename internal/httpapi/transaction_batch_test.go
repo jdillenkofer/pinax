@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 )
 
@@ -310,19 +312,15 @@ func TestTransactWriteDuplicateTargetValidation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected duplicate target validation error")
 	}
-
-	var txErr *types.TransactionCanceledException
-	if !errors.As(err, &txErr) {
-		t.Fatalf("expected TransactionCanceledException, got %T: %v", err, err)
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected smithy API error, got %T: %v", err, err)
 	}
-	if len(txErr.CancellationReasons) != 2 {
-		t.Fatalf("expected 2 cancellation reasons, got %d", len(txErr.CancellationReasons))
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException code, got %q", apiErr.ErrorCode())
 	}
-	if txErr.CancellationReasons[0].Code == nil || *txErr.CancellationReasons[0].Code != "None" {
-		t.Fatalf("expected first reason None, got %+v", txErr.CancellationReasons[0])
-	}
-	if txErr.CancellationReasons[1].Code == nil || *txErr.CancellationReasons[1].Code != "TransactionConflict" {
-		t.Fatalf("expected second reason TransactionConflict, got %+v", txErr.CancellationReasons[1])
+	if apiErr.ErrorMessage() != "Transaction request cannot include multiple operations on one item" {
+		t.Fatalf("unexpected duplicate target message: %q", apiErr.ErrorMessage())
 	}
 }
 
@@ -353,6 +351,16 @@ func TestTransactWriteRejectsMultipleOperationsInOneItem(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected validation error for multiple operations in one transaction item")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected smithy API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException code, got %q", apiErr.ErrorCode())
+	}
+	if apiErr.ErrorMessage() != "TransactItems can only contain one of Check, Put, Update or Delete" {
+		t.Fatalf("unexpected validation message: %q", apiErr.ErrorMessage())
 	}
 }
 
@@ -465,6 +473,100 @@ func TestTransactWriteConditionFailureReturnsCancellationReasons(t *testing.T) {
 	}
 	if txErr.CancellationReasons[1].Code == nil || *txErr.CancellationReasons[1].Code != "None" {
 		t.Fatalf("expected second reason None, got %+v", txErr.CancellationReasons[1])
+	}
+}
+
+func TestTransactWriteMixedFailureOrderingPrefersFirstFailure(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("txmixed"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("txmixed"), Item: map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "a"},
+		"v":  &types.AttributeValueMemberN{Value: "1"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Update: &types.Update{
+			TableName:                 aws.String("txmixed"),
+			Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}},
+			UpdateExpression:          aws.String("SET #v = #v + :one"),
+			ConditionExpression:       aws.String("#v = :bad"),
+			ExpressionAttributeNames:  map[string]string{"#v": "v"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":one": &types.AttributeValueMemberN{Value: "1"}, ":bad": &types.AttributeValueMemberN{Value: "999"}},
+		}},
+		{Update: &types.Update{
+			TableName:                 aws.String("txmixed"),
+			Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}},
+			UpdateExpression:          aws.String("SET #v = "),
+			ExpressionAttributeNames:  map[string]string{"#v": "v"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":one": &types.AttributeValueMemberN{Value: "1"}},
+		}},
+	}})
+	if err == nil {
+		t.Fatal("expected transaction canceled error")
+	}
+	var txErr *types.TransactionCanceledException
+	if !errors.As(err, &txErr) {
+		t.Fatalf("expected TransactionCanceledException, got %T: %v", err, err)
+	}
+	if len(txErr.CancellationReasons) != 2 {
+		t.Fatalf("expected 2 cancellation reasons, got %d", len(txErr.CancellationReasons))
+	}
+	if txErr.CancellationReasons[0].Code == nil || *txErr.CancellationReasons[0].Code != "ConditionalCheckFailed" {
+		t.Fatalf("expected first reason ConditionalCheckFailed, got %+v", txErr.CancellationReasons[0])
+	}
+	if txErr.CancellationReasons[1].Code == nil || *txErr.CancellationReasons[1].Code != "None" {
+		t.Fatalf("expected second reason None, got %+v", txErr.CancellationReasons[1])
+	}
+}
+
+func TestTransactWriteLargeItemReturnsValidationReason(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("txbig"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: aws.String("txbig"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "ok"}}}},
+		{Put: &types.Put{TableName: aws.String("txbig"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "big"}, "blob": &types.AttributeValueMemberS{Value: strings.Repeat("x", 410000)}}}},
+	}})
+	if err == nil {
+		t.Fatal("expected transaction canceled error")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected smithy API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException code, got %q", apiErr.ErrorCode())
+	}
+	if apiErr.ErrorMessage() != "Item size has exceeded the maximum allowed size" {
+		t.Fatalf("unexpected item size message: %q", apiErr.ErrorMessage())
 	}
 }
 

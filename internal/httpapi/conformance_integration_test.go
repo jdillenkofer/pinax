@@ -71,8 +71,14 @@ type conformanceSnapshot struct {
 	CRCTxCanceledErrValid    bool
 	ExprValidationCode       string
 	ExprValidationMessage    string
+	ExprSyntaxCode           string
+	ExprSyntaxMessage        string
 	TxValidationCode         string
 	TxValidationMessage      string
+	TxConflictCode           string
+	TxConflictMessage        string
+	TxItemSizeCode           string
+	TxItemSizeMessage        string
 }
 
 type knownConformanceDifferences struct {
@@ -392,6 +398,19 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	exprValidationCode := apiErrorCode(err)
 	exprValidationMsg := apiErrorMessage(err)
 
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(table),
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}},
+		UpdateExpression:          aws.String("SET #v = "),
+		ExpressionAttributeNames:  map[string]string{"#v": "version"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":one": &types.AttributeValueMemberN{Value: "1"}},
+	})
+	if err == nil {
+		t.Fatal("expected invalid expression syntax error")
+	}
+	exprSyntaxCode := apiErrorCode(err)
+	exprSyntaxMsg := apiErrorMessage(err)
+
 	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{{
 		Put:    &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#tx"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
 		Delete: &types.Delete{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#tx"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
@@ -401,6 +420,27 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	}
 	txValidationCode := apiErrorCode(err)
 	txValidationMsg := apiErrorMessage(err)
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#dup"}, "sk": &types.AttributeValueMemberN{Value: "1"}}}},
+		{Delete: &types.Delete{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#dup"}, "sk": &types.AttributeValueMemberN{Value: "1"}}}},
+	}})
+	if err == nil {
+		t.Fatal("expected duplicate target transaction cancellation")
+	}
+	txConflictCode := apiErrorCode(err)
+	txConflictMsg := apiErrorMessage(err)
+
+	bigPayload := strings.Repeat("x", 410000)
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{Put: &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#ok"}, "sk": &types.AttributeValueMemberN{Value: "1"}}}},
+		{Put: &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#big"}, "sk": &types.AttributeValueMemberN{Value: "1"}, "blob": &types.AttributeValueMemberS{Value: bigPayload}}}},
+	}})
+	if err == nil {
+		t.Fatal("expected item-size transaction validation error")
+	}
+	txItemSizeCode := apiErrorCode(err)
+	txItemSizeMessage := apiErrorMessage(err)
 
 	tg, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal, TransactItems: []types.TransactGetItem{{
 		Get: &types.Get{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}}},
@@ -645,8 +685,14 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 		CRCTxCanceledErrValid:    crcTxCanceledErrValid,
 		ExprValidationCode:       exprValidationCode,
 		ExprValidationMessage:    exprValidationMsg,
+		ExprSyntaxCode:           exprSyntaxCode,
+		ExprSyntaxMessage:        exprSyntaxMsg,
 		TxValidationCode:         txValidationCode,
 		TxValidationMessage:      txValidationMsg,
+		TxConflictCode:           txConflictCode,
+		TxConflictMessage:        txConflictMsg,
+		TxItemSizeCode:           txItemSizeCode,
+		TxItemSizeMessage:        txItemSizeMessage,
 	}
 }
 

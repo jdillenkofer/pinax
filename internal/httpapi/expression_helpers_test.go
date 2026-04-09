@@ -1,6 +1,9 @@
 package httpapi
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestUpdateExpressionSetRemoveAdd(t *testing.T) {
 	plan, err := parseUpdateExpression("SET #n = :name, visits = visits + :inc REMOVE old ADD score :add", map[string]string{"#n": "name"}, map[string]any{
@@ -93,5 +96,49 @@ func TestUpdateExpressionListAppendAndIfNotExists(t *testing.T) {
 	list2 := next2["tags"].(map[string]any)["L"].([]any)
 	if len(list2) != 3 {
 		t.Fatalf("expected 3 tags after append, got %d", len(list2))
+	}
+}
+
+func TestUpdateExpressionMissingAttributeValueUsesDynamoStyleMessage(t *testing.T) {
+	_, err := parseUpdateExpression("SET #v = :missing", map[string]string{"#v": "version"}, map[string]any{
+		":other": map[string]any{"N": "1"},
+	})
+	if err == nil {
+		t.Fatal("expected missing expression value error")
+	}
+	if !strings.Contains(err.Error(), "Invalid UpdateExpression") {
+		t.Fatalf("expected Dynamo-style update expression prefix, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), ":missing") {
+		t.Fatalf("expected missing token in message, got %q", err.Error())
+	}
+}
+
+func TestUpdateExpressionListAppendRejectsInvalidArity(t *testing.T) {
+	_, err := parseUpdateExpression("SET tags = list_append(:only_one)", nil, map[string]any{
+		":only_one": map[string]any{"L": []any{}},
+	})
+	if err == nil {
+		t.Fatal("expected invalid list_append arity error")
+	}
+	if !strings.Contains(err.Error(), "expected two arguments") {
+		t.Fatalf("expected parseTwoArgs error, got %q", err.Error())
+	}
+}
+
+func TestUpdateExpressionListAppendRejectsNonListOperand(t *testing.T) {
+	plan, err := parseUpdateExpression("SET tags = list_append(if_not_exists(tags, :empty), :bad)", nil, map[string]any{
+		":empty": map[string]any{"L": []any{}},
+		":bad":   map[string]any{"N": "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = applyUpdatePlan(map[string]any{}, plan)
+	if err == nil {
+		t.Fatal("expected non-list operand validation error")
+	}
+	if !strings.Contains(err.Error(), "list_append supports only L operands") {
+		t.Fatalf("expected list operand message, got %q", err.Error())
 	}
 }

@@ -67,7 +67,11 @@ func parseUpdateExpression(raw string, names map[string]string, values map[strin
 				if err != nil {
 					return updatePlan{}, err
 				}
-				value, err := evalSetValue(strings.TrimSpace(parts[1]), attr, names, values)
+				rhs := strings.TrimSpace(parts[1])
+				if rhs == "" {
+					return updatePlan{}, fmt.Errorf("Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"= \"")
+				}
+				value, err := evalSetValue(rhs, attr, names, values)
 				if err != nil {
 					return updatePlan{}, err
 				}
