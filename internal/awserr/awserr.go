@@ -3,7 +3,9 @@ package awserr
 import (
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"net/http"
+	"strconv"
 )
 
 const prefix = "com.amazonaws.dynamodb.v20120810#"
@@ -62,8 +64,6 @@ func Write(w http.ResponseWriter, err error) {
 		apiErr = Internal(err.Error())
 	}
 
-	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
-	w.WriteHeader(apiErr.Status)
 	payload := map[string]any{
 		"__type":  prefix + apiErr.Code,
 		"message": apiErr.Message,
@@ -71,5 +71,12 @@ func Write(w http.ResponseWriter, err error) {
 	for k, v := range apiErr.Details {
 		payload[k] = v
 	}
-	_ = json.NewEncoder(w).Encode(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		body = []byte(`{"__type":"` + prefix + `InternalServerError","message":"failed to encode error payload"}`)
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(body)), 10))
+	w.WriteHeader(apiErr.Status)
+	_, _ = w.Write(body)
 }

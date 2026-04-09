@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net"
@@ -143,10 +144,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
-	if err := json.NewEncoder(iw).Encode(resp); err != nil {
+	encoded, err := json.Marshal(resp)
+	if err != nil {
 		slog.Error("encode response", "operation", op, "err", err)
+		errCode = "InternalServerError"
+		awserr.Write(iw, awserr.Internal("failed to encode response"))
+		return
 	}
+	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	iw.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(encoded)), 10))
+	_, _ = iw.Write(encoded)
 }
 
 func (s *Server) observeRequest(operation string, statusCode int, errorCode string, duration time.Duration) {
