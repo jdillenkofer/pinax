@@ -1524,11 +1524,11 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 }
 
 type transactGetRequest struct {
-	TransactItems []struct {
+	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
+	TransactItems          []struct {
 		Get struct {
-			TableName              string         `json:"TableName"`
-			Key                    map[string]any `json:"Key"`
-			ReturnConsumedCapacity string         `json:"ReturnConsumedCapacity"`
+			TableName string         `json:"TableName"`
+			Key       map[string]any `json:"Key"`
 		} `json:"Get"`
 	} `json:"TransactItems"`
 }
@@ -1552,6 +1552,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 	defer tx.Rollback()
 
 	responses := make([]map[string]any, 0, len(req.TransactItems))
+	readByTable := map[string]float64{}
 	for _, txItem := range req.TransactItems {
 		g := txItem.Get
 		t, err := s.store.GetTable(r.Context(), tx, g.TableName)
@@ -1573,6 +1574,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 			}
 			return nil, err
 		}
+		readByTable[g.TableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), true)
 		responses = append(responses, map[string]any{"Item": item})
 	}
 
@@ -1580,11 +1582,16 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		return nil, err
 	}
 
-	return map[string]any{"Responses": responses}, nil
+	resp := map[string]any{"Responses": responses}
+	for tableName, units := range readByTable {
+		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, units, 0)
+	}
+	return resp, nil
 }
 
 type transactWriteRequest struct {
-	TransactItems []struct {
+	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
+	TransactItems          []struct {
 		Put struct {
 			TableName                           string            `json:"TableName"`
 			Item                                map[string]any    `json:"Item"`
@@ -1640,6 +1647,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	defer tx.Rollback()
 
 	seenTargets := map[string]struct{}{}
+	writeByTable := map[string]float64{}
 
 	for i, txItem := range req.TransactItems {
 		if len(txItem.Put.Item) > 0 {
@@ -1694,6 +1702,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
 				return nil, err
 			}
+			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
 			continue
 		}
 
@@ -1746,6 +1755,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 				return nil, err
 			}
+			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
 			continue
 		}
 
@@ -1821,6 +1831,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
 				return nil, err
 			}
+			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
 			continue
 		}
 
@@ -1880,7 +1891,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		return nil, err
 	}
 
-	return map[string]any{}, nil
+	resp := map[string]any{}
+	for tableName, units := range writeByTable {
+		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
+	}
+	return resp, nil
 }
 
 func buildTransactionCancellationReasons(count int, failedIndex int, failed awserr.CancellationReason) []awserr.CancellationReason {

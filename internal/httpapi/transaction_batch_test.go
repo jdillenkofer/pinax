@@ -374,3 +374,76 @@ func TestTransactWriteConditionFailureWithoutReturnValuesOmitsItem(t *testing.T)
 		t.Fatal("expected no item when ReturnValuesOnConditionCheckFailure is not ALL_OLD")
 	}
 }
+
+func TestTransactGetReturnConsumedCapacity(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txcc1"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("txcc1"),
+		Item:      map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		TransactItems: []types.TransactGetItem{{
+			Get: &types.Get{TableName: aws.String("txcc1"), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ConsumedCapacity) == 0 {
+		t.Fatal("expected consumed capacity in transact get response")
+	}
+}
+
+func TestTransactWriteReturnConsumedCapacity(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("txcc2"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		TransactItems: []types.TransactWriteItem{{
+			Put: &types.Put{TableName: aws.String("txcc2"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ConsumedCapacity) == 0 {
+		t.Fatal("expected consumed capacity in transact write response")
+	}
+}
