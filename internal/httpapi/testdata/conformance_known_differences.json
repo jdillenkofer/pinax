@@ -1,0 +1,5 @@
+{
+  "fields": {
+    "TTLStatusAfterEnable": "DynamoDB Local TTL behavior differs from Pinax/AWS transitions"
+  }
+}

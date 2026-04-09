@@ -93,6 +93,15 @@ Integration tests (mirrors `pithos` style flag):
 go test ./... -integration
 ```
 
+Run conformance checks against DynamoDB Local (requires local container on `http://localhost:8000` or custom endpoint):
+
+```bash
+PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT=http://localhost:8000 go test ./internal/httpapi -integration -run Conformance
+```
+
+Known conformance differences are tracked in `internal/httpapi/testdata/conformance_known_differences.json`.
+When extending conformance coverage, prefer fixing parity gaps first and only add entries to this file when the difference is intentional or externally constrained.
+
 ## Optimistic locking
 
 `pinax` follows the DynamoDB optimistic locking pattern using standard condition and update expressions.

@@ -36,3 +36,33 @@ jobs:
 
       - name: Run integration tests
         run: go test ./... -integration
+
+  conformance:
+    name: Conformance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Start DynamoDB Local
+        run: docker run -d --name ddb-local -p 8000:8000 amazon/dynamodb-local
+
+      - name: Run conformance tests
+        env:
+          PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT: http://localhost:8000
+          PINAX_LIFECYCLE_DELAY_MS: "0"
+        run: go test ./internal/httpapi -integration -run Conformance -v
+
+      - name: Stop DynamoDB Local
+        if: always()
+        run: docker rm -f ddb-local
