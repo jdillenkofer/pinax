@@ -131,3 +131,49 @@ func TestTrailingJSONContentReturnsValidationException(t *testing.T) {
 		t.Fatalf("expected ValidationException, got %q with payload %s", typ, string(body))
 	}
 }
+
+func TestTransactWriteUnknownNestedFieldReturnsValidationException(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/", strings.NewReader(`{"TransactItems":[{"Put":{"TableName":"t","Item":{"pk":{"S":"a"}},"UnexpectedNested":"x"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "DynamoDB_20120810.TransactWriteItems")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	typ, _ := payload["__type"].(string)
+	if !strings.HasSuffix(typ, "ValidationException") {
+		t.Fatalf("expected ValidationException, got %q with payload %s", typ, string(body))
+	}
+}

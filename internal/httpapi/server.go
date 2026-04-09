@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jdillenkofer/pinax/internal/awserr"
@@ -30,10 +31,18 @@ const targetPrefix = "DynamoDB_20120810."
 type Server struct {
 	store             store.Store
 	requestAuthorizer authorization.RequestAuthorizer
+	capMu             sync.Mutex
+	capacityWindows   map[string]capacityWindow
+}
+
+type capacityWindow struct {
+	second    int64
+	readUsed  float64
+	writeUsed float64
 }
 
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer) *Server {
-	return &Server{store: store, requestAuthorizer: requestAuthorizer}
+	return &Server{store: store, requestAuthorizer: requestAuthorizer, capacityWindows: map[string]capacityWindow{}}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -272,7 +281,7 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		return nil, awserr.Validation(err.Error())
 	}
 
-	now := time.Now().Unix()
+	now := lifecycleNow()
 	t := model.Table{
 		Name:               req.TableName,
 		HashKey:            hashKey,
@@ -284,7 +293,7 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		WriteCapacityUnits: writeCapacityUnits,
 		Status:             model.TableStatusCreating,
 		StatusAt:           now,
-		CreatedAt:          now,
+		CreatedAt:          time.Now().Unix(),
 	}
 
 	indexNames := map[string]struct{}{}
@@ -488,7 +497,7 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 		return nil, err
 	}
 	t.Status = model.TableStatusDeleting
-	t.StatusAt = time.Now().Unix() + 1
+	t.StatusAt = lifecycleNow() + lifecycleDelayMillis()
 	if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
 		return nil, err
 	}
@@ -554,7 +563,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item))
-	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
 
@@ -613,7 +622,7 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			readUnits := model.CalculateReadCapacityUnits(1, req.ConsistentRead)
-			if err := ensureReadCapacity(t, readUnits); err != nil {
+			if err := s.ensureReadCapacity(t, readUnits); err != nil {
 				return nil, err
 			}
 			resp := map[string]any{}
@@ -623,7 +632,7 @@ func (s *Server) getItem(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, err
 	}
 	readUnits := model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
-	if err := ensureReadCapacity(t, readUnits); err != nil {
+	if err := s.ensureReadCapacity(t, readUnits); err != nil {
 		return nil, err
 	}
 
@@ -687,7 +696,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
 	if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
@@ -785,7 +794,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
 	}
 	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
-	if err := ensureWriteCapacity(t, writeUnits); err != nil {
+	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
 	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
@@ -907,14 +916,14 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 				attrTypes[d.AttributeName] = d.AttributeType
 			}
 		}
-		now := time.Now().Unix()
+		now := lifecycleNow()
 		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes, now)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
 		t.GSIs = updatedGSIs
 		t.Status = model.TableStatusUpdating
-		t.StatusAt = now + 1
+		t.StatusAt = now + lifecycleDelayMillis()
 		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
 			return nil, err
 		}
@@ -946,7 +955,7 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 }
 
 func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
-	now := time.Now().Unix()
+	now := lifecycleNow()
 	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
 		if err := s.store.DeleteTable(ctx, tx, t.Name); err != nil {
 			return err
@@ -1114,7 +1123,7 @@ func applyGSIUpdates(table model.Table, updates []struct {
 						return nil, fmt.Errorf("index %q is already being deleted", name)
 					}
 					g.Status = model.IndexStatusDeleting
-					g.StatusAt = now + 1
+					g.StatusAt = now + lifecycleDelayMillis()
 					next = append(next, g)
 					continue
 				}
@@ -1178,7 +1187,7 @@ func applyGSIUpdates(table model.Table, updates []struct {
 			RangeKey:       rangeKey,
 			RangeType:      rangeType,
 			Status:         model.IndexStatusCreating,
-			StatusAt:       now + 1,
+			StatusAt:       now + lifecycleDelayMillis(),
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -1384,7 +1393,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
-	if err := ensureReadCapacity(t, totalRead); err != nil {
+	if err := s.ensureReadCapacity(t, totalRead); err != nil {
 		return nil, err
 	}
 	indexType := ""
@@ -1479,7 +1488,7 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
-	if err := ensureReadCapacity(t, totalRead); err != nil {
+	if err := s.ensureReadCapacity(t, totalRead); err != nil {
 		return nil, err
 	}
 	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
@@ -1558,17 +1567,27 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			item, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					readByTable[tableName] += model.CalculateReadCapacityUnits(1, itemReq.ConsistentRead)
+					units := model.CalculateReadCapacityUnits(1, itemReq.ConsistentRead)
+					if !s.reserveReadCapacity(t, units) {
+						unprocessedKeys = append(unprocessedKeys, key)
+						continue
+					}
+					readByTable[tableName] += units
 					continue
 				}
 				return nil, err
+			}
+			units := model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead)
+			if !s.reserveReadCapacity(t, units) {
+				unprocessedKeys = append(unprocessedKeys, key)
+				continue
 			}
 			projected, err := applyProjection(item, itemReq.ProjectionExpression, itemReq.ExpressionAttributeNames)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
 			items = append(items, projected)
-			readByTable[tableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead)
+			readByTable[tableName] += units
 		}
 		responses[tableName] = items
 		if len(unprocessedKeys) > 0 {
@@ -1578,15 +1597,6 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 				"ProjectionExpression":     itemReq.ProjectionExpression,
 				"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
 			}
-		}
-	}
-	for tableName, units := range readByTable {
-		t, err := s.getActiveTable(r.Context(), tx, tableName)
-		if err != nil {
-			return nil, err
-		}
-		if err := ensureReadCapacity(t, units); err != nil {
-			return nil, err
 		}
 	}
 
@@ -1693,10 +1703,18 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
 				}
 				seenKeys[k] = struct{}{}
+				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
+				if !s.reserveWriteCapacity(t, writeUnits) {
+					if unprocessed[tableName] == nil {
+						unprocessed[tableName] = make([]any, 0)
+					}
+					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
+					continue
+				}
 				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
-				writeByTable[tableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
+				writeByTable[tableName] += writeUnits
 				processed++
 			}
 			if len(op.DeleteRequest.Key) > 0 {
@@ -1716,21 +1734,20 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if errors.Is(err, sql.ErrNoRows) {
 					current = op.DeleteRequest.Key
 				}
+				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+				if !s.reserveWriteCapacity(t, writeUnits) {
+					if unprocessed[tableName] == nil {
+						unprocessed[tableName] = make([]any, 0)
+					}
+					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
+					continue
+				}
 				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
 					return nil, err
 				}
-				writeByTable[tableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+				writeByTable[tableName] += writeUnits
 				processed++
 			}
-		}
-	}
-	for tableName, units := range writeByTable {
-		t, err := s.getActiveTable(r.Context(), tx, tableName)
-		if err != nil {
-			return nil, err
-		}
-		if err := ensureWriteCapacity(t, units); err != nil {
-			return nil, err
 		}
 	}
 
@@ -1802,7 +1819,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		if err != nil {
 			return nil, err
 		}
-		if err := ensureReadCapacity(t, units); err != nil {
+		if err := s.ensureReadCapacity(t, units); err != nil {
 			return nil, err
 		}
 	}
@@ -2132,7 +2149,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		if err != nil {
 			return nil, err
 		}
-		if err := ensureWriteCapacity(t, units); err != nil {
+		if err := s.ensureWriteCapacity(t, units); err != nil {
 			return nil, err
 		}
 	}
@@ -2184,28 +2201,94 @@ func processingLimitFromEnv(name string) int {
 	return v
 }
 
+func lifecycleNow() int64 {
+	return time.Now().UnixMilli()
+}
+
+func lifecycleDelayMillis() int64 {
+	raw := strings.TrimSpace(os.Getenv("PINAX_LIFECYCLE_DELAY_MS"))
+	if raw == "" {
+		return 1000
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return 1000
+	}
+	return v
+}
+
 func enforceProvisionedLimits() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("PINAX_ENFORCE_PROVISIONED_LIMITS")), "true")
 }
 
-func ensureReadCapacity(t model.Table, units float64) error {
-	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
-		return nil
-	}
-	if t.ReadCapacityUnits > 0 && units > float64(t.ReadCapacityUnits) {
+func (s *Server) ensureReadCapacity(t model.Table, units float64) error {
+	if !s.reserveReadCapacity(t, units) {
 		return awserr.ProvisionedThroughputExceeded("read capacity exceeded for table " + t.Name)
 	}
 	return nil
 }
 
-func ensureWriteCapacity(t model.Table, units float64) error {
-	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
-		return nil
-	}
-	if t.WriteCapacityUnits > 0 && units > float64(t.WriteCapacityUnits) {
+func (s *Server) ensureWriteCapacity(t model.Table, units float64) error {
+	if !s.reserveWriteCapacity(t, units) {
 		return awserr.ProvisionedThroughputExceeded("write capacity exceeded for table " + t.Name)
 	}
 	return nil
+}
+
+func (s *Server) reserveReadCapacity(t model.Table, units float64) bool {
+	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
+		return true
+	}
+	if units <= 0 || t.ReadCapacityUnits <= 0 {
+		return true
+	}
+	return s.reserveCapacityUnits(t.Name, float64(t.ReadCapacityUnits), units, true)
+}
+
+func (s *Server) reserveWriteCapacity(t model.Table, units float64) bool {
+	if !enforceProvisionedLimits() || t.BillingMode != "PROVISIONED" {
+		return true
+	}
+	if units <= 0 || t.WriteCapacityUnits <= 0 {
+		return true
+	}
+	return s.reserveCapacityUnits(t.Name, float64(t.WriteCapacityUnits), units, false)
+}
+
+func (s *Server) reserveCapacityUnits(tableName string, perSecondLimit float64, units float64, isRead bool) bool {
+	if units <= 0 {
+		return true
+	}
+	nowSec := time.Now().Unix()
+	key := tableName
+	if isRead {
+		key += "|r"
+	} else {
+		key += "|w"
+	}
+
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+
+	window := s.capacityWindows[key]
+	if window.second != nowSec {
+		window = capacityWindow{second: nowSec}
+	}
+	used := window.writeUsed
+	if isRead {
+		used = window.readUsed
+	}
+	if used+units > perSecondLimit+0.00001 {
+		s.capacityWindows[key] = window
+		return false
+	}
+	if isRead {
+		window.readUsed += units
+	} else {
+		window.writeUsed += units
+	}
+	s.capacityWindows[key] = window
+	return true
 }
 
 func decode(body []byte, out any) error {
@@ -2714,7 +2797,7 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 	ttl := model.TimeToLive{
 		Enabled:  req.TimeToLiveSpecification.Enabled,
 		AttrName: req.TimeToLiveSpecification.AttributeName,
-		StatusAt: time.Now().Unix() + 1,
+		StatusAt: lifecycleNow() + lifecycleDelayMillis(),
 	}
 	if ttl.Enabled {
 		ttl.Status = model.TTLStatusEnabling
@@ -2761,7 +2844,7 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().Unix()
+	now := lifecycleNow()
 	if t.TimeToLive.Status == model.TTLStatusEnabling && t.TimeToLive.StatusAt > 0 && now >= t.TimeToLive.StatusAt {
 		t.TimeToLive.Status = model.TTLStatusEnabled
 		t.TimeToLive.StatusAt = 0

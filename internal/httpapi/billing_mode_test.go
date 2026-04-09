@@ -153,6 +153,10 @@ func TestProvisionedModeThrottlesReadsWhenEnabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected ProvisionedThroughputExceededException on read")
 	}
+	var pErr *types.ProvisionedThroughputExceededException
+	if !errors.As(err, &pErr) {
+		t.Fatalf("expected ProvisionedThroughputExceededException, got %T: %v", err, err)
+	}
 }
 
 func TestProvisionedModeThrottlesWritesWhenEnabled(t *testing.T) {
@@ -182,5 +186,85 @@ func TestProvisionedModeThrottlesWritesWhenEnabled(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected ProvisionedThroughputExceededException on write")
+	}
+	var pErr *types.ProvisionedThroughputExceededException
+	if !errors.As(err, &pErr) {
+		t.Fatalf("expected ProvisionedThroughputExceededException, got %T: %v", err, err)
+	}
+}
+
+func TestProvisionedModeBatchWriteReturnsUnprocessedInsteadOfError(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_ENFORCE_PROVISIONED_LIMITS", "true")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String("bmthrottle3"),
+		BillingMode: types.BillingModeProvisioned,
+		ProvisionedThroughput: &types.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(10),
+			WriteCapacityUnits: aws.Int64(2),
+		},
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 2048)
+	out, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{
+		"bmthrottle3": {
+			{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}, "payload": &types.AttributeValueMemberS{Value: large}}}},
+			{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "b"}, "payload": &types.AttributeValueMemberS{Value: large}}}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.UnprocessedItems["bmthrottle3"]) == 0 {
+		t.Fatal("expected unprocessed items when provisioned write capacity is exceeded")
+	}
+}
+
+func TestProvisionedModeBatchGetReturnsUnprocessedInsteadOfError(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_ENFORCE_PROVISIONED_LIMITS", "true")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String("bmthrottle4"),
+		BillingMode: types.BillingModeProvisioned,
+		ProvisionedThroughput: &types.ProvisionedThroughput{
+			ReadCapacityUnits:  aws.Int64(1),
+			WriteCapacityUnits: aws.Int64(10),
+		},
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 6000)
+	for _, id := range []string{"a", "b"} {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("bmthrottle4"), Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: id},
+			"payload": &types.AttributeValueMemberS{Value: large},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: map[string]types.KeysAndAttributes{
+		"bmthrottle4": {ConsistentRead: aws.Bool(true), Keys: []map[string]types.AttributeValue{{"pk": &types.AttributeValueMemberS{Value: "a"}}, {"pk": &types.AttributeValueMemberS{Value: "b"}}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.UnprocessedKeys["bmthrottle4"].Keys) == 0 {
+		t.Fatal("expected unprocessed keys when provisioned read capacity is exceeded")
 	}
 }
