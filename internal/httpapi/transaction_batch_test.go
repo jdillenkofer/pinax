@@ -142,6 +142,7 @@ func TestBatchGetDuplicateKeysValidation(t *testing.T) {
 
 func TestBatchGetReturnsUnprocessedKeysWhenOverProcessingLimit(t *testing.T) {
 	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_BATCH_GET_PROCESS_LIMIT", "80")
 	client, cleanup := newTestClient(t)
 	defer cleanup()
 
@@ -184,6 +185,7 @@ func TestBatchGetReturnsUnprocessedKeysWhenOverProcessingLimit(t *testing.T) {
 
 func TestBatchWriteReturnsUnprocessedItemsWhenOverProcessingLimit(t *testing.T) {
 	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_BATCH_WRITE_PROCESS_LIMIT", "20")
 	client, cleanup := newTestClient(t)
 	defer cleanup()
 
@@ -210,6 +212,76 @@ func TestBatchWriteReturnsUnprocessedItemsWhenOverProcessingLimit(t *testing.T) 
 	}
 	if len(out.UnprocessedItems["bwcap"]) == 0 {
 		t.Fatal("expected unprocessed items for oversized batch write processing")
+	}
+}
+
+func TestBatchGetReturnConsumedCapacity(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bgcc"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("bgcc"), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		RequestItems: map[string]types.KeysAndAttributes{
+			"bgcc": {
+				Keys: []map[string]types.AttributeValue{{"pk": &types.AttributeValueMemberS{Value: "a"}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ConsumedCapacity) == 0 {
+		t.Fatal("expected consumed capacity in batch get response")
+	}
+}
+
+func TestBatchWriteReturnConsumedCapacity(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bwcc"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		RequestItems: map[string][]types.WriteRequest{
+			"bwcc": {{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "a"}}}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ConsumedCapacity) == 0 {
+		t.Fatal("expected consumed capacity in batch write response")
 	}
 }
 

@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1305,7 +1307,8 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 }
 
 type batchGetItemRequest struct {
-	RequestItems map[string]struct {
+	ReturnConsumedCapacity string `json:"ReturnConsumedCapacity"`
+	RequestItems           map[string]struct {
 		Keys                     []map[string]any  `json:"Keys"`
 		ConsistentRead           bool              `json:"ConsistentRead"`
 		ProjectionExpression     string            `json:"ProjectionExpression"`
@@ -1336,10 +1339,11 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	}
 	defer tx.Rollback()
 
-	const batchGetProcessLimit = 80
+	batchGetProcessLimit := processingLimitFromEnv("PINAX_BATCH_GET_PROCESS_LIMIT")
 	processed := 0
 	responses := map[string]any{}
 	unprocessed := map[string]any{}
+	readByTable := map[string]float64{}
 	for tableName, itemReq := range req.RequestItems {
 		if len(itemReq.Keys) == 0 {
 			return nil, awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
@@ -1365,7 +1369,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			}
 			seenKeys[target] = struct{}{}
 
-			if processed >= batchGetProcessLimit {
+			if batchGetProcessLimit > 0 && processed >= batchGetProcessLimit {
 				unprocessedKeys = append(unprocessedKeys, key)
 				continue
 			}
@@ -1379,6 +1383,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 				return nil, err
 			}
 			items = append(items, item)
+			readByTable[tableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead)
 		}
 		responses[tableName] = items
 		if len(unprocessedKeys) > 0 {
@@ -1396,12 +1401,12 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	}
 
 	resp := map[string]any{"Responses": responses, "UnprocessedKeys": unprocessed}
-	for tableName, itemReq := range req.RequestItems {
-		if items, ok := responses[tableName]; ok {
-			for _, item := range items.([]map[string]any) {
-				addConsumedCapacity(resp, itemReq.ReturnConsumedCapacity, tableName, model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead), 0)
-			}
+	for tableName, units := range readByTable {
+		mode := req.ReturnConsumedCapacity
+		if mode == "" {
+			mode = req.RequestItems[tableName].ReturnConsumedCapacity
 		}
+		addConsumedCapacity(resp, mode, tableName, units, 0)
 	}
 	return resp, nil
 }
@@ -1447,9 +1452,10 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	}
 	sort.Strings(tableNames)
 
-	const batchWriteProcessLimit = 20
+	batchWriteProcessLimit := processingLimitFromEnv("PINAX_BATCH_WRITE_PROCESS_LIMIT")
 	processed := 0
 	unprocessed := map[string]any{}
+	writeByTable := map[string]float64{}
 
 	for _, tableName := range tableNames {
 		ops := req.RequestItems[tableName]
@@ -1472,7 +1478,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 			if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
 				return nil, awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
 			}
-			if processed >= batchWriteProcessLimit {
+			if batchWriteProcessLimit > 0 && processed >= batchWriteProcessLimit {
 				if unprocessed[tableName] == nil {
 					unprocessed[tableName] = make([]any, 0)
 				}
@@ -1496,6 +1502,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
+				writeByTable[tableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
 				processed++
 			}
 			if len(op.DeleteRequest.Key) > 0 {
@@ -1508,9 +1515,17 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
 				}
 				seenKeys[k] = struct{}{}
+				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return nil, err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					current = op.DeleteRequest.Key
+				}
 				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
 					return nil, err
 				}
+				writeByTable[tableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
 				processed++
 			}
 		}
@@ -1520,7 +1535,11 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, err
 	}
 
-	return map[string]any{"UnprocessedItems": unprocessed}, nil
+	resp := map[string]any{"UnprocessedItems": unprocessed}
+	for tableName, units := range writeByTable {
+		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
+	}
+	return resp, nil
 }
 
 type transactGetRequest struct {
@@ -1920,6 +1939,18 @@ func itemForConditionFailure(returnValues string, item map[string]any, itemExist
 		return nil
 	}
 	return item
+}
+
+func processingLimitFromEnv(name string) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func decode(body []byte, out any) error {
