@@ -180,3 +180,33 @@ func TestQueryPaginationUsesLastEvaluatedKey(t *testing.T) {
 		t.Fatal("expected next page to contain items")
 	}
 }
+
+func TestQueryFilterLimitUsesEvaluatedItemsForLastEvaluatedKey(t *testing.T) {
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+	seedQueryTable(t, client)
+
+	ctx := context.Background()
+	out, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("q"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		FilterExpression:       aws.String("sk = :only"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":   &types.AttributeValueMemberS{Value: "u#1"},
+			":only": &types.AttributeValueMemberN{Value: "5"},
+		},
+		Limit: aws.Int32(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Count != 0 {
+		t.Fatalf("expected no returned items on first filtered page, got %d", out.Count)
+	}
+	if out.ScannedCount != 2 {
+		t.Fatalf("expected scanned count 2, got %d", out.ScannedCount)
+	}
+	if out.LastEvaluatedKey == nil {
+		t.Fatal("expected LastEvaluatedKey on filtered query page")
+	}
+}
