@@ -1,0 +1,1 @@
+ALTER TABLE tables ADD COLUMN lsi_json TEXT NOT NULL DEFAULT '[]';

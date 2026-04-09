@@ -212,6 +212,17 @@ type createTableRequest struct {
 			NonKeyAttributes []string `json:"NonKeyAttributes"`
 		} `json:"Projection"`
 	} `json:"GlobalSecondaryIndexes"`
+	LocalSecondaryIndexes []struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+	} `json:"LocalSecondaryIndexes"`
 }
 
 func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, error) {
@@ -257,6 +268,8 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		CreatedAt: time.Now().Unix(),
 	}
 
+	indexNames := map[string]struct{}{}
+
 	for _, g := range req.GlobalSecondaryIndexes {
 		var gHash string
 		var gRange string
@@ -274,7 +287,11 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		if g.IndexName == "" {
 			return nil, awserr.Validation("GSI IndexName is required")
 		}
-		projectionType, nonKeyAttrs, err := normalizeGSIProjection(g.Projection.ProjectionType, g.Projection.NonKeyAttributes)
+		if _, exists := indexNames[g.IndexName]; exists {
+			return nil, awserr.Validation("duplicate secondary index name " + g.IndexName)
+		}
+		indexNames[g.IndexName] = struct{}{}
+		projectionType, nonKeyAttrs, err := normalizeIndexProjection(g.Projection.ProjectionType, g.Projection.NonKeyAttributes)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
@@ -284,6 +301,51 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 			HashType:       attrType[gHash],
 			RangeKey:       gRange,
 			RangeType:      attrType[gRange],
+			ProjectionType: projectionType,
+			NonKeyAttrs:    nonKeyAttrs,
+		})
+	}
+
+	for _, l := range req.LocalSecondaryIndexes {
+		if t.RangeKey == "" {
+			return nil, awserr.Validation("LocalSecondaryIndexes require table RANGE key")
+		}
+		if l.IndexName == "" {
+			return nil, awserr.Validation("LSI IndexName is required")
+		}
+		if _, exists := indexNames[l.IndexName]; exists {
+			return nil, awserr.Validation("duplicate secondary index name " + l.IndexName)
+		}
+		indexNames[l.IndexName] = struct{}{}
+
+		var lHash string
+		var lRange string
+		for _, k := range l.KeySchema {
+			switch k.KeyType {
+			case "HASH":
+				lHash = k.AttributeName
+			case "RANGE":
+				lRange = k.AttributeName
+			}
+		}
+		if lHash == "" || lRange == "" {
+			return nil, awserr.Validation("LSI KeySchema must include HASH and RANGE keys")
+		}
+		if lHash != t.HashKey {
+			return nil, awserr.Validation("LSI HASH key must match table HASH key")
+		}
+		if attrType[lRange] == "" {
+			return nil, awserr.Validation("AttributeDefinitions missing LSI RANGE key type")
+		}
+		projectionType, nonKeyAttrs, err := normalizeIndexProjection(l.Projection.ProjectionType, l.Projection.NonKeyAttributes)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+
+		t.LSIs = append(t.LSIs, model.LocalSecondaryIndex{
+			IndexName:      l.IndexName,
+			RangeKey:       lRange,
+			RangeType:      attrType[lRange],
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -791,14 +853,22 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	targetHashKey := t.HashKey
 	targetRangeKey := t.RangeKey
 	var queryGSI *model.GlobalSecondaryIndex
+	var queryLSI *model.LocalSecondaryIndex
 	if strings.TrimSpace(req.IndexName) != "" {
 		gsi, ok := t.GetGSI(req.IndexName)
-		if !ok {
-			return nil, awserr.Validation("unknown index " + req.IndexName)
+		if ok {
+			queryGSI = &gsi
+			targetHashKey = gsi.HashKey
+			targetRangeKey = gsi.RangeKey
+		} else {
+			lsi, ok := t.GetLSI(req.IndexName)
+			if !ok {
+				return nil, awserr.Validation("unknown index " + req.IndexName)
+			}
+			queryLSI = &lsi
+			targetHashKey = t.HashKey
+			targetRangeKey = lsi.RangeKey
 		}
-		queryGSI = &gsi
-		targetHashKey = gsi.HashKey
-		targetRangeKey = gsi.RangeKey
 	}
 
 	pkAttr, err := resolveNameStrict(pkToken.attr, req.ExpressionAttributeNames)
@@ -833,8 +903,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	var items []map[string]any
-	if strings.TrimSpace(req.IndexName) != "" {
+	if queryGSI != nil {
 		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, startSK, scanForward, 0)
+	} else if queryLSI != nil {
+		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, "", true, 0)
+		if err != nil {
+			return nil, err
+		}
+		items, err = orderItemsForLSI(items, t, *queryLSI, req.ExclusiveStartKey, scanForward)
 	} else if skToken == nil {
 		if targetRangeKey == "" {
 			items, err = s.store.QueryByPKSK(r.Context(), tx, t.Name, pk, model.NoSortKey)
@@ -869,6 +945,8 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		queryItem := item
 		if queryGSI != nil {
 			queryItem = projectItemForGSI(item, t, *queryGSI)
+		} else if queryLSI != nil {
+			queryItem = projectItemForLSI(item, t, *queryLSI)
 		}
 
 		if strings.TrimSpace(req.IndexName) != "" {
@@ -1574,7 +1652,7 @@ func resolveNameStrict(v string, names map[string]string) (string, error) {
 	return v, nil
 }
 
-func normalizeGSIProjection(projectionType string, nonKeyAttrs []string) (string, []string, error) {
+func normalizeIndexProjection(projectionType string, nonKeyAttrs []string) (string, []string, error) {
 	projectionType = strings.TrimSpace(projectionType)
 	if projectionType == "" {
 		projectionType = "ALL"
@@ -1611,7 +1689,7 @@ func normalizeGSIProjection(projectionType string, nonKeyAttrs []string) (string
 		}
 		return projectionType, cleaned, nil
 	default:
-		return "", nil, fmt.Errorf("unsupported GSI ProjectionType %q", projectionType)
+		return "", nil, fmt.Errorf("unsupported ProjectionType %q", projectionType)
 	}
 }
 
@@ -1640,6 +1718,123 @@ func projectItemForGSI(item map[string]any, t model.Table, g model.GlobalSeconda
 	}
 
 	return projected
+}
+
+func projectItemForLSI(item map[string]any, t model.Table, l model.LocalSecondaryIndex) map[string]any {
+	if l.ProjectionType == "ALL" {
+		return item
+	}
+
+	projected := map[string]any{}
+	keys := []string{t.HashKey, t.RangeKey, l.RangeKey}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if value, ok := item[key]; ok {
+			projected[key] = value
+		}
+	}
+
+	if l.ProjectionType == "INCLUDE" {
+		for _, attr := range l.NonKeyAttrs {
+			if value, ok := item[attr]; ok {
+				projected[attr] = value
+			}
+		}
+	}
+
+	return projected
+}
+
+func orderItemsForLSI(items []map[string]any, t model.Table, l model.LocalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	type entry struct {
+		item  map[string]any
+		lsiSK string
+		tblSK string
+	}
+
+	entries := make([]entry, 0, len(items))
+	for _, item := range items {
+		raw, ok := item[l.RangeKey]
+		if !ok {
+			continue
+		}
+		lsiSK, err := model.SerializeKeyValue(raw)
+		if err != nil {
+			continue
+		}
+		tblSK := model.NoSortKey
+		if t.RangeKey != "" {
+			rawTableSK, ok := item[t.RangeKey]
+			if !ok {
+				continue
+			}
+			tblSK, err = model.SerializeKeyValue(rawTableSK)
+			if err != nil {
+				continue
+			}
+		}
+		entries = append(entries, entry{item: item, lsiSK: lsiSK, tblSK: tblSK})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].lsiSK == entries[j].lsiSK {
+			if scanForward {
+				return entries[i].tblSK < entries[j].tblSK
+			}
+			return entries[i].tblSK > entries[j].tblSK
+		}
+		if scanForward {
+			return entries[i].lsiSK < entries[j].lsiSK
+		}
+		return entries[i].lsiSK > entries[j].lsiSK
+	})
+
+	if len(exclusiveStartKey) == 0 {
+		out := make([]map[string]any, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e.item)
+		}
+		return out, nil
+	}
+
+	startPK, startSK, err := model.ExtractKey(t, exclusiveStartKey)
+	if err != nil {
+		return nil, err
+	}
+	start := 0
+	for i, e := range entries {
+		pkVal, ok := e.item[t.HashKey]
+		if !ok {
+			continue
+		}
+		pk, err := model.SerializeKeyValue(pkVal)
+		if err != nil {
+			continue
+		}
+		tblSK := model.NoSortKey
+		if t.RangeKey != "" {
+			tblSKVal, ok := e.item[t.RangeKey]
+			if !ok {
+				continue
+			}
+			tblSK, err = model.SerializeKeyValue(tblSKVal)
+			if err != nil {
+				continue
+			}
+		}
+		if pk == startPK && tblSK == startSK {
+			start = i + 1
+			break
+		}
+	}
+
+	out := make([]map[string]any, 0, len(entries)-start)
+	for i := start; i < len(entries); i++ {
+		out = append(out, entries[i].item)
+	}
+	return out, nil
 }
 
 func firstNonEmpty(v string, fallback string) string {

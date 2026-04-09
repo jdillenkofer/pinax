@@ -20,6 +20,7 @@ type Table struct {
 	RangeKey  string
 	RangeType string
 	GSIs      []GlobalSecondaryIndex
+	LSIs      []LocalSecondaryIndex
 	CreatedAt int64
 
 	TimeToLive TimeToLive
@@ -29,6 +30,14 @@ type GlobalSecondaryIndex struct {
 	IndexName      string
 	HashKey        string
 	HashType       string
+	RangeKey       string
+	RangeType      string
+	ProjectionType string
+	NonKeyAttrs    []string
+}
+
+type LocalSecondaryIndex struct {
+	IndexName      string
 	RangeKey       string
 	RangeType      string
 	ProjectionType string
@@ -70,6 +79,23 @@ func (t Table) Description(itemCount int64) map[string]any {
 		gsis[len(gsis)-1]["Projection"] = projection
 	}
 
+	lsis := make([]map[string]any, 0, len(t.LSIs))
+	for _, l := range t.LSIs {
+		projection := map[string]any{"ProjectionType": l.ProjectionType}
+		if l.ProjectionType == "INCLUDE" {
+			projection["NonKeyAttributes"] = l.NonKeyAttrs
+		}
+		lsis = append(lsis, map[string]any{
+			"IndexName": l.IndexName,
+			"KeySchema": []map[string]any{
+				{"AttributeName": t.HashKey, "KeyType": "HASH"},
+				{"AttributeName": l.RangeKey, "KeyType": "RANGE"},
+			},
+			"Projection":  projection,
+			"IndexStatus": "ACTIVE",
+		})
+	}
+
 	desc := map[string]any{
 		"AttributeDefinitions": t.AttributeDefinitions(),
 		"TableName":            t.Name,
@@ -85,6 +111,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 		},
 		"BillingModeSummary":     map[string]any{"BillingMode": "PAY_PER_REQUEST"},
 		"GlobalSecondaryIndexes": gsis,
+		"LocalSecondaryIndexes":  lsis,
 	}
 
 	if t.TimeToLive.Enabled {
@@ -104,6 +131,15 @@ func (t Table) GetGSI(indexName string) (GlobalSecondaryIndex, bool) {
 		}
 	}
 	return GlobalSecondaryIndex{}, false
+}
+
+func (t Table) GetLSI(indexName string) (LocalSecondaryIndex, bool) {
+	for _, l := range t.LSIs {
+		if l.IndexName == indexName {
+			return l, true
+		}
+	}
+	return LocalSecondaryIndex{}, false
 }
 
 func ExtractItemKeys(t Table, item map[string]any) (pk string, sk string, err error) {

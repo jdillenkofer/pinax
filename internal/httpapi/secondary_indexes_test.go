@@ -294,3 +294,163 @@ func TestQueryGSIIncludeProjectionReturnsConfiguredNonKeyAttrs(t *testing.T) {
 		t.Fatalf("expected NonKeyAttributes [summary], got %+v", proj.NonKeyAttributes)
 	}
 }
+
+func TestQueryLSIKeysOnlyProjectionAndOrdering(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_lsi"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+			{
+				IndexName: aws.String("status-lsi"),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String("status"), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_lsi"), Item: map[string]types.AttributeValue{
+		"pk":     &types.AttributeValueMemberS{Value: "u#1"},
+		"sk":     &types.AttributeValueMemberN{Value: "2"},
+		"status": &types.AttributeValueMemberS{Value: "B"},
+		"note":   &types.AttributeValueMemberS{Value: "hidden"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_lsi"), Item: map[string]types.AttributeValue{
+		"pk":     &types.AttributeValueMemberS{Value: "u#1"},
+		"sk":     &types.AttributeValueMemberN{Value: "1"},
+		"status": &types.AttributeValueMemberS{Value: "A"},
+		"note":   &types.AttributeValueMemberS{Value: "hidden"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_lsi"), Item: map[string]types.AttributeValue{
+		"pk":   &types.AttributeValueMemberS{Value: "u#1"},
+		"sk":   &types.AttributeValueMemberN{Value: "3"},
+		"note": &types.AttributeValueMemberS{Value: "sparse-skip"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_lsi"),
+		IndexName:              aws.String("status-lsi"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Count != 2 {
+		t.Fatalf("expected 2 items from LSI query, got %d", out.Count)
+	}
+	if out.Items[0]["status"].(*types.AttributeValueMemberS).Value != "A" {
+		t.Fatalf("expected first item status A, got %+v", out.Items[0]["status"])
+	}
+	if _, ok := out.Items[0]["note"]; ok {
+		t.Fatal("did not expect non-key attribute for KEYS_ONLY LSI projection")
+	}
+
+	desc, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("orders_lsi")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(desc.Table.LocalSecondaryIndexes) != 1 {
+		t.Fatalf("expected one lsi in describe response, got %d", len(desc.Table.LocalSecondaryIndexes))
+	}
+}
+
+func TestCreateTableWithInvalidLSIHashKeyFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_invalid_lsi"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("other"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+			{
+				IndexName: aws.String("bad-lsi"),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("other"), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err == nil {
+		t.Fatal("expected validation error for invalid LSI hash key")
+	}
+}

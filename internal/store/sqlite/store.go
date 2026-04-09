@@ -114,14 +114,18 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 	if err != nil {
 		return err
 	}
+	lsiJSON, err := json.Marshal(t.LSIs)
+	if err != nil {
+		return err
+	}
 	ttlEnabled := 0
 	if t.TimeToLive.Enabled {
 		ttlEnabled = 1
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
 	if err != nil {
 		return err
 	}
@@ -133,13 +137,14 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
 	var gsiJSON string
+	var lsiJSON string
 	var ttlEnabled int
 	var ttlAttr sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, created_at, ttl_enabled, ttl_attribute
+		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
 	if err != nil {
 		return model.Table{}, err
 	}
@@ -147,6 +152,11 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	t.RangeType = rangeType.String
 	if strings.TrimSpace(gsiJSON) != "" {
 		if err := json.Unmarshal([]byte(gsiJSON), &t.GSIs); err != nil {
+			return model.Table{}, err
+		}
+	}
+	if strings.TrimSpace(lsiJSON) != "" {
+		if err := json.Unmarshal([]byte(lsiJSON), &t.LSIs); err != nil {
 			return model.Table{}, err
 		}
 	}
