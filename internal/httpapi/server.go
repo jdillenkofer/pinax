@@ -350,6 +350,12 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.describeContinuousBackups(r, body)
 	case "RestoreTableToPointInTime":
 		return s.restoreTableToPointInTime(r, body)
+	case "TagResource":
+		return s.tagResource(r, body)
+	case "UntagResource":
+		return s.untagResource(r, body)
+	case "ListTagsOfResource":
+		return s.listTagsOfResource(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -1221,6 +1227,24 @@ type restoreTableToPointInTimeRequest struct {
 	} `json:"LocalSecondaryIndexOverride"`
 }
 
+type tagResourceRequest struct {
+	ResourceARN string `json:"ResourceArn"`
+	Tags        []struct {
+		Key   string `json:"Key"`
+		Value string `json:"Value"`
+	} `json:"Tags"`
+}
+
+type untagResourceRequest struct {
+	ResourceARN string   `json:"ResourceArn"`
+	TagKeys     []string `json:"TagKeys"`
+}
+
+type listTagsOfResourceRequest struct {
+	ResourceARN string `json:"ResourceArn"`
+	NextToken   string `json:"NextToken"`
+}
+
 func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[string]any, error) {
 	var req updateContinuousBackupsRequest
 	if err := decode(body, &req); err != nil {
@@ -1482,6 +1506,154 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return nil, err
 	}
 	return map[string]any{"TableDescription": tableToCreate.Description(count)}, nil
+}
+
+func (s *Server) tagResource(r *http.Request, body []byte) (map[string]any, error) {
+	var req tagResourceRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.ResourceARN) == "" {
+		return nil, awserr.Validation("ResourceArn is required")
+	}
+	if len(req.Tags) == 0 {
+		return nil, awserr.Validation("Tags is required")
+	}
+	tags, err := normalizeTags(req.Tags)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, awserr.ResourceNotFound("Requested resource not found")
+		}
+		return nil, err
+	}
+
+	nextTags := mergeTags(t.Tags, tags)
+	if len(nextTags) > 50 {
+		return nil, awserr.Validation("Tags can have at most 50 items")
+	}
+
+	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, nextTags); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
+}
+
+func (s *Server) untagResource(r *http.Request, body []byte) (map[string]any, error) {
+	var req untagResourceRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.ResourceARN) == "" {
+		return nil, awserr.Validation("ResourceArn is required")
+	}
+	if len(req.TagKeys) == 0 {
+		return nil, awserr.Validation("TagKeys is required")
+	}
+	keys, err := normalizeTagKeys(req.TagKeys)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, awserr.ResourceNotFound("Requested resource not found")
+		}
+		return nil, err
+	}
+
+	nextTags := removeTags(t.Tags, keys)
+	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, nextTags); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
+}
+
+func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]any, error) {
+	var req listTagsOfResourceRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.ResourceARN) == "" {
+		return nil, awserr.Validation("ResourceArn is required")
+	}
+	if strings.TrimSpace(req.NextToken) != "" {
+		return nil, awserr.Validation("NextToken is not supported")
+	}
+
+	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
+	if err != nil {
+		var apiErr *awserr.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+			return nil, awserr.ResourceNotFound("Requested resource not found")
+		}
+		return nil, err
+	}
+
+	tags := make([]map[string]any, 0, len(t.Tags))
+	sortedTags := append([]model.Tag(nil), t.Tags...)
+	sort.Slice(sortedTags, func(i, j int) bool {
+		if sortedTags[i].Key == sortedTags[j].Key {
+			return sortedTags[i].Value < sortedTags[j].Value
+		}
+		return sortedTags[i].Key < sortedTags[j].Key
+	})
+	for _, tag := range sortedTags {
+		tags = append(tags, map[string]any{"Key": tag.Key, "Value": tag.Value})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"Tags": tags}, nil
 }
 
 type putItemRequest struct {
@@ -3750,6 +3922,87 @@ func normalizeTags(in []struct {
 		out = append(out, model.Tag{Key: key, Value: tag.Value})
 	}
 	return out, nil
+}
+
+func normalizeTagKeys(keys []string) ([]string, error) {
+	out := make([]string, 0, len(keys))
+	seen := map[string]struct{}{}
+	for _, raw := range keys {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			return nil, fmt.Errorf("TagKeys must not contain empty values")
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out, nil
+}
+
+func mergeTags(existing []model.Tag, updates []model.Tag) []model.Tag {
+	merged := append([]model.Tag(nil), existing...)
+	positions := make(map[string]int, len(merged))
+	for i, tag := range merged {
+		positions[tag.Key] = i
+	}
+	for _, tag := range updates {
+		if idx, ok := positions[tag.Key]; ok {
+			merged[idx].Value = tag.Value
+			continue
+		}
+		positions[tag.Key] = len(merged)
+		merged = append(merged, tag)
+	}
+	return merged
+}
+
+func removeTags(existing []model.Tag, keys []string) []model.Tag {
+	if len(existing) == 0 || len(keys) == 0 {
+		return existing
+	}
+	remove := map[string]struct{}{}
+	for _, key := range keys {
+		remove[key] = struct{}{}
+	}
+	out := make([]model.Tag, 0, len(existing))
+	for _, tag := range existing {
+		if _, ok := remove[tag.Key]; ok {
+			continue
+		}
+		out = append(out, tag)
+	}
+	return out
+}
+
+func taggableTableNameFromResourceARN(resourceARN string) (string, error) {
+	resourceARN = strings.TrimSpace(resourceARN)
+	if !strings.HasPrefix(resourceARN, "arn:") {
+		return "", fmt.Errorf("ResourceArn must be a valid ARN")
+	}
+	marker := ":table/"
+	start := strings.Index(resourceARN, marker)
+	if start < 0 {
+		marker = "/table/"
+		start = strings.Index(resourceARN, marker)
+	}
+	if start < 0 {
+		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	remainder := resourceARN[start+len(marker):]
+	if remainder == "" {
+		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	tableName := remainder
+	if slash := strings.Index(tableName, "/"); slash >= 0 {
+		tableName = tableName[:slash]
+	}
+	tableName = strings.TrimSpace(tableName)
+	if tableName == "" {
+		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	return tableName, nil
 }
 
 func normalizeGSIThroughputForCreate(billingMode string, throughput *struct {

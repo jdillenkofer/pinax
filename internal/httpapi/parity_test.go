@@ -638,3 +638,53 @@ func TestCreateBackupMissingTableReturnsTableNotFound(t *testing.T) {
 		t.Fatalf("expected TableNotFoundException, got %q", apiErr.ErrorCode())
 	}
 }
+
+func TestTagResourceMissingResourceReturnsResourceNotFound(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.TagResource(ctx, &dynamodb.TagResourceInput{
+		ResourceArn: aws.String("arn:aws:dynamodb:local:000000000000:table/does-not-exist"),
+		Tags: []types.Tag{{
+			Key:   aws.String("env"),
+			Value: aws.String("dev"),
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected ResourceNotFoundException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ResourceNotFoundException" {
+		t.Fatalf("expected ResourceNotFoundException, got %q", apiErr.ErrorCode())
+	}
+}
+
+func TestTagResourceDuplicateTagKeysReturnsValidationException(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.TagResource(ctx, &dynamodb.TagResourceInput{
+		ResourceArn: aws.String("arn:aws:dynamodb:local:000000000000:table/does-not-exist"),
+		Tags: []types.Tag{
+			{Key: aws.String("dup"), Value: aws.String("1")},
+			{Key: aws.String("dup"), Value: aws.String("2")},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected ValidationException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException, got %q", apiErr.ErrorCode())
+	}
+}

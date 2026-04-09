@@ -621,9 +621,9 @@ func isReadOnly(operation string) bool {
 	switch operation {
 	case "DescribeTable", "DescribeLimits", "DescribeEndpoints", "ListTables", "GetItem", "Query", "Scan", "BatchGetItem", "TransactGetItems", "DescribeTimeToLive", "DescribeContinuousBackups":
 		return true
-	case "DescribeBackup", "ListBackups":
+	case "DescribeBackup", "ListBackups", "ListTagsOfResource":
 		return true
-	case "CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem", "BatchWriteItem", "CreateBackup", "DeleteBackup", "RestoreTableFromBackup", "UpdateContinuousBackups", "RestoreTableToPointInTime":
+	case "CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem", "BatchWriteItem", "CreateBackup", "DeleteBackup", "RestoreTableFromBackup", "UpdateContinuousBackups", "RestoreTableToPointInTime", "TagResource", "UntagResource":
 		return false
 	default:
 		return false
