@@ -92,3 +92,33 @@ Integration tests (mirrors `pithos` style flag):
 ```bash
 go test ./... -integration
 ```
+
+## Optimistic locking
+
+`pinax` follows the DynamoDB optimistic locking pattern using standard condition and update expressions.
+It does not provide a custom versioning API and does not auto-manage version attributes.
+
+Recommended pattern:
+
+- create: `ConditionExpression` with `attribute_not_exists(pk)` and set `version` to `1`
+- update: `ConditionExpression` with `version = :expected` and bump version in the same write
+- delete: `ConditionExpression` with `version = :expected`
+
+Single-item optimistic update example:
+
+```text
+UpdateExpression:    SET #v = #v + :one, #payload = :payload
+ConditionExpression: #v = :expected
+ExpressionAttributeNames:
+  #v -> version
+  #payload -> payload
+ExpressionAttributeValues:
+  :one -> {"N":"1"}
+  :expected -> {"N":"7"}
+  :payload -> {"S":"next"}
+```
+
+Failure semantics:
+
+- stale single-item writes return `ConditionalCheckFailedException`
+- stale transactional writes return `TransactionCanceledException` with ordered cancellation reasons
