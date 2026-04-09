@@ -616,6 +616,114 @@ func TestUpdateTableRejectsUnknownGSIDelete(t *testing.T) {
 	}
 }
 
+func TestUpdateTableRejectsGSINameCollisionWithExistingLSI(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_lsi_name_collision"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{{
+			IndexName:  aws.String("status-lsi"),
+			KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("status"), KeyType: types.KeyTypeRange}},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("orders_lsi_name_collision"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{{
+			Create: &types.CreateGlobalSecondaryIndexAction{
+				IndexName:  aws.String("status-lsi"),
+				KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("status"), KeyType: types.KeyTypeHash}},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected update table validation error due to GSI/LSI name collision")
+	}
+}
+
+func TestUpdateTableRejectsMultipleUpdatesForSameGSI(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:            aws.String("orders_multi_gsi_updates"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}, {AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName:            aws.String("orders_multi_gsi_updates"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS}},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{Create: &types.CreateGlobalSecondaryIndexAction{IndexName: aws.String("status-index"), KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("status"), KeyType: types.KeyTypeHash}}, Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll}}},
+			{Delete: &types.DeleteGlobalSecondaryIndexAction{IndexName: aws.String("status-index")}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected validation error for multiple updates to same GSI")
+	}
+}
+
 func TestQueryGSIPaginationUsesExclusiveStartKey(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite3", ":memory:")

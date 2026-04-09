@@ -807,6 +807,10 @@ type updateTableRequest struct {
 }
 
 func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, error) {
+	if err := validateUpdateTablePayload(body); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
 	var req updateTableRequest
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
@@ -870,6 +874,23 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	return map[string]any{"TableDescription": t.Description(count)}, nil
 }
 
+func validateUpdateTablePayload(body []byte) error {
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid request body: %w", err)
+	}
+	if _, exists := raw["LocalSecondaryIndexUpdates"]; exists {
+		return fmt.Errorf("LocalSecondaryIndexUpdates is not supported; local secondary indexes can only be specified at CreateTable")
+	}
+	if _, exists := raw["LocalSecondaryIndexes"]; exists {
+		return fmt.Errorf("LocalSecondaryIndexes cannot be modified by UpdateTable")
+	}
+	return nil
+}
+
 type gsiUpdateRequest struct {
 	Create struct {
 		IndexName string
@@ -904,6 +925,7 @@ func applyGSIUpdates(table model.Table, updates []struct {
 	} `json:"Delete"`
 }, attrTypes map[string]string) ([]model.GlobalSecondaryIndex, error) {
 	gsis := append([]model.GlobalSecondaryIndex{}, table.GSIs...)
+	touched := map[string]struct{}{}
 	for _, u := range updates {
 		hasCreate := strings.TrimSpace(u.Create.IndexName) != ""
 		hasDelete := strings.TrimSpace(u.Delete.IndexName) != ""
@@ -912,6 +934,10 @@ func applyGSIUpdates(table model.Table, updates []struct {
 		}
 		if hasDelete {
 			name := strings.TrimSpace(u.Delete.IndexName)
+			if _, exists := touched[name]; exists {
+				return nil, fmt.Errorf("multiple updates for index %q are not allowed", name)
+			}
+			touched[name] = struct{}{}
 			found := false
 			next := make([]model.GlobalSecondaryIndex, 0, len(gsis))
 			for _, g := range gsis {
@@ -932,6 +958,10 @@ func applyGSIUpdates(table model.Table, updates []struct {
 		if name == "" {
 			return nil, fmt.Errorf("GSI IndexName is required")
 		}
+		if _, exists := touched[name]; exists {
+			return nil, fmt.Errorf("multiple updates for index %q are not allowed", name)
+		}
+		touched[name] = struct{}{}
 		if _, ok := table.GetLSI(name); ok {
 			return nil, fmt.Errorf("duplicate secondary index name %s", name)
 		}
