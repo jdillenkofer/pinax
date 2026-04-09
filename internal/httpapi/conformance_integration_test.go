@@ -85,6 +85,25 @@ type knownConformanceDifferences struct {
 	Fields map[string]string `json:"fields"`
 }
 
+type operationErrorParitySnapshot struct {
+	PutWrongTypeCode       string
+	PutWrongTypeMessage    string
+	GetWrongTypeCode       string
+	GetWrongTypeMessage    string
+	DeleteWrongTypeCode    string
+	DeleteWrongTypeMessage string
+	QueryWrongTypeCode     string
+	QueryWrongTypeMessage  string
+	ScanMissingValueCode   string
+	ScanMissingValueMsg    string
+	UpdateSyntaxCode       string
+	UpdateSyntaxMessage    string
+	BatchGetDupCode        string
+	BatchGetDupMessage     string
+	BatchWriteDupCode      string
+	BatchWriteDupMessage   string
+}
+
 func TestConformanceAgainstDynamoDBLocal(t *testing.T) {
 	testutils.SkipIfNotIntegration(t)
 	t.Setenv("PINAX_LIFECYCLE_DELAY_MS", "0")
@@ -123,6 +142,41 @@ func TestConformanceAgainstDynamoDBLocal(t *testing.T) {
 
 	if len(mismatches) > 0 {
 		t.Fatalf("conformance mismatches:\n%s\n\npinax: %+v\nlocal: %+v", strings.Join(mismatches, "\n"), pinaxSnap, localSnap)
+	}
+}
+
+func TestOperationErrorParityAgainstDynamoDBLocal(t *testing.T) {
+	testutils.SkipIfNotIntegration(t)
+
+	localEndpoint := os.Getenv("PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT")
+	if localEndpoint == "" {
+		t.Skip("set PINAX_CONFORMANCE_DDB_LOCAL_ENDPOINT (for example http://localhost:8000) to run operation error parity test")
+	}
+
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pinaxSrv := httptest.NewServer(NewServer(store, nil))
+	t.Cleanup(pinaxSrv.Close)
+
+	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)
+	localClient := mustConformanceClient(ctx, t, localEndpoint)
+
+	pinax := runOperationErrorParityScenario(ctx, t, pinaxClient.ddb, "pinax")
+	local := runOperationErrorParityScenario(ctx, t, localClient.ddb, "local")
+
+	if !reflect.DeepEqual(pinax, local) {
+		t.Fatalf("operation error parity mismatches\npinax: %+v\nlocal: %+v", pinax, local)
 	}
 }
 
@@ -786,6 +840,138 @@ func runConformanceStressScenario(ctx context.Context, t *testing.T, client *dyn
 	}
 
 	return conformanceStressSnapshot{TotalItems: total, PageCount: pages, ScannedCount: scannedCount}
+}
+
+func runOperationErrorParityScenario(ctx context.Context, t *testing.T, client *dynamodb.Client, prefix string) operationErrorParitySnapshot {
+	t.Helper()
+
+	table := fmt.Sprintf("err_%s_%d", prefix, time.Now().UnixNano())
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(table),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "wrong"}}})
+	if err == nil {
+		t.Fatal("expected put wrong key type error")
+	}
+	putWrongTypeCode := apiErrorCode(err)
+	putWrongTypeMessage := apiErrorMessage(err)
+
+	_, err = client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "wrong"}}})
+	if err == nil {
+		t.Fatal("expected get wrong key type error")
+	}
+	getWrongTypeCode := apiErrorCode(err)
+	getWrongTypeMessage := apiErrorMessage(err)
+
+	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(table), Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "wrong"}}})
+	if err == nil {
+		t.Fatal("expected delete wrong key type error")
+	}
+	deleteWrongTypeCode := apiErrorCode(err)
+	deleteWrongTypeMessage := apiErrorMessage(err)
+
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(table),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "wrong"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected query wrong key type error")
+	}
+	queryWrongTypeCode := apiErrorCode(err)
+	queryWrongTypeMessage := apiErrorMessage(err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberN{Value: "0"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:        aws.String(table),
+		FilterExpression: aws.String("pk = :missing"),
+	})
+	if err == nil {
+		t.Fatal("expected scan missing value error")
+	}
+	scanMissingValueCode := apiErrorCode(err)
+	scanMissingValueMsg := apiErrorMessage(err)
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberN{Value: "1"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(table),
+		Key:                       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberN{Value: "1"}},
+		UpdateExpression:          aws.String("SET #v = "),
+		ExpressionAttributeNames:  map[string]string{"#v": "version"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":one": &types.AttributeValueMemberN{Value: "1"}},
+	})
+	if err == nil {
+		t.Fatal("expected update syntax error")
+	}
+	updateSyntaxCode := apiErrorCode(err)
+	updateSyntaxMessage := apiErrorMessage(err)
+
+	_, err = client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: map[string]types.KeysAndAttributes{
+		table: {
+			Keys: []map[string]types.AttributeValue{
+				{"pk": &types.AttributeValueMemberN{Value: "1"}},
+				{"pk": &types.AttributeValueMemberN{Value: "1"}},
+			},
+		},
+	}})
+	if err == nil {
+		t.Fatal("expected batch get duplicate key error")
+	}
+	batchGetDupCode := apiErrorCode(err)
+	batchGetDupMessage := apiErrorMessage(err)
+
+	_, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{
+		table: {
+			{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberN{Value: "9"}}}},
+			{DeleteRequest: &types.DeleteRequest{Key: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberN{Value: "9"}}}},
+		},
+	}})
+	if err == nil {
+		t.Fatal("expected batch write duplicate key error")
+	}
+	batchWriteDupCode := apiErrorCode(err)
+	batchWriteDupMessage := apiErrorMessage(err)
+
+	return operationErrorParitySnapshot{
+		PutWrongTypeCode:       putWrongTypeCode,
+		PutWrongTypeMessage:    putWrongTypeMessage,
+		GetWrongTypeCode:       getWrongTypeCode,
+		GetWrongTypeMessage:    getWrongTypeMessage,
+		DeleteWrongTypeCode:    deleteWrongTypeCode,
+		DeleteWrongTypeMessage: deleteWrongTypeMessage,
+		QueryWrongTypeCode:     queryWrongTypeCode,
+		QueryWrongTypeMessage:  queryWrongTypeMessage,
+		ScanMissingValueCode:   scanMissingValueCode,
+		ScanMissingValueMsg:    scanMissingValueMsg,
+		UpdateSyntaxCode:       updateSyntaxCode,
+		UpdateSyntaxMessage:    updateSyntaxMessage,
+		BatchGetDupCode:        batchGetDupCode,
+		BatchGetDupMessage:     batchGetDupMessage,
+		BatchWriteDupCode:      batchWriteDupCode,
+		BatchWriteDupMessage:   batchWriteDupMessage,
+	}
 }
 
 func apiErrorCode(err error) string {

@@ -186,7 +186,7 @@ func ValidateKeyAttributeType(v any, expectedType string, attrName string) error
 		return fmt.Errorf("invalid key attribute %q", attrName)
 	}
 	if actual != expectedType {
-		return fmt.Errorf("type mismatch for key attribute %q: expected %s, got %s", attrName, expectedType, actual)
+		return fmt.Errorf("One or more parameter values were invalid: Type mismatch for key")
 	}
 	return nil
 }

@@ -1397,7 +1397,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation("missing partition key expression value")
 	}
 	if err := model.ValidateKeyAttributeType(pkValue, targetHashType, targetHashKey); err != nil {
-		return nil, awserr.Validation(err.Error())
+		return nil, awserr.Validation("One or more parameter values were invalid: Condition parameter type does not match schema type")
 	}
 	pk, err := model.SerializeKeyValue(pkValue)
 	if err != nil {
@@ -1494,7 +1494,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 
 		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
-			return nil, awserr.Validation(err.Error())
+			return nil, awserr.Validation(filterExpressionValidationMessage(err))
 		}
 		if matches {
 			projected, err := applyProjection(queryItem, req.ProjectionExpression, req.ExpressionAttributeNames)
@@ -1586,7 +1586,7 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 
 		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
-			return nil, awserr.Validation(err.Error())
+			return nil, awserr.Validation(filterExpressionValidationMessage(err))
 		}
 		if !matches {
 			if limit > 0 && scanned >= limit {
@@ -1672,7 +1672,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			}
 			target := tableName + "|" + pk + "|" + sk
 			if _, exists := seenKeys[target]; exists {
-				return nil, awserr.Validation("BatchGetItem contains duplicate keys")
+				return nil, awserr.Validation("Provided list of item keys contains duplicates")
 			}
 			seenKeys[target] = struct{}{}
 
@@ -1818,7 +1818,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				}
 				k := tableName + "|" + pk + "|" + sk
 				if _, exists := seenKeys[k]; exists {
-					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
+					return nil, awserr.Validation("Provided list of item keys contains duplicates")
 				}
 				seenKeys[k] = struct{}{}
 				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
@@ -1842,7 +1842,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				}
 				k := tableName + "|" + pk + "|" + sk
 				if _, exists := seenKeys[k]; exists {
-					return nil, awserr.Validation("BatchWriteItem contains duplicate keys")
+					return nil, awserr.Validation("Provided list of item keys contains duplicates")
 				}
 				seenKeys[k] = struct{}{}
 				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
@@ -3096,4 +3096,15 @@ func addQueryConsumedCapacity(resp map[string]any, mode string, tableName, index
 	}
 	list := resp["ConsumedCapacity"].([]map[string]any)
 	resp["ConsumedCapacity"] = append(list, entry)
+}
+
+func filterExpressionValidationMessage(err error) string {
+	msg := err.Error()
+	const prefix = "missing expression value "
+	if strings.HasPrefix(msg, prefix) {
+		token := strings.TrimPrefix(msg, prefix)
+		token = strings.Trim(token, "\"")
+		return "Invalid FilterExpression: An expression attribute value used in expression is not defined; attribute value: " + token
+	}
+	return msg
 }
