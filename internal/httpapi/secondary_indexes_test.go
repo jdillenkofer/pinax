@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -525,6 +526,19 @@ func TestUpdateTableCreateAndDeleteGSI(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_update_gsi"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :status"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected ResourceInUse while index is CREATING")
+	}
+
+	time.Sleep(1100 * time.Millisecond)
 	qOut, err := client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String("orders_update_gsi"),
 		IndexName:              aws.String("status-index"),
@@ -550,6 +564,18 @@ func TestUpdateTableCreateAndDeleteGSI(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_update_gsi"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :status"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected ResourceInUse while index is DELETING")
+	}
+	time.Sleep(1100 * time.Millisecond)
 	_, err = client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String("orders_update_gsi"),
 		IndexName:              aws.String("status-index"),

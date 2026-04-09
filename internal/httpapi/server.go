@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -267,6 +268,7 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		HashType:  hashType,
 		RangeKey:  rangeKey,
 		RangeType: attrType[rangeKey],
+		Status:    model.TableStatusActive,
 		CreatedAt: time.Now().Unix(),
 	}
 
@@ -303,6 +305,7 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 			HashType:       attrType[gHash],
 			RangeKey:       gRange,
 			RangeType:      attrType[gRange],
+			Status:         model.IndexStatusActive,
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -392,6 +395,9 @@ func (s *Server) describeTable(r *http.Request, body []byte) (map[string]any, er
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
+		return nil, err
+	}
+	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
 		return nil, err
 	}
 	count, err := s.store.CountItems(r.Context(), tx, t.Name)
@@ -833,6 +839,12 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 		}
 		return nil, err
 	}
+	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
+		return nil, err
+	}
+	if t.Status == model.TableStatusUpdating {
+		return nil, awserr.ResourceInUse("Table is currently UPDATING")
+	}
 
 	if len(req.GlobalSecondaryIndexUpdates) > 0 {
 		attrTypes := map[string]string{}
@@ -841,12 +853,15 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 				attrTypes[d.AttributeName] = d.AttributeType
 			}
 		}
-		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes)
+		now := time.Now().Unix()
+		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes, now)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
 		t.GSIs = updatedGSIs
-		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.GSIs, t.LSIs); err != nil {
+		t.Status = model.TableStatusUpdating
+		t.StatusAt = now + 1
+		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
 			return nil, err
 		}
 		items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
@@ -874,6 +889,63 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 
 	return map[string]any{"TableDescription": t.Description(count)}, nil
+}
+
+func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
+	if !advanceTableLifecycle(t, time.Now().Unix()) {
+		return nil
+	}
+	return s.store.UpdateTableIndexes(ctx, tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
+}
+
+func advanceTableLifecycle(t *model.Table, now int64) bool {
+	changed := false
+	updatedGSIs := make([]model.GlobalSecondaryIndex, 0, len(t.GSIs))
+	pending := false
+
+	for _, g := range t.GSIs {
+		status := strings.TrimSpace(g.Status)
+		if status == "" {
+			status = model.IndexStatusActive
+		}
+		if (status == model.IndexStatusCreating || status == model.IndexStatusDeleting) && g.StatusAt > 0 && now >= g.StatusAt {
+			if status == model.IndexStatusDeleting {
+				changed = true
+				continue
+			}
+			g.Status = model.IndexStatusActive
+			g.StatusAt = 0
+			changed = true
+		}
+		if g.Status == model.IndexStatusCreating || g.Status == model.IndexStatusDeleting {
+			pending = true
+		}
+		updatedGSIs = append(updatedGSIs, g)
+	}
+
+	if len(updatedGSIs) != len(t.GSIs) {
+		changed = true
+	}
+	t.GSIs = updatedGSIs
+
+	if pending {
+		if t.Status != model.TableStatusUpdating {
+			t.Status = model.TableStatusUpdating
+			changed = true
+		}
+	} else if t.Status != model.TableStatusActive {
+		t.Status = model.TableStatusActive
+		t.StatusAt = 0
+		changed = true
+	}
+
+	if t.Status == model.TableStatusUpdating && t.StatusAt > 0 && now >= t.StatusAt && !pending {
+		t.Status = model.TableStatusActive
+		t.StatusAt = 0
+		changed = true
+	}
+
+	return changed
 }
 
 func validateUpdateTablePayload(body []byte) error {
@@ -925,7 +997,7 @@ func applyGSIUpdates(table model.Table, updates []struct {
 	Delete struct {
 		IndexName string `json:"IndexName"`
 	} `json:"Delete"`
-}, attrTypes map[string]string) ([]model.GlobalSecondaryIndex, error) {
+}, attrTypes map[string]string, now int64) ([]model.GlobalSecondaryIndex, error) {
 	gsis := append([]model.GlobalSecondaryIndex{}, table.GSIs...)
 	touched := map[string]struct{}{}
 	for _, u := range updates {
@@ -945,6 +1017,12 @@ func applyGSIUpdates(table model.Table, updates []struct {
 			for _, g := range gsis {
 				if g.IndexName == name {
 					found = true
+					if g.Status == model.IndexStatusDeleting {
+						return nil, fmt.Errorf("index %q is already being deleted", name)
+					}
+					g.Status = model.IndexStatusDeleting
+					g.StatusAt = now + 1
+					next = append(next, g)
 					continue
 				}
 				next = append(next, g)
@@ -1006,6 +1084,8 @@ func applyGSIUpdates(table model.Table, updates []struct {
 			HashType:       hashType,
 			RangeKey:       rangeKey,
 			RangeType:      rangeType,
+			Status:         model.IndexStatusCreating,
+			StatusAt:       now + 1,
 			ProjectionType: projectionType,
 			NonKeyAttrs:    nonKeyAttrs,
 		})
@@ -1048,6 +1128,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 		return nil, err
 	}
+	if err := s.refreshTableLifecycle(r.Context(), tx, &t); err != nil {
+		return nil, err
+	}
 	pkToken, skToken, err := parseKeyCondition(req.KeyConditionExpression)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
@@ -1059,6 +1142,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if strings.TrimSpace(req.IndexName) != "" {
 		gsi, ok := t.GetGSI(req.IndexName)
 		if ok {
+			if gsi.Status != "" && gsi.Status != model.IndexStatusActive {
+				return nil, awserr.ResourceInUse("Index " + req.IndexName + " is not ACTIVE")
+			}
 			if req.ConsistentRead {
 				return nil, awserr.Validation("ConsistentRead is not supported on global secondary indexes")
 			}

@@ -8,6 +8,15 @@ import (
 
 const NoSortKey = "__PINAX_NO_SORT_KEY__"
 
+const (
+	TableStatusActive   = "ACTIVE"
+	TableStatusUpdating = "UPDATING"
+
+	IndexStatusActive   = "ACTIVE"
+	IndexStatusCreating = "CREATING"
+	IndexStatusDeleting = "DELETING"
+)
+
 type TimeToLive struct {
 	Enabled  bool
 	AttrName string
@@ -19,6 +28,8 @@ type Table struct {
 	HashType  string
 	RangeKey  string
 	RangeType string
+	Status    string
+	StatusAt  int64
 	GSIs      []GlobalSecondaryIndex
 	LSIs      []LocalSecondaryIndex
 	CreatedAt int64
@@ -32,6 +43,8 @@ type GlobalSecondaryIndex struct {
 	HashType       string
 	RangeKey       string
 	RangeType      string
+	Status         string
+	StatusAt       int64
 	ProjectionType string
 	NonKeyAttrs    []string
 }
@@ -70,7 +83,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 		gsis = append(gsis, map[string]any{
 			"IndexName":   g.IndexName,
 			"KeySchema":   keySchema,
-			"IndexStatus": "ACTIVE",
+			"IndexStatus": firstNonEmpty(g.Status, IndexStatusActive),
 		})
 		projection := map[string]any{"ProjectionType": g.ProjectionType}
 		if g.ProjectionType == "INCLUDE" {
@@ -100,7 +113,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 		"AttributeDefinitions": t.AttributeDefinitions(),
 		"TableName":            t.Name,
 		"KeySchema":            t.KeySchema(),
-		"TableStatus":          "ACTIVE",
+		"TableStatus":          firstNonEmpty(t.Status, TableStatusActive),
 		"CreationDateTime":     t.CreatedAt,
 		"ItemCount":            itemCount,
 		"TableSizeBytes":       0,
@@ -131,6 +144,14 @@ func (t Table) GetGSI(indexName string) (GlobalSecondaryIndex, bool) {
 		}
 	}
 	return GlobalSecondaryIndex{}, false
+}
+
+func firstNonEmpty(v, fallback string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 func (t Table) GetLSI(indexName string) (LocalSecondaryIndex, bool) {

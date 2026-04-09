@@ -123,9 +123,9 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 		ttlEnabled = 1
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName))
 	if err != nil {
 		return err
 	}
@@ -136,20 +136,24 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var t model.Table
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
+	var tableStatus string
+	var tableStatusAt int64
 	var gsiJSON string
 	var lsiJSON string
 	var ttlEnabled int
 	var ttlAttr sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute
+		SELECT name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr)
 	if err != nil {
 		return model.Table{}, err
 	}
 	t.RangeKey = rangeKey.String
 	t.RangeType = rangeType.String
+	t.Status = tableStatus
+	t.StatusAt = tableStatusAt
 	if strings.TrimSpace(gsiJSON) != "" {
 		if err := json.Unmarshal([]byte(gsiJSON), &t.GSIs); err != nil {
 			return model.Table{}, err
@@ -415,7 +419,7 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
-func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName string, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	gsiJSON, err := json.Marshal(gsis)
 	if err != nil {
 		return err
@@ -426,10 +430,18 @@ func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName st
 	}
 	_, err = tx.ExecContext(ctx, `
 		UPDATE tables
-		SET gsi_json = ?, lsi_json = ?
+		SET table_status = ?, table_status_at = ?, gsi_json = ?, lsi_json = ?
 		WHERE name = ?
-	`, string(gsiJSON), string(lsiJSON), tableName)
+	`, firstNonEmpty(tableStatus, model.TableStatusActive), tableStatusAt, string(gsiJSON), string(lsiJSON), tableName)
 	return err
+}
+
+func firstNonEmpty(v, fallback string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName string, ttl model.TimeToLive) error {
