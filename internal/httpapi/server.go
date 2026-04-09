@@ -782,10 +782,37 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	return resp, nil
 }
 
+type updateTableRequest struct {
+	TableName            string `json:"TableName"`
+	AttributeDefinitions []struct {
+		AttributeName string `json:"AttributeName"`
+		AttributeType string `json:"AttributeType"`
+	} `json:"AttributeDefinitions"`
+	GlobalSecondaryIndexUpdates []struct {
+		Create struct {
+			IndexName string `json:"IndexName"`
+			KeySchema []struct {
+				AttributeName string `json:"AttributeName"`
+				KeyType       string `json:"KeyType"`
+			} `json:"KeySchema"`
+			Projection struct {
+				ProjectionType   string   `json:"ProjectionType"`
+				NonKeyAttributes []string `json:"NonKeyAttributes"`
+			} `json:"Projection"`
+		} `json:"Create"`
+		Delete struct {
+			IndexName string `json:"IndexName"`
+		} `json:"Delete"`
+	} `json:"GlobalSecondaryIndexUpdates"`
+}
+
 func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, error) {
-	var req tableNameRequest
+	var req updateTableRequest
 	if err := decode(body, &req); err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.TableName) == "" {
+		return nil, awserr.Validation("TableName is required")
 	}
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
 	if err != nil {
@@ -800,6 +827,37 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 		}
 		return nil, err
 	}
+
+	if len(req.GlobalSecondaryIndexUpdates) > 0 {
+		attrTypes := map[string]string{}
+		for _, d := range req.AttributeDefinitions {
+			if strings.TrimSpace(d.AttributeName) != "" {
+				attrTypes[d.AttributeName] = d.AttributeType
+			}
+		}
+		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		t.GSIs = updatedGSIs
+		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.GSIs, t.LSIs); err != nil {
+			return nil, err
+		}
+		items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			pk, sk, err := model.ExtractItemKeys(t, item)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
+			}
+			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, item); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	count, err := s.store.CountItems(r.Context(), tx, t.Name)
 	if err != nil {
 		return nil, err
@@ -810,6 +868,118 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	}
 
 	return map[string]any{"TableDescription": t.Description(count)}, nil
+}
+
+type gsiUpdateRequest struct {
+	Create struct {
+		IndexName string
+		KeySchema []struct {
+			AttributeName string
+			KeyType       string
+		}
+		Projection struct {
+			ProjectionType   string
+			NonKeyAttributes []string
+		}
+	}
+	Delete struct {
+		IndexName string
+	}
+}
+
+func applyGSIUpdates(table model.Table, updates []struct {
+	Create struct {
+		IndexName string `json:"IndexName"`
+		KeySchema []struct {
+			AttributeName string `json:"AttributeName"`
+			KeyType       string `json:"KeyType"`
+		} `json:"KeySchema"`
+		Projection struct {
+			ProjectionType   string   `json:"ProjectionType"`
+			NonKeyAttributes []string `json:"NonKeyAttributes"`
+		} `json:"Projection"`
+	} `json:"Create"`
+	Delete struct {
+		IndexName string `json:"IndexName"`
+	} `json:"Delete"`
+}, attrTypes map[string]string) ([]model.GlobalSecondaryIndex, error) {
+	gsis := append([]model.GlobalSecondaryIndex{}, table.GSIs...)
+	for _, u := range updates {
+		hasCreate := strings.TrimSpace(u.Create.IndexName) != ""
+		hasDelete := strings.TrimSpace(u.Delete.IndexName) != ""
+		if hasCreate == hasDelete {
+			return nil, fmt.Errorf("each GlobalSecondaryIndexUpdates entry must include exactly one of Create or Delete")
+		}
+		if hasDelete {
+			name := strings.TrimSpace(u.Delete.IndexName)
+			found := false
+			next := make([]model.GlobalSecondaryIndex, 0, len(gsis))
+			for _, g := range gsis {
+				if g.IndexName == name {
+					found = true
+					continue
+				}
+				next = append(next, g)
+			}
+			if !found {
+				return nil, fmt.Errorf("cannot delete unknown index %q", name)
+			}
+			gsis = next
+			continue
+		}
+
+		name := strings.TrimSpace(u.Create.IndexName)
+		if name == "" {
+			return nil, fmt.Errorf("GSI IndexName is required")
+		}
+		if _, ok := table.GetLSI(name); ok {
+			return nil, fmt.Errorf("duplicate secondary index name %s", name)
+		}
+		for _, g := range gsis {
+			if g.IndexName == name {
+				return nil, fmt.Errorf("duplicate secondary index name %s", name)
+			}
+		}
+
+		var hashKey, rangeKey string
+		for _, key := range u.Create.KeySchema {
+			switch key.KeyType {
+			case "HASH":
+				hashKey = key.AttributeName
+			case "RANGE":
+				rangeKey = key.AttributeName
+			}
+		}
+		if strings.TrimSpace(hashKey) == "" {
+			return nil, fmt.Errorf("GSI KeySchema must include HASH key")
+		}
+		hashType := attrTypes[hashKey]
+		if hashType == "" {
+			return nil, fmt.Errorf("AttributeDefinitions missing GSI HASH key type")
+		}
+		rangeType := ""
+		if strings.TrimSpace(rangeKey) != "" {
+			rangeType = attrTypes[rangeKey]
+			if rangeType == "" {
+				return nil, fmt.Errorf("AttributeDefinitions missing GSI RANGE key type")
+			}
+		}
+		projectionType, nonKeyAttrs, err := normalizeIndexProjection(u.Create.Projection.ProjectionType, u.Create.Projection.NonKeyAttributes)
+		if err != nil {
+			return nil, err
+		}
+		gsis = append(gsis, model.GlobalSecondaryIndex{
+			IndexName:      name,
+			HashKey:        hashKey,
+			HashType:       hashType,
+			RangeKey:       rangeKey,
+			RangeType:      rangeType,
+			ProjectionType: projectionType,
+			NonKeyAttrs:    nonKeyAttrs,
+		})
+	}
+	sort.Slice(gsis, func(i, j int) bool { return gsis[i].IndexName < gsis[j].IndexName })
+	return gsis, nil
 }
 
 type queryRequest struct {

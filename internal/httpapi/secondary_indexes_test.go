@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http/httptest"
 	"testing"
 
@@ -452,5 +453,165 @@ func TestCreateTableWithInvalidLSIHashKeyFails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected validation error for invalid LSI hash key")
+	}
+}
+
+func TestUpdateTableCreateAndDeleteGSI(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_update_gsi"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("orders_update_gsi"), Item: map[string]types.AttributeValue{
+		"pk":     &types.AttributeValueMemberS{Value: "u#1"},
+		"sk":     &types.AttributeValueMemberN{Value: "1"},
+		"status": &types.AttributeValueMemberS{Value: "OPEN"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("orders_update_gsi"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{Create: &types.CreateGlobalSecondaryIndexAction{
+				IndexName: aws.String("status-index"),
+				KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("status"), KeyType: types.KeyTypeHash}},
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	qOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_update_gsi"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :status"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qOut.Count != 1 {
+		t.Fatalf("expected 1 item from created GSI query, got %d", qOut.Count)
+	}
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("orders_update_gsi"),
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{Delete: &types.DeleteGlobalSecondaryIndexAction{IndexName: aws.String("status-index")}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_update_gsi"),
+		IndexName:              aws.String("status-index"),
+		KeyConditionExpression: aws.String("status = :status"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected query error for deleted GSI")
+	}
+}
+
+func TestUpdateTableRejectsUnknownGSIDelete(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_update_gsi_err"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("orders_update_gsi_err"),
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{Delete: &types.DeleteGlobalSecondaryIndexAction{IndexName: aws.String("missing")}},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected update error for unknown GSI")
+	}
+	var apiErr *types.ResourceNotFoundException
+	if errors.As(err, &apiErr) {
+		t.Fatalf("expected validation error, got resource not found: %v", err)
 	}
 }

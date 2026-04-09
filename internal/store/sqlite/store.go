@@ -415,6 +415,23 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName string, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+	gsiJSON, err := json.Marshal(gsis)
+	if err != nil {
+		return err
+	}
+	lsiJSON, err := json.Marshal(lsis)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE tables
+		SET gsi_json = ?, lsi_json = ?
+		WHERE name = ?
+	`, string(gsiJSON), string(lsiJSON), tableName)
+	return err
+}
+
 func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName string, ttl model.TimeToLive) error {
 	ttlEnabled := 0
 	if ttl.Enabled {
