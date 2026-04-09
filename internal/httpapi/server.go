@@ -1027,6 +1027,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if strings.TrimSpace(req.IndexName) != "" {
 		gsi, ok := t.GetGSI(req.IndexName)
 		if ok {
+			if req.ConsistentRead {
+				return nil, awserr.Validation("ConsistentRead is not supported on global secondary indexes")
+			}
 			queryGSI = &gsi
 			targetHashKey = gsi.HashKey
 			targetRangeKey = gsi.RangeKey

@@ -791,3 +791,60 @@ func TestQueryLSIPaginationUsesExclusiveStartKey(t *testing.T) {
 		t.Fatalf("expected second page count 2, got %d", page2.Count)
 	}
 }
+
+func TestQueryGSIRejectsConsistentRead(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("eu-central-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("orders_gsi_consistent"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+			{AttributeName: aws.String("status"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange}},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
+			IndexName:  aws.String("status-index"),
+			KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("status"), KeyType: types.KeyTypeHash}},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("orders_gsi_consistent"),
+		IndexName:              aws.String("status-index"),
+		ConsistentRead:         aws.Bool(true),
+		KeyConditionExpression: aws.String("status = :s"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":s": &types.AttributeValueMemberS{Value: "OPEN"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected consistent read validation error on GSI query")
+	}
+}

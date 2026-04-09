@@ -102,6 +102,44 @@ func TestQuerySupportsBetweenAndBeginsWith(t *testing.T) {
 	}
 }
 
+func TestQuerySortConditionParsingIsCaseInsensitive(t *testing.T) {
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+	seedQueryTable(t, client)
+
+	ctx := context.Background()
+	out, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("q"),
+		KeyConditionExpression: aws.String("pk = :pk and sk between :a and :b"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "u#1"},
+			":a":  &types.AttributeValueMemberN{Value: "2"},
+			":b":  &types.AttributeValueMemberN{Value: "4"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Count != 3 {
+		t.Fatalf("expected 3 items for lowercase between query, got %d", out.Count)
+	}
+
+	out, err = client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("q"),
+		KeyConditionExpression: aws.String("pk = :pk AND BEGINS_WITH(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: "u#1"},
+			":prefix": &types.AttributeValueMemberN{Value: "1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Count != 1 {
+		t.Fatalf("expected 1 item for uppercase BEGINS_WITH query, got %d", out.Count)
+	}
+}
+
 func TestQueryPaginationUsesLastEvaluatedKey(t *testing.T) {
 	client, cleanup := newTestClient(t)
 	defer cleanup()

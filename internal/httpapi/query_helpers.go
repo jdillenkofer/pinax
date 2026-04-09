@@ -73,7 +73,7 @@ func findTopLevelAND(expr string) int {
 }
 
 func parseSingleEq(s string) (keyExprToken, error) {
-	parts := strings.Split(s, "=")
+	parts := strings.SplitN(s, "=", 2)
 	if len(parts) != 2 {
 		return keyExprToken{}, fmt.Errorf("partition key condition must use '='")
 	}
@@ -89,7 +89,7 @@ func parseSortCondition(s string) (sortKeyCondition, error) {
 	s = strings.TrimSpace(s)
 
 	if strings.HasPrefix(strings.ToLower(s), "begins_with(") && strings.HasSuffix(s, ")") {
-		inside := strings.TrimSuffix(strings.TrimPrefix(s, "begins_with("), ")")
+		inside := s[len("begins_with(") : len(s)-1]
 		parts := strings.Split(inside, ",")
 		if len(parts) != 2 {
 			return sortKeyCondition{}, fmt.Errorf("invalid begins_with sort key condition")
@@ -97,19 +97,19 @@ func parseSortCondition(s string) (sortKeyCondition, error) {
 		return sortKeyCondition{attr: strings.TrimSpace(parts[0]), op: "begins_with", value1: strings.TrimSpace(parts[1])}, nil
 	}
 
-	upper := strings.ToUpper(s)
-	if strings.Contains(upper, " BETWEEN ") {
-		betweenParts := strings.SplitN(s, "BETWEEN", 2)
-		if len(betweenParts) != 2 {
+	if idx := strings.Index(strings.ToUpper(s), " BETWEEN "); idx >= 0 {
+		attr := strings.TrimSpace(s[:idx])
+		right := strings.TrimSpace(s[idx+len(" BETWEEN "):])
+		andIdx := strings.Index(strings.ToUpper(right), " AND ")
+		if andIdx < 0 {
 			return sortKeyCondition{}, fmt.Errorf("invalid BETWEEN sort key condition")
 		}
-		attr := strings.TrimSpace(betweenParts[0])
-		right := strings.TrimSpace(betweenParts[1])
-		vals := strings.SplitN(right, "AND", 2)
-		if len(vals) != 2 {
+		v1 := strings.TrimSpace(right[:andIdx])
+		v2 := strings.TrimSpace(right[andIdx+len(" AND "):])
+		if v1 == "" || v2 == "" {
 			return sortKeyCondition{}, fmt.Errorf("BETWEEN requires two values")
 		}
-		return sortKeyCondition{attr: attr, op: "BETWEEN", value1: strings.TrimSpace(vals[0]), value2: strings.TrimSpace(vals[1])}, nil
+		return sortKeyCondition{attr: attr, op: "BETWEEN", value1: v1, value2: v2}, nil
 	}
 
 	for _, op := range []string{"<=", ">=", "<", ">", "="} {
