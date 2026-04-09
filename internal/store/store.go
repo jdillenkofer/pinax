@@ -33,6 +33,7 @@ type Store interface {
 	ListItemChangesAfterCursorUpToCursor(ctx context.Context, tx *sql.Tx, tableName string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error)
 	GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error)
 	GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) (model.PITRCheckpoint, error)
+	CreatePITRCheckpointFromCurrentState(ctx context.Context, tx *sql.Tx, tableName string, changedAt int64) error
 	CompactItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error)
 	DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error)
 	GetTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, token string, now int64) (model.TransactWriteIdempotencyRecord, error)

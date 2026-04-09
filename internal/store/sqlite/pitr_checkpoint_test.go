@@ -108,6 +108,63 @@ func TestCompactItemChangesBeforeCreatesCheckpointAndPreservesRebuild(t *testing
 	}
 }
 
+func TestCreatePITRCheckpointFromCurrentStateBootstrapsWithoutHistory(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s, err := New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	table := model.Table{Name: "bootstrap_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
+	if err := s.CreateTable(ctx, tx, table); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PutItem(ctx, tx, table.Name, "S|a", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "a"}, "v": map[string]any{"S": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutItem(ctx, tx, table.Name, "S|b", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "b"}, "v": map[string]any{"S": "2"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CreatePITRCheckpointFromCurrentState(ctx, tx, table.Name, 5000); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint, err := s.GetLatestPITRCheckpointAtOrBefore(ctx, tx, table.Name, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !checkpoint.Found {
+		t.Fatal("expected bootstrap checkpoint to be created")
+	}
+	if len(checkpoint.Items) != 2 {
+		t.Fatalf("expected 2 items in bootstrap checkpoint, got %d", len(checkpoint.Items))
+	}
+	state := map[string]map[string]any{}
+	for _, item := range checkpoint.Items {
+		state[item.PK+"\x00"+item.SK] = item.Item
+	}
+	if _, ok := state["S|a\x00"+model.NoSortKey]; !ok {
+		t.Fatalf("expected key S|a in bootstrap checkpoint, got keys=%v", keysOf(state))
+	}
+	if _, ok := state["S|b\x00"+model.NoSortKey]; !ok {
+		t.Fatalf("expected key S|b in bootstrap checkpoint, got keys=%v", keysOf(state))
+	}
+}
+
 func TestCompactItemChangesBeforeBuildsNextCheckpointFromPreviousCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite3", ":memory:")

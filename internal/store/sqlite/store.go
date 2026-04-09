@@ -757,6 +757,67 @@ func (s *Store) GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx 
 	return s.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tx, tableName, cursor)
 }
 
+func (s *Store) CreatePITRCheckpointFromCurrentState(ctx context.Context, tx *sql.Tx, tableName string, changedAt int64) error {
+	cursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, tableName, changedAt)
+	if err != nil {
+		return err
+	}
+	sequence := int64(0)
+	if cursor.Found {
+		sequence = cursor.Sequence
+	} else if changedAt > 0 {
+		sequence = -changedAt
+	} else {
+		sequence = -1
+	}
+
+	var existing int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM pitr_checkpoints
+		WHERE table_name = ? AND history_sequence = ?
+		LIMIT 1
+	`, tableName, sequence).Scan(&existing)
+	if err == nil {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk, item_json
+		FROM items
+		WHERE table_name = ?
+		ORDER BY pk ASC, sk ASC
+	`, tableName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	items := make([]model.PITRCheckpointItem, 0)
+	for rows.Next() {
+		var item model.PITRCheckpointItem
+		var raw []byte
+		if err := rows.Scan(&item.PK, &item.SK, &raw); err != nil {
+			return err
+		}
+		item.Item = map[string]any{}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &item.Item); err != nil {
+				return err
+			}
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	return s.insertPITRCheckpoint(ctx, tx, tableName, changedAt, sequence, items)
+}
+
 func (s *Store) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
 	if !cursor.Found {
 		return model.PITRCheckpoint{}, nil
@@ -933,10 +994,14 @@ func (s *Store) createPITRCheckpointForCursor(ctx context.Context, tx *sql.Tx, t
 		})
 	}
 
+	return s.insertPITRCheckpoint(ctx, tx, tableName, cursor.ChangedAt, cursor.Sequence, items)
+}
+
+func (s *Store) insertPITRCheckpoint(ctx context.Context, tx *sql.Tx, tableName string, changedAt int64, sequence int64, items []model.PITRCheckpointItem) error {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO pitr_checkpoints(table_name, changed_at, history_sequence, created_at)
 		VALUES (?, ?, ?, ?)
-	`, tableName, cursor.ChangedAt, cursor.Sequence, time.Now().UnixMilli())
+	`, tableName, changedAt, sequence, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}

@@ -1325,6 +1325,9 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 					return nil, err
 				}
 			}
+			if err := s.store.CreatePITRCheckpointFromCurrentState(r.Context(), tx, t.Name, enabledAt); err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		enabledAt = 0
