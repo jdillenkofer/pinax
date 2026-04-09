@@ -127,9 +127,9 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 		ttlStatus = model.TTLStatusDisabled
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt)
 	if err != nil {
 		return err
 	}
@@ -142,6 +142,9 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var rangeType sql.NullString
 	var tableStatus string
 	var tableStatusAt int64
+	var billingMode string
+	var readCapacityUnits int64
+	var writeCapacityUnits int64
 	var gsiJSON string
 	var lsiJSON string
 	var ttlEnabled int
@@ -149,15 +152,18 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var ttlStatus string
 	var ttlStatusAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
+		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt)
 	if err != nil {
 		return model.Table{}, err
 	}
 	t.RangeKey = rangeKey.String
 	t.RangeType = rangeType.String
+	t.BillingMode = billingMode
+	t.ReadCapacityUnits = readCapacityUnits
+	t.WriteCapacityUnits = writeCapacityUnits
 	t.Status = tableStatus
 	t.StatusAt = tableStatusAt
 	if strings.TrimSpace(gsiJSON) != "" {
@@ -441,6 +447,15 @@ func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName st
 		SET table_status = ?, table_status_at = ?, gsi_json = ?, lsi_json = ?
 		WHERE name = ?
 	`, firstNonEmpty(tableStatus, model.TableStatusActive), tableStatusAt, string(gsiJSON), string(lsiJSON), tableName)
+	return err
+}
+
+func (s *Store) UpdateTableBilling(ctx context.Context, tx *sql.Tx, tableName string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE tables
+		SET billing_mode = ?, read_capacity_units = ?, write_capacity_units = ?
+		WHERE name = ?
+	`, firstNonEmpty(billingMode, "PAY_PER_REQUEST"), readCapacityUnits, writeCapacityUnits, tableName)
 	return err
 }
 
