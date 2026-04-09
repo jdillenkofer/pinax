@@ -345,7 +345,11 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 		}
 	}
 	if t.PITR.Enabled {
-		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "PUT", item, time.Now().UnixMilli()); err != nil {
+		nowMs := time.Now().UnixMilli()
+		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "PUT", item, nowMs); err != nil {
+			return err
+		}
+		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
 			return err
 		}
 	}
@@ -365,7 +369,11 @@ func (s *Store) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk st
 		return err
 	}
 	if t.PITR.Enabled {
-		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, time.Now().UnixMilli()); err != nil {
+		nowMs := time.Now().UnixMilli()
+		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, nowMs); err != nil {
+			return err
+		}
+		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
 			return err
 		}
 	}
@@ -625,6 +633,93 @@ func (s *Store) ListItemChangesUpTo(ctx context.Context, tx *sql.Tx, tableName s
 	return out, nil
 }
 
+func (s *Store) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) (model.ItemChangeCursor, error) {
+	var cursor model.ItemChangeCursor
+	err := tx.QueryRowContext(ctx, `
+		SELECT changed_at, id
+		FROM item_history
+		WHERE table_name = ? AND changed_at <= ?
+		ORDER BY changed_at DESC, id DESC
+		LIMIT 1
+	`, tableName, upTo).Scan(&cursor.ChangedAt, &cursor.Sequence)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.ItemChangeCursor{}, nil
+		}
+		return model.ItemChangeCursor{}, err
+	}
+	cursor.Found = true
+	return cursor, nil
+}
+
+func (s *Store) ListItemChangesUpToCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) ([]model.ItemChange, error) {
+	if !cursor.Found {
+		return []model.ItemChange{}, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk, change_type, item_json, changed_at, id
+		FROM item_history
+		WHERE table_name = ?
+		  AND (changed_at < ? OR (changed_at = ? AND id <= ?))
+		ORDER BY changed_at ASC, id ASC
+	`, tableName, cursor.ChangedAt, cursor.ChangedAt, cursor.Sequence)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]model.ItemChange, 0)
+	for rows.Next() {
+		var change model.ItemChange
+		var raw []byte
+		if err := rows.Scan(&change.PK, &change.SK, &change.ChangeType, &raw, &change.ChangedAt, &change.Sequence); err != nil {
+			return nil, err
+		}
+		change.TableName = tableName
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &change.Item); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM item_history
+		WHERE table_name = ? AND changed_at < ?
+	`, tableName, before)
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+func (s *Store) pruneItemHistoryByRetention(ctx context.Context, tx *sql.Tx, table model.Table, nowMs int64) error {
+	if !table.PITR.Enabled {
+		return nil
+	}
+	recoveryDays := table.PITR.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
+	if cutoff <= 0 {
+		return nil
+	}
+	_, err := s.DeleteItemChangesBefore(ctx, tx, table.Name, cutoff)
+	return err
+}
+
 func (s *Store) AppendItemChange(ctx context.Context, tx *sql.Tx, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
 	return s.appendItemHistory(ctx, tx, tableName, pk, sk, changeType, item, changedAt)
 }
@@ -690,6 +785,7 @@ func (s *Store) GetExpiredItems(ctx context.Context, tx *sql.Tx, tableName strin
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk FROM items
 		WHERE table_name = ? AND ttl > 0 AND ttl < ?
+		ORDER BY ttl ASC, pk ASC, sk ASC
 		LIMIT ?
 	`, tableName, before, limit)
 	if err != nil {
@@ -715,33 +811,45 @@ func (s *Store) GetExpiredItems(ctx context.Context, tx *sql.Tx, tableName strin
 }
 
 func (s *Store) DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
-	_, err := tx.ExecContext(ctx, `
+	t, err := s.GetTable(ctx, tx, tableName)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if t.PITR.Enabled {
+		nowMs := time.Now().UnixMilli()
+		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, nowMs); err != nil {
+			return err
+		}
+		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) DeleteExpiredItems(ctx context.Context, tx *sql.Tx, tableName string, before int64, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	res, err := tx.ExecContext(ctx, `
-		DELETE FROM items
-		WHERE rowid IN (
-			SELECT rowid FROM items
-			WHERE table_name = ? AND ttl > 0 AND ttl < ?
-			ORDER BY ttl ASC
-			LIMIT ?
-		)
-	`, tableName, before, limit)
+	expired, err := s.GetExpiredItems(ctx, tx, tableName, "", before, limit)
 	if err != nil {
 		return 0, err
 	}
-	deleted, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
+	for _, key := range expired {
+		if err := s.DeleteExpiredItem(ctx, tx, tableName, key.PK, key.SK); err != nil {
+			return 0, err
+		}
 	}
-	return deleted, nil
+	return int64(len(expired)), nil
 }
 
 func (s *Store) CreateBackup(ctx context.Context, tx *sql.Tx, backup model.Backup) error {

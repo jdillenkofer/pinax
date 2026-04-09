@@ -81,11 +81,12 @@ var (
 )
 
 type Server struct {
-	store             store.Store
-	requestAuthorizer authorization.RequestAuthorizer
-	capMu             sync.Mutex
-	capacityWindows   map[string]capacityWindow
-	metricsHandler    http.Handler
+	store                         store.Store
+	requestAuthorizer             authorization.RequestAuthorizer
+	capMu                         sync.Mutex
+	capacityWindows               map[string]capacityWindow
+	metricsHandler                http.Handler
+	pitrLatestRestorableLagMillis int64
 }
 
 type capacityWindow struct {
@@ -94,8 +95,29 @@ type capacityWindow struct {
 	writeUsed float64
 }
 
-func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer) *Server {
-	return &Server{store: store, requestAuthorizer: requestAuthorizer, capacityWindows: map[string]capacityWindow{}, metricsHandler: promhttp.Handler()}
+type ServerOption func(*Server)
+
+func WithPITRLatestRestorableLagMillis(ms int64) ServerOption {
+	if ms < 0 {
+		ms = 0
+	}
+	return func(s *Server) {
+		s.pitrLatestRestorableLagMillis = ms
+	}
+}
+
+func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
+	s := &Server{
+		store:                         store,
+		requestAuthorizer:             requestAuthorizer,
+		capacityWindows:               map[string]capacityWindow{},
+		metricsHandler:                promhttp.Handler(),
+		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisFromEnv(),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1313,11 +1335,19 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 		return nil, err
 	}
 	t.PITR = next
+	if next.Enabled {
+		cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
+		if cutoff > 0 {
+			if _, err := s.store.DeleteItemChangesBefore(r.Context(), tx, t.Name, cutoff); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"ContinuousBackupsDescription": continuousBackupsDescription(t, nowMs)}, nil
+	return map[string]any{"ContinuousBackupsDescription": s.continuousBackupsDescription(t, nowMs)}, nil
 }
 
 func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[string]any, error) {
@@ -1348,7 +1378,7 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"ContinuousBackupsDescription": continuousBackupsDescription(t, nowMs)}, nil
+	return map[string]any{"ContinuousBackupsDescription": s.continuousBackupsDescription(t, nowMs)}, nil
 }
 
 func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[string]any, error) {
@@ -1395,7 +1425,7 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 	}
 
 	nowMs := time.Now().UnixMilli()
-	earliest, latest := pitrRestoreWindow(source, nowMs)
+	earliest, latest := s.pitrRestoreWindow(source, nowMs)
 	restoreAt := latest
 	if req.RestoreDateTime != nil {
 		restoreAt = int64(math.Round(*req.RestoreDateTime * 1000))
@@ -1475,7 +1505,12 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return nil, err
 	}
 
-	changes, err := s.store.ListItemChangesUpTo(r.Context(), tx, source.Name, restoreAt)
+	cursor, err := s.store.ResolveItemChangeCursorAtOrBefore(r.Context(), tx, source.Name, restoreAt)
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := s.store.ListItemChangesUpToCursor(r.Context(), tx, source.Name, cursor)
 	if err != nil {
 		return nil, err
 	}
@@ -3680,6 +3715,18 @@ func enforceProvisionedLimits() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("PINAX_ENFORCE_PROVISIONED_LIMITS")), "true")
 }
 
+func pitrLatestRestorableLagMillisFromEnv() int64 {
+	raw := strings.TrimSpace(os.Getenv("PINAX_PITR_LATEST_RESTORABLE_LAG_MS"))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
+}
+
 func (s *Server) ensureReadCapacity(t model.Table, units float64) error {
 	if !s.reserveReadCapacity(t, units) {
 		return awserr.ProvisionedThroughputExceeded("read capacity exceeded for table " + t.Name)
@@ -4128,7 +4175,7 @@ func normalizeTableNameIdentifier(v string) string {
 	return v
 }
 
-func pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
+func (s *Server) pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
 	recoveryDays := t.PITR.RecoveryPeriodInDays
 	if recoveryDays <= 0 {
 		recoveryDays = 35
@@ -4137,14 +4184,15 @@ func pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
 	if t.PITR.EnabledAt > 0 && t.PITR.EnabledAt > earliest {
 		earliest = t.PITR.EnabledAt
 	}
-	latest := nowMs
+	lagMs := s.pitrLatestRestorableLagMillis
+	latest := nowMs - lagMs
 	if latest < earliest {
 		latest = earliest
 	}
 	return earliest, latest
 }
 
-func continuousBackupsDescription(t model.Table, nowMs int64) map[string]any {
+func (s *Server) continuousBackupsDescription(t model.Table, nowMs int64) map[string]any {
 	pitrStatus := model.PointInTimeRecoveryStatusDisabled
 	recoveryDays := t.PITR.RecoveryPeriodInDays
 	if recoveryDays <= 0 {
@@ -4156,7 +4204,7 @@ func continuousBackupsDescription(t model.Table, nowMs int64) map[string]any {
 	}
 	if t.PITR.Enabled {
 		pitrStatus = model.PointInTimeRecoveryStatusEnabled
-		earliest, latest := pitrRestoreWindow(t, nowMs)
+		earliest, latest := s.pitrRestoreWindow(t, nowMs)
 		pitrDesc["PointInTimeRecoveryStatus"] = pitrStatus
 		pitrDesc["EarliestRestorableDateTime"] = float64(earliest) / 1000.0
 		pitrDesc["LatestRestorableDateTime"] = float64(latest) / 1000.0

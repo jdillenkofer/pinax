@@ -69,6 +69,7 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 	logLevelAccessor := registerStringFlag(serveCommand, "logLevel", "info", "the log level for the application")
 	ttlSweeperEnabledAccessor := registerBoolFlag(serveCommand, "ttlSweeperEnabled", false, "enable TTL sweeper background task")
 	ttlSweeperIntervalAccessor := registerIntFlag(serveCommand, "ttlSweeperInterval", defaultTTLSweeperInterval, "TTL sweeper interval in nanoseconds")
+	pitrLatestRestorableLagMillisAccessor := registerIntFlag(serveCommand, "pitrLatestRestorableLagMillis", defaultPITRLatestRestorableLagMillis, "PITR latest restorable lag in milliseconds")
 
 	if err := serveCommand.Parse(cmdArgs); err != nil {
 		return nil, err
@@ -88,17 +89,18 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 	}
 
 	return &Settings{
-		authenticationEnabled: authenticationEnabledAccessor(),
-		credentials:           nil,
-		region:                regionAccessor(),
-		bindAddress:           bindAddressAccessor(),
-		port:                  portAccessor(),
-		dbPath:                dbPathAccessor(),
-		authorizerPath:        authorizerPathAccessor(),
-		trustForwardedHeaders: trustForwardedHeadersAccessor(),
-		trustedProxyCIDRs:     trustedProxyCIDRs,
-		logLevel:              logLevelAccessor(),
-		ttlSweeperEnabled:     ttlSweeperEnabledAccessor(),
-		ttlSweeperInterval:    ttlSweeperIntervalAccessor(),
+		authenticationEnabled:         authenticationEnabledAccessor(),
+		credentials:                   nil,
+		region:                        regionAccessor(),
+		bindAddress:                   bindAddressAccessor(),
+		port:                          portAccessor(),
+		dbPath:                        dbPathAccessor(),
+		authorizerPath:                authorizerPathAccessor(),
+		trustForwardedHeaders:         trustForwardedHeadersAccessor(),
+		trustedProxyCIDRs:             trustedProxyCIDRs,
+		logLevel:                      logLevelAccessor(),
+		ttlSweeperEnabled:             ttlSweeperEnabledAccessor(),
+		ttlSweeperInterval:            ttlSweeperIntervalAccessor(),
+		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisAccessor(),
 	}, nil
 }

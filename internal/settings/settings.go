@@ -16,6 +16,7 @@ const defaultDBPath = "./pinax.db"
 const defaultAuthorizerPath = "./authorizer.lua"
 const defaultTrustForwardedHeaders = false
 const defaultTTLSweeperInterval = 5 * 60 * 1000000000 // 5 minutes in nanoseconds
+const defaultPITRLatestRestorableLagMillis = 0
 
 const mergableTagKey = "mergable"
 
@@ -25,18 +26,19 @@ type Credentials struct {
 }
 
 type Settings struct {
-	authenticationEnabled *bool         `mergable:""`
-	credentials           []Credentials `mergable:""`
-	region                *string       `mergable:""`
-	bindAddress           *string       `mergable:""`
-	port                  *int          `mergable:""`
-	dbPath                *string       `mergable:""`
-	authorizerPath        *string       `mergable:""`
-	trustForwardedHeaders *bool         `mergable:""`
-	trustedProxyCIDRs     []string      `mergable:""`
-	logLevel              *string       `mergable:""`
-	ttlSweeperEnabled     *bool         `mergable:""`
-	ttlSweeperInterval    *int          `mergable:""`
+	authenticationEnabled         *bool         `mergable:""`
+	credentials                   []Credentials `mergable:""`
+	region                        *string       `mergable:""`
+	bindAddress                   *string       `mergable:""`
+	port                          *int          `mergable:""`
+	dbPath                        *string       `mergable:""`
+	authorizerPath                *string       `mergable:""`
+	trustForwardedHeaders         *bool         `mergable:""`
+	trustedProxyCIDRs             []string      `mergable:""`
+	logLevel                      *string       `mergable:""`
+	ttlSweeperEnabled             *bool         `mergable:""`
+	ttlSweeperInterval            *int          `mergable:""`
+	pitrLatestRestorableLagMillis *int          `mergable:""`
 }
 
 func valueOrDefault[V any](v *V, defaultValue V) V {
@@ -105,6 +107,14 @@ func (s *Settings) TTLSweeperEnabled() bool {
 
 func (s *Settings) TTLSweeperInterval() time.Duration {
 	return time.Duration(valueOrDefault(s.ttlSweeperInterval, defaultTTLSweeperInterval)) * time.Nanosecond
+}
+
+func (s *Settings) PITRLatestRestorableLagMillis() int64 {
+	v := valueOrDefault(s.pitrLatestRestorableLagMillis, defaultPITRLatestRestorableLagMillis)
+	if v < 0 {
+		return 0
+	}
+	return int64(v)
 }
 
 func getUnexportedField(field reflect.Value) interface{} {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
@@ -90,5 +91,72 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 	}
 	if _, err := store.GetItem(ctx, tx, table.Name, "S|valid", model.NoSortKey); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSweeperPrunesPITRHistoryWithoutTTL(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nowMs := time.Now().UnixMilli()
+	table := model.Table{
+		Name:      "sweep_pitr",
+		HashKey:   "pk",
+		HashType:  "S",
+		CreatedAt: 1,
+		PITR:      model.PointInTimeRecovery{Enabled: true, RecoveryPeriodInDays: 1, EnabledAt: nowMs},
+	}
+	if err := store.CreateTable(ctx, tx, table); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+
+	oldTs := nowMs - (2 * 24 * 60 * 60 * 1000)
+	if err := store.AppendItemChange(ctx, tx, table.Name, "S|old", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := store.AppendItemChange(ctx, tx, table.Name, "S|new", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, nowMs); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	NewSweeper(store, 0).RunOnce(ctx)
+
+	tx, err = store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	changes, err := store.ListItemChangesUpTo(ctx, tx, table.Name, time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("expected old PITR history to be pruned, got %d changes", len(changes))
+	}
+	if changes[0].PK != "S|new" {
+		t.Fatalf("expected newest PITR change to remain, got pk=%s", changes[0].PK)
 	}
 }

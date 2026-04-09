@@ -99,6 +99,12 @@ type ItemChange struct {
 	Sequence   int64
 }
 
+type ItemChangeCursor struct {
+	Found     bool
+	ChangedAt int64
+	Sequence  int64
+}
+
 type StreamSpecification struct {
 	Enabled  bool
 	ViewType string

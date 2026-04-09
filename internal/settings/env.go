@@ -19,6 +19,7 @@ const trustedProxyCIDRsEnvKey = envKeyPrefix + "_TRUSTED_PROXY_CIDRS"
 const logLevelEnvKey = envKeyPrefix + "_LOG_LEVEL"
 const ttlSweeperEnabledEnvKey = envKeyPrefix + "_TTL_SWEEPER_ENABLED"
 const ttlSweeperIntervalEnvKey = envKeyPrefix + "_TTL_SWEEPER_INTERVAL"
+const pitrLatestRestorableLagMillisEnvKey = envKeyPrefix + "_PITR_LATEST_RESTORABLE_LAG_MS"
 
 func getCredentialsFromEnv() []Credentials {
 	var credentials []Credentials
@@ -86,17 +87,18 @@ func getStringSliceFromEnv(envKey string) []string {
 
 func loadSettingsFromEnv() (*Settings, error) {
 	return &Settings{
-		authenticationEnabled: getBoolFromEnv(authenticationEnabledEnvKey),
-		credentials:           getCredentialsFromEnv(),
-		region:                getStringFromEnv(regionEnvKey),
-		bindAddress:           getStringFromEnv(bindAddressEnvKey),
-		port:                  getIntFromEnv(portEnvKey),
-		dbPath:                getStringFromEnv(dbPathEnvKey),
-		authorizerPath:        getStringFromEnv(authorizerPathEnvKey),
-		trustForwardedHeaders: getBoolFromEnv(trustForwardedHeadersEnvKey),
-		trustedProxyCIDRs:     getStringSliceFromEnv(trustedProxyCIDRsEnvKey),
-		logLevel:              getStringFromEnv(logLevelEnvKey),
-		ttlSweeperEnabled:     getBoolFromEnv(ttlSweeperEnabledEnvKey),
-		ttlSweeperInterval:    getIntFromEnv(ttlSweeperIntervalEnvKey),
+		authenticationEnabled:         getBoolFromEnv(authenticationEnabledEnvKey),
+		credentials:                   getCredentialsFromEnv(),
+		region:                        getStringFromEnv(regionEnvKey),
+		bindAddress:                   getStringFromEnv(bindAddressEnvKey),
+		port:                          getIntFromEnv(portEnvKey),
+		dbPath:                        getStringFromEnv(dbPathEnvKey),
+		authorizerPath:                getStringFromEnv(authorizerPathEnvKey),
+		trustForwardedHeaders:         getBoolFromEnv(trustForwardedHeadersEnvKey),
+		trustedProxyCIDRs:             getStringSliceFromEnv(trustedProxyCIDRsEnvKey),
+		logLevel:                      getStringFromEnv(logLevelEnvKey),
+		ttlSweeperEnabled:             getBoolFromEnv(ttlSweeperEnabledEnvKey),
+		ttlSweeperInterval:            getIntFromEnv(ttlSweeperIntervalEnvKey),
+		pitrLatestRestorableLagMillis: getIntFromEnv(pitrLatestRestorableLagMillisEnvKey),
 	}, nil
 }

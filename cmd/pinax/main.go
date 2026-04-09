@@ -74,7 +74,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := httpapi.NewServer(store, requestAuthorizer)
+	srv := httpapi.NewServer(store, requestAuthorizer, httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()))
 
 	var rootHandler http.Handler = srv
 	if s.AuthenticationEnabled() {

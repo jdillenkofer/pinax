@@ -98,6 +98,11 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 		return
 	}
 
+	if err := s.prunePITRHistory(ctx, t); err != nil {
+		slog.Error("failed to prune PITR history", "table", tableName, "err", err)
+		return
+	}
+
 	if !t.TimeToLive.Enabled || t.TimeToLive.AttrName == "" {
 		return
 	}
@@ -133,6 +138,32 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 			break
 		}
 	}
+}
+
+func (s *Sweeper) prunePITRHistory(ctx context.Context, t model.Table) error {
+	if !t.PITR.Enabled {
+		return nil
+	}
+	recoveryDays := t.PITR.RecoveryPeriodInDays
+	if recoveryDays <= 0 {
+		recoveryDays = 35
+	}
+	nowMs := time.Now().UnixMilli()
+	cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
+	if cutoff <= 0 {
+		return nil
+	}
+
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := s.store.DeleteItemChangesBefore(ctx, tx, t.Name, cutoff); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Sweeper) loadTable(ctx context.Context, tableName string) (model.Table, error) {
