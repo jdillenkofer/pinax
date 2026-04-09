@@ -1338,7 +1338,7 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 	if next.Enabled {
 		cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
 		if cutoff > 0 {
-			if _, err := s.store.DeleteItemChangesBefore(r.Context(), tx, t.Name, cutoff); err != nil {
+			if _, err := s.store.CompactItemChangesBefore(r.Context(), tx, t.Name, cutoff); err != nil {
 				return nil, err
 			}
 		}
@@ -1510,11 +1510,27 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return nil, err
 	}
 
-	changes, err := s.store.ListItemChangesUpToCursor(r.Context(), tx, source.Name, cursor)
+	checkpoint, err := s.store.GetLatestPITRCheckpointAtOrBeforeCursor(r.Context(), tx, source.Name, cursor)
+	if err != nil {
+		return nil, err
+	}
+	if !checkpoint.Found {
+		checkpoint, err = s.store.GetLatestPITRCheckpointAtOrBefore(r.Context(), tx, source.Name, restoreAt)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := s.store.ListItemChangesAfterCursorUpToCursor(r.Context(), tx, source.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, cursor)
 	if err != nil {
 		return nil, err
 	}
 	state := map[string]map[string]any{}
+	if checkpoint.Found {
+		for _, item := range checkpoint.Items {
+			state[item.PK+"\x00"+item.SK] = item.Item
+		}
+	}
 	for _, change := range changes {
 		key := change.PK + "\x00" + change.SK
 		if strings.EqualFold(change.ChangeType, "DELETE") {

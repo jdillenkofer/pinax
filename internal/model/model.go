@@ -105,6 +105,19 @@ type ItemChangeCursor struct {
 	Sequence  int64
 }
 
+type PITRCheckpointItem struct {
+	PK   string
+	SK   string
+	Item map[string]any
+}
+
+type PITRCheckpoint struct {
+	Found     bool
+	ChangedAt int64
+	Sequence  int64
+	Items     []PITRCheckpointItem
+}
+
 type StreamSpecification struct {
 	Enabled  bool
 	ViewType string

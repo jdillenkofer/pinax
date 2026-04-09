@@ -160,7 +160,7 @@ func (s *Sweeper) prunePITRHistory(ctx context.Context, t model.Table) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := s.store.DeleteItemChangesBefore(ctx, tx, t.Name, cutoff); err != nil {
+	if _, err := s.store.CompactItemChangesBefore(ctx, tx, t.Name, cutoff); err != nil {
 		return err
 	}
 	return tx.Commit()

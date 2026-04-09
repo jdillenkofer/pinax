@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -689,6 +690,135 @@ func (s *Store) ListItemChangesUpToCursor(ctx context.Context, tx *sql.Tx, table
 	return out, nil
 }
 
+func (s *Store) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tx *sql.Tx, tableName string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error) {
+	if !upTo.Found {
+		return []model.ItemChange{}, nil
+	}
+	if !after.Found {
+		return s.ListItemChangesUpToCursor(ctx, tx, tableName, upTo)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk, change_type, item_json, changed_at, id
+		FROM item_history
+		WHERE table_name = ?
+		  AND (changed_at > ? OR (changed_at = ? AND id > ?))
+		  AND (changed_at < ? OR (changed_at = ? AND id <= ?))
+		ORDER BY changed_at ASC, id ASC
+	`, tableName, after.ChangedAt, after.ChangedAt, after.Sequence, upTo.ChangedAt, upTo.ChangedAt, upTo.Sequence)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]model.ItemChange, 0)
+	for rows.Next() {
+		var change model.ItemChange
+		var raw []byte
+		if err := rows.Scan(&change.PK, &change.SK, &change.ChangeType, &raw, &change.ChangedAt, &change.Sequence); err != nil {
+			return nil, err
+		}
+		change.TableName = tableName
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &change.Item); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) (model.PITRCheckpoint, error) {
+	if upTo <= 0 {
+		return model.PITRCheckpoint{}, nil
+	}
+	var cursor model.ItemChangeCursor
+	err := tx.QueryRowContext(ctx, `
+		SELECT changed_at, history_sequence
+		FROM pitr_checkpoints
+		WHERE table_name = ? AND changed_at <= ?
+		ORDER BY changed_at DESC, history_sequence DESC
+		LIMIT 1
+	`, tableName, upTo).Scan(&cursor.ChangedAt, &cursor.Sequence)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.PITRCheckpoint{}, nil
+		}
+		return model.PITRCheckpoint{}, err
+	}
+	cursor.Found = true
+	return s.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tx, tableName, cursor)
+}
+
+func (s *Store) GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
+	return s.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tx, tableName, cursor)
+}
+
+func (s *Store) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
+	if !cursor.Found {
+		return model.PITRCheckpoint{}, nil
+	}
+	var checkpoint model.PITRCheckpoint
+	var checkpointID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, changed_at, history_sequence
+		FROM pitr_checkpoints
+		WHERE table_name = ?
+		  AND (changed_at < ? OR (changed_at = ? AND history_sequence <= ?))
+		ORDER BY changed_at DESC, history_sequence DESC
+		LIMIT 1
+	`, tableName, cursor.ChangedAt, cursor.ChangedAt, cursor.Sequence).Scan(&checkpointID, &checkpoint.ChangedAt, &checkpoint.Sequence)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.PITRCheckpoint{}, nil
+		}
+		return model.PITRCheckpoint{}, err
+	}
+	checkpoint.Found = true
+	items, err := s.listPITRCheckpointItems(ctx, tx, checkpointID)
+	if err != nil {
+		return model.PITRCheckpoint{}, err
+	}
+	checkpoint.Items = items
+	return checkpoint, nil
+}
+
+func (s *Store) listPITRCheckpointItems(ctx context.Context, tx *sql.Tx, checkpointID int64) ([]model.PITRCheckpointItem, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT pk, sk, item_json
+		FROM pitr_checkpoint_items
+		WHERE checkpoint_id = ?
+	`, checkpointID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]model.PITRCheckpointItem, 0)
+	for rows.Next() {
+		var item model.PITRCheckpointItem
+		var raw []byte
+		if err := rows.Scan(&item.PK, &item.SK, &raw); err != nil {
+			return nil, err
+		}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &item.Item); err != nil {
+				return nil, err
+			}
+		} else {
+			item.Item = map[string]any{}
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 func (s *Store) DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error) {
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM item_history
@@ -704,6 +834,134 @@ func (s *Store) DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableNa
 	return deleted, nil
 }
 
+func (s *Store) CompactItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error) {
+	if before <= 0 {
+		return 0, nil
+	}
+	var hasRows int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM item_history
+		WHERE table_name = ? AND changed_at < ?
+		LIMIT 1
+	`, tableName, before).Scan(&hasRows)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	cursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, tableName, before)
+	if err != nil {
+		return 0, err
+	}
+	if cursor.Found {
+		if err := s.createPITRCheckpointForCursor(ctx, tx, tableName, cursor); err != nil {
+			return 0, err
+		}
+	}
+
+	return s.DeleteItemChangesBefore(ctx, tx, tableName, before)
+}
+
+func (s *Store) createPITRCheckpointForCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) error {
+	if !cursor.Found {
+		return nil
+	}
+
+	var existing int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM pitr_checkpoints
+		WHERE table_name = ? AND history_sequence = ?
+		LIMIT 1
+	`, tableName, cursor.Sequence).Scan(&existing)
+	if err == nil {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	previousCheckpoint, err := s.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tx, tableName, cursor)
+	if err != nil {
+		return err
+	}
+
+	after := model.ItemChangeCursor{}
+	if previousCheckpoint.Found {
+		after = model.ItemChangeCursor{Found: true, ChangedAt: previousCheckpoint.ChangedAt, Sequence: previousCheckpoint.Sequence}
+	}
+	changes, err := s.ListItemChangesAfterCursorUpToCursor(ctx, tx, tableName, after, cursor)
+	if err != nil {
+		return err
+	}
+
+	state := make(map[string]map[string]any)
+	if previousCheckpoint.Found {
+		for _, item := range previousCheckpoint.Items {
+			state[item.PK+"\x00"+item.SK] = item.Item
+		}
+	}
+	for _, change := range changes {
+		key := change.PK + "\x00" + change.SK
+		if strings.EqualFold(change.ChangeType, "DELETE") {
+			delete(state, key)
+			continue
+		}
+		if change.Item != nil {
+			state[key] = change.Item
+		}
+	}
+
+	keys := make([]string, 0, len(state))
+	for k := range state {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	items := make([]model.PITRCheckpointItem, 0, len(keys))
+	for _, key := range keys {
+		sep := strings.IndexByte(key, '\x00')
+		if sep < 0 {
+			continue
+		}
+		items = append(items, model.PITRCheckpointItem{
+			PK:   key[:sep],
+			SK:   key[sep+1:],
+			Item: state[key],
+		})
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO pitr_checkpoints(table_name, changed_at, history_sequence, created_at)
+		VALUES (?, ?, ?, ?)
+	`, tableName, cursor.ChangedAt, cursor.Sequence, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+
+	checkpointID, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		raw, err := json.Marshal(item.Item)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO pitr_checkpoint_items(checkpoint_id, pk, sk, item_json)
+			VALUES (?, ?, ?, ?)
+		`, checkpointID, item.PK, item.SK, raw); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *Store) pruneItemHistoryByRetention(ctx context.Context, tx *sql.Tx, table model.Table, nowMs int64) error {
 	if !table.PITR.Enabled {
 		return nil
@@ -716,7 +974,7 @@ func (s *Store) pruneItemHistoryByRetention(ctx context.Context, tx *sql.Tx, tab
 	if cutoff <= 0 {
 		return nil
 	}
-	_, err := s.DeleteItemChangesBefore(ctx, tx, table.Name, cutoff)
+	_, err := s.CompactItemChangesBefore(ctx, tx, table.Name, cutoff)
 	return err
 }
 

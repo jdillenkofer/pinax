@@ -30,6 +30,10 @@ type Store interface {
 	ListItemChangesUpTo(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) ([]model.ItemChange, error)
 	ResolveItemChangeCursorAtOrBefore(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) (model.ItemChangeCursor, error)
 	ListItemChangesUpToCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) ([]model.ItemChange, error)
+	ListItemChangesAfterCursorUpToCursor(ctx context.Context, tx *sql.Tx, tableName string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error)
+	GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx *sql.Tx, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error)
+	GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tx *sql.Tx, tableName string, upTo int64) (model.PITRCheckpoint, error)
+	CompactItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error)
 	DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error)
 	GetTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, token string, now int64) (model.TransactWriteIdempotencyRecord, error)
 	PutTransactWriteIdempotency(ctx context.Context, tx *sql.Tx, record model.TransactWriteIdempotencyRecord) error
