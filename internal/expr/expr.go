@@ -146,8 +146,50 @@ func evaluateSingle(condition string, item map[string]any, names map[string]stri
 				}
 				return false, nil
 			}
+			if ss, ok := listMap["SS"].([]any); ok {
+				rs, ok := attrString(right)
+				if !ok {
+					return false, fmt.Errorf("contains with SS requires string operand")
+				}
+				for _, v := range ss {
+					if s, ok := v.(string); ok && s == rs {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
+			if ns, ok := listMap["NS"].([]any); ok {
+				rn, ok := attrNumber(right)
+				if !ok {
+					return false, fmt.Errorf("contains with NS requires number operand")
+				}
+				for _, v := range ns {
+					s, ok := v.(string)
+					if !ok {
+						continue
+					}
+					n, err := strconv.ParseFloat(s, 64)
+					if err == nil && n == rn {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
+			if bs, ok := listMap["BS"].([]any); ok {
+				rb, ok := attrBinary(right)
+				if !ok {
+					return false, fmt.Errorf("contains with BS requires binary operand")
+				}
+				for _, v := range bs {
+					s, ok := v.(string)
+					if ok && s == rb {
+						return true, nil
+					}
+				}
+				return false, nil
+			}
 		}
-		return false, fmt.Errorf("contains supports string and list operands")
+		return false, fmt.Errorf("contains supports string, list, and set operands")
 	}
 
 	if strings.HasPrefix(condition, "attribute_type(") && strings.HasSuffix(condition, ")") {
@@ -367,6 +409,18 @@ func attrNumber(v any) (float64, bool) {
 		return 0, false
 	}
 	return f, true
+}
+
+func attrBinary(v any) (string, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	b, ok := m["B"].(string)
+	if !ok {
+		return "", false
+	}
+	return b, true
 }
 
 func hasAttrType(v any, typ string) bool {
