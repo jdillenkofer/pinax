@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -103,6 +104,112 @@ func TestBatchWriteDuplicateKeysValidation(t *testing.T) {
 	_, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{"bw2": wr}})
 	if err == nil {
 		t.Fatal("expected duplicate key validation error")
+	}
+}
+
+func TestBatchGetDuplicateKeysValidation(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bgdup"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			"bgdup": {
+				Keys: []map[string]types.AttributeValue{
+					{"pk": &types.AttributeValueMemberS{Value: "a"}},
+					{"pk": &types.AttributeValueMemberS{Value: "a"}},
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate key validation error for BatchGetItem")
+	}
+}
+
+func TestBatchGetReturnsUnprocessedKeysWhenOverProcessingLimit(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bgcap"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := make([]map[string]types.AttributeValue, 0, 90)
+	for i := 0; i < 90; i++ {
+		id := "k" + strconv.Itoa(i)
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String("bgcap"),
+			Item: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: id},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: id}})
+	}
+
+	out, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: map[string]types.KeysAndAttributes{"bgcap": {Keys: keys}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.UnprocessedKeys["bgcap"].Keys) == 0 {
+		t.Fatal("expected unprocessed keys for oversized batch get processing")
+	}
+}
+
+func TestBatchWriteReturnsUnprocessedItemsWhenOverProcessingLimit(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("bwcap"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writes := make([]types.WriteRequest, 0, 25)
+	for i := 0; i < 25; i++ {
+		writes = append(writes, types.WriteRequest{PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "w" + strconv.Itoa(i)}}}})
+	}
+	out, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{"bwcap": writes}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.UnprocessedItems["bwcap"]) == 0 {
+		t.Fatal("expected unprocessed items for oversized batch write processing")
 	}
 }
 

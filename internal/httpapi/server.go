@@ -1306,9 +1306,11 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 
 type batchGetItemRequest struct {
 	RequestItems map[string]struct {
-		Keys                   []map[string]any `json:"Keys"`
-		ConsistentRead         bool             `json:"ConsistentRead"`
-		ReturnConsumedCapacity string           `json:"ReturnConsumedCapacity"`
+		Keys                     []map[string]any  `json:"Keys"`
+		ConsistentRead           bool              `json:"ConsistentRead"`
+		ProjectionExpression     string            `json:"ProjectionExpression"`
+		ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
+		ReturnConsumedCapacity   string            `json:"ReturnConsumedCapacity"`
 	} `json:"RequestItems"`
 }
 
@@ -1321,6 +1323,9 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	for _, itemReq := range req.RequestItems {
 		totalKeys += len(itemReq.Keys)
 	}
+	if len(req.RequestItems) == 0 {
+		return nil, awserr.Validation("RequestItems is required")
+	}
 	if totalKeys > 100 {
 		return nil, awserr.Validation("BatchGetItem supports at most 100 keys")
 	}
@@ -1331,8 +1336,14 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 	}
 	defer tx.Rollback()
 
+	const batchGetProcessLimit = 80
+	processed := 0
 	responses := map[string]any{}
+	unprocessed := map[string]any{}
 	for tableName, itemReq := range req.RequestItems {
+		if len(itemReq.Keys) == 0 {
+			return nil, awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
+		}
 		t, err := s.store.GetTable(r.Context(), tx, tableName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -1340,12 +1351,26 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			}
 			return nil, err
 		}
+		seenKeys := map[string]struct{}{}
 		items := make([]map[string]any, 0, len(itemReq.Keys))
+		unprocessedKeys := make([]map[string]any, 0)
 		for _, key := range itemReq.Keys {
 			pk, sk, err := model.ExtractKey(t, key)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
+			target := tableName + "|" + pk + "|" + sk
+			if _, exists := seenKeys[target]; exists {
+				return nil, awserr.Validation("BatchGetItem contains duplicate keys")
+			}
+			seenKeys[target] = struct{}{}
+
+			if processed >= batchGetProcessLimit {
+				unprocessedKeys = append(unprocessedKeys, key)
+				continue
+			}
+			processed++
+
 			item, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -1356,13 +1381,21 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			items = append(items, item)
 		}
 		responses[tableName] = items
+		if len(unprocessedKeys) > 0 {
+			unprocessed[tableName] = map[string]any{
+				"Keys":                     unprocessedKeys,
+				"ConsistentRead":           itemReq.ConsistentRead,
+				"ProjectionExpression":     itemReq.ProjectionExpression,
+				"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	resp := map[string]any{"Responses": responses, "UnprocessedKeys": map[string]any{}}
+	resp := map[string]any{"Responses": responses, "UnprocessedKeys": unprocessed}
 	for tableName, itemReq := range req.RequestItems {
 		if items, ok := responses[tableName]; ok {
 			for _, item := range items.([]map[string]any) {
@@ -1395,6 +1428,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	for _, ops := range req.RequestItems {
 		totalOps += len(ops)
 	}
+	if len(req.RequestItems) == 0 {
+		return nil, awserr.Validation("RequestItems is required")
+	}
 	if totalOps > 25 {
 		return nil, awserr.Validation("BatchWriteItem supports at most 25 operations")
 	}
@@ -1411,8 +1447,15 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	}
 	sort.Strings(tableNames)
 
+	const batchWriteProcessLimit = 20
+	processed := 0
+	unprocessed := map[string]any{}
+
 	for _, tableName := range tableNames {
 		ops := req.RequestItems[tableName]
+		if len(ops) == 0 {
+			return nil, awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
+		}
 		t, err := s.store.GetTable(r.Context(), tx, tableName)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -1423,9 +1466,20 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 
 		seenKeys := map[string]struct{}{}
 		for _, op := range ops {
+			if len(op.PutRequest.Item) == 0 && len(op.DeleteRequest.Key) == 0 {
+				return nil, awserr.Validation("write request must contain either PutRequest or DeleteRequest")
+			}
 			if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
 				return nil, awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
 			}
+			if processed >= batchWriteProcessLimit {
+				if unprocessed[tableName] == nil {
+					unprocessed[tableName] = make([]any, 0)
+				}
+				unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
+				continue
+			}
+
 			if len(op.PutRequest.Item) > 0 {
 				if model.ItemTooLarge(op.PutRequest.Item) {
 					return nil, awserr.Validation("Item size has exceeded the maximum allowed size (400KB)")
@@ -1442,6 +1496,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
+				processed++
 			}
 			if len(op.DeleteRequest.Key) > 0 {
 				pk, sk, err := model.ExtractKey(t, op.DeleteRequest.Key)
@@ -1456,6 +1511,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
 					return nil, err
 				}
+				processed++
 			}
 		}
 	}
@@ -1464,7 +1520,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, err
 	}
 
-	return map[string]any{"UnprocessedItems": map[string]any{}}, nil
+	return map[string]any{"UnprocessedItems": unprocessed}, nil
 }
 
 type transactGetRequest struct {
