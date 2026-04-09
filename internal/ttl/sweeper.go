@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/store"
 )
 
@@ -13,6 +14,11 @@ type Sweeper struct {
 	interval time.Duration
 	stopCh   chan struct{}
 }
+
+const (
+	tablePageSize  = 100
+	sweepBatchSize = 1000
+)
 
 func NewSweeper(store store.Store, interval time.Duration) *Sweeper {
 	return &Sweeper{
@@ -45,38 +51,48 @@ func (s *Sweeper) Stop() {
 }
 
 func (s *Sweeper) RunOnce(ctx context.Context) {
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		slog.Error("failed to start transaction for TTL sweep", "err", err)
-		return
-	}
-	defer tx.Rollback()
+	start := ""
+	for {
+		tables, err := s.listTablesPage(ctx, start)
+		if err != nil {
+			slog.Error("failed to list tables for TTL sweep", "err", err)
+			return
+		}
+		if len(tables) == 0 {
+			return
+		}
 
-	tables, err := s.store.ListTables(ctx, tx, "", 100)
-	if err != nil {
-		slog.Error("failed to list tables for TTL sweep", "err", err)
-		return
-	}
+		for _, tableName := range tables {
+			s.sweepTable(ctx, tableName)
+		}
 
-	if err := tx.Commit(); err != nil {
-		slog.Error("failed to commit transaction for TTL list tables", "err", err)
-		return
-	}
-
-	for _, tableName := range tables {
-		s.sweepTable(ctx, tableName)
+		if len(tables) < tablePageSize {
+			return
+		}
+		start = tables[len(tables)-1]
 	}
 }
 
-func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
+func (s *Sweeper) listTablesPage(ctx context.Context, start string) ([]string, error) {
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
-		slog.Error("failed to start transaction for TTL sweepTable", "table", tableName, "err", err)
-		return
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	t, err := s.store.GetTable(ctx, tx, tableName)
+	tables, err := s.store.ListTables(ctx, tx, start, tablePageSize)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
+	t, err := s.loadTable(ctx, tableName)
 	if err != nil {
 		slog.Error("failed to get table for TTL sweep", "table", tableName, "err", err)
 		return
@@ -87,7 +103,6 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 	}
 
 	now := time.Now().Unix()
-	limit := 100
 
 	for {
 		select {
@@ -96,28 +111,44 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 		default:
 		}
 
-		expired, err := s.store.GetExpiredItems(ctx, tx, tableName, t.TimeToLive.AttrName, now, limit)
+		tx, err := s.store.DB().BeginTx(ctx, nil)
 		if err != nil {
-			slog.Error("failed to get expired items", "table", tableName, "err", err)
+			slog.Error("failed to start transaction for TTL batch delete", "table", tableName, "err", err)
 			return
 		}
 
-		if len(expired) == 0 {
-			break
+		deleted, err := s.store.DeleteExpiredItems(ctx, tx, tableName, now, sweepBatchSize)
+		if err != nil {
+			_ = tx.Rollback()
+			slog.Error("failed to delete expired items", "table", tableName, "err", err)
+			return
 		}
 
-		for _, item := range expired {
-			if err := s.store.DeleteExpiredItem(ctx, tx, tableName, item.PK, item.SK); err != nil {
-				slog.Error("failed to delete expired item", "table", tableName, "pk", item.PK, "sk", item.SK, "err", err)
-			}
+		if err := tx.Commit(); err != nil {
+			slog.Error("failed to commit transaction for TTL batch delete", "table", tableName, "err", err)
+			return
 		}
 
-		if len(expired) < limit {
+		if deleted < sweepBatchSize {
 			break
 		}
+	}
+}
+
+func (s *Sweeper) loadTable(ctx context.Context, tableName string) (model.Table, error) {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return model.Table{}, err
+	}
+	defer tx.Rollback()
+
+	table, err := s.store.GetTable(ctx, tx, tableName)
+	if err != nil {
+		return model.Table{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		slog.Error("failed to commit transaction for TTL sweepTable", "table", tableName, "err", err)
+		return model.Table{}, err
 	}
+	return table, nil
 }

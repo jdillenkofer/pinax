@@ -456,3 +456,26 @@ func (s *Store) DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk
 	`, tableName, pk, sk)
 	return err
 }
+
+func (s *Store) DeleteExpiredItems(ctx context.Context, tx *sql.Tx, tableName string, before int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM items
+		WHERE rowid IN (
+			SELECT rowid FROM items
+			WHERE table_name = ? AND ttl > 0 AND ttl < ?
+			ORDER BY ttl ASC
+			LIMIT ?
+		)
+	`, tableName, before, limit)
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}

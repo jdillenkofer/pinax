@@ -27,4 +27,5 @@ type Store interface {
 		SK string
 	}, error)
 	DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error
+	DeleteExpiredItems(ctx context.Context, tx *sql.Tx, tableName string, before int64, limit int) (int64, error)
 }
