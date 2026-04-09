@@ -240,7 +240,7 @@ func TestProvisionedModeBatchGetReturnsUnprocessedInsteadOfError(t *testing.T) {
 		BillingMode: types.BillingModeProvisioned,
 		ProvisionedThroughput: &types.ProvisionedThroughput{
 			ReadCapacityUnits:  aws.Int64(1),
-			WriteCapacityUnits: aws.Int64(10),
+			WriteCapacityUnits: aws.Int64(20),
 		},
 		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
 		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
