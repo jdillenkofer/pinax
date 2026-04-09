@@ -1119,6 +1119,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	scanned := 0
 	filtered := make([]map[string]any, 0)
 	var lastScanned map[string]any
+	totalRead := 0.0
 
 	for _, item := range items {
 		queryItem := item
@@ -1151,6 +1152,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 
 		scanned++
 		lastScanned = keyFromItem(t, item)
+		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(queryItem), req.ConsistentRead)
 
 		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 		if err != nil {
@@ -1171,11 +1173,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	}
 
 	resp := map[string]any{"Items": filtered, "Count": count, "ScannedCount": scanned}
-	var totalRead float64
-	for _, item := range filtered {
-		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
+	indexType := ""
+	if queryGSI != nil {
+		indexType = "GSI"
 	}
-	addConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
+	if queryLSI != nil {
+		indexType = "LSI"
+	}
+	addQueryConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, req.IndexName, indexType, totalRead)
 	if limit > 0 && scanned == limit && lastScanned != nil {
 		resp["LastEvaluatedKey"] = lastScanned
 	}
@@ -2232,5 +2237,38 @@ func addConsumedCapacity(resp map[string]any, capacity string, tableName string,
 	if readUnits > 0 && writeUnits > 0 {
 		entry["CapacityUnits"] = readUnits + writeUnits
 	}
+	resp["ConsumedCapacity"] = append(list, entry)
+}
+
+func addQueryConsumedCapacity(resp map[string]any, mode string, tableName, indexName, indexType string, readUnits float64) {
+	if mode == "" || mode == "NONE" {
+		return
+	}
+	if resp["ConsumedCapacity"] == nil {
+		resp["ConsumedCapacity"] = []map[string]any{}
+	}
+	entry := map[string]any{
+		"TableName":         tableName,
+		"ReadCapacityUnits": readUnits,
+		"CapacityUnits":     readUnits,
+	}
+	if mode == "INDEXES" && strings.TrimSpace(indexName) != "" {
+		if indexType == "GSI" {
+			entry["GlobalSecondaryIndexes"] = map[string]any{
+				indexName: map[string]any{
+					"ReadCapacityUnits": readUnits,
+					"CapacityUnits":     readUnits,
+				},
+			}
+		} else if indexType == "LSI" {
+			entry["LocalSecondaryIndexes"] = map[string]any{
+				indexName: map[string]any{
+					"ReadCapacityUnits": readUnits,
+					"CapacityUnits":     readUnits,
+				},
+			}
+		}
+	}
+	list := resp["ConsumedCapacity"].([]map[string]any)
 	resp["ConsumedCapacity"] = append(list, entry)
 }
