@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -43,6 +44,7 @@ const (
 	defaultTableMaxReadCapacityUnits    int64 = 40000
 	defaultTableMaxWriteCapacityUnits   int64 = 40000
 	defaultDescribeEndpointsCachePeriod int64 = 60
+	listTagsOfResourcePageSize                = 10
 )
 
 var (
@@ -1668,9 +1670,6 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 	if strings.TrimSpace(req.ResourceARN) == "" {
 		return nil, awserr.Validation("ResourceArn is required")
 	}
-	if strings.TrimSpace(req.NextToken) != "" {
-		return nil, awserr.Validation("NextToken is not supported")
-	}
 
 	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
 	if err != nil {
@@ -1700,14 +1699,46 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 		}
 		return sortedTags[i].Key < sortedTags[j].Key
 	})
-	for _, tag := range sortedTags {
+	start, err := parseListTagsOfResourceStartToken(req.NextToken, len(sortedTags))
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	end := len(sortedTags)
+	if max := start + listTagsOfResourcePageSize; max < end {
+		end = max
+	}
+	for _, tag := range sortedTags[start:end] {
 		tags = append(tags, map[string]any{"Key": tag.Key, "Value": tag.Value})
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"Tags": tags}, nil
+	resp := map[string]any{"Tags": tags}
+	if end < len(sortedTags) {
+		resp["NextToken"] = encodeListTagsOfResourceStartToken(end)
+	}
+	return resp, nil
+}
+
+func parseListTagsOfResourceStartToken(nextToken string, total int) (int, error) {
+	token := strings.TrimSpace(nextToken)
+	if token == "" {
+		return 0, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, fmt.Errorf("Invalid NextToken")
+	}
+	start, err := strconv.Atoi(string(raw))
+	if err != nil || start < 0 || start >= total {
+		return 0, fmt.Errorf("Invalid NextToken")
+	}
+	return start, nil
+}
+
+func encodeListTagsOfResourceStartToken(start int) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(start)))
 }
 
 type putItemRequest struct {

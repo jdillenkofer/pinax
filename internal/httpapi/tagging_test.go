@@ -131,6 +131,118 @@ func TestListTagsOfResourceMissingResourceReturnsResourceNotFound(t *testing.T) 
 	}
 }
 
+func TestListTagsOfResourcePagination(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	createTags := make([]types.Tag, 0, 12)
+	for i := 0; i < 12; i++ {
+		createTags = append(createTags, types.Tag{
+			Key:   aws.String("k" + string(rune('a'+i))),
+			Value: aws.String("v"),
+		})
+	}
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("tagging-pagination"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+		Tags:        createTags,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desc, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("tagging-pagination")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstPage, err := client.ListTagsOfResource(ctx, &dynamodb.ListTagsOfResourceInput{ResourceArn: desc.Table.TableArn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.Tags) != 10 {
+		t.Fatalf("expected 10 tags on first page, got %d", len(firstPage.Tags))
+	}
+	if firstPage.NextToken == nil || *firstPage.NextToken == "" {
+		t.Fatalf("expected NextToken on first page, got %+v", firstPage)
+	}
+
+	secondPage, err := client.ListTagsOfResource(ctx, &dynamodb.ListTagsOfResourceInput{
+		ResourceArn: desc.Table.TableArn,
+		NextToken:   firstPage.NextToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondPage.Tags) != 2 {
+		t.Fatalf("expected 2 tags on second page, got %d", len(secondPage.Tags))
+	}
+	if secondPage.NextToken != nil {
+		t.Fatalf("expected no NextToken on final page, got %+v", *secondPage.NextToken)
+	}
+
+	seen := map[string]struct{}{}
+	for _, tag := range append(firstPage.Tags, secondPage.Tags...) {
+		if tag.Key == nil || tag.Value == nil {
+			t.Fatalf("expected complete tag values, got %+v", tag)
+		}
+		seen[*tag.Key+"="+*tag.Value] = struct{}{}
+	}
+	if len(seen) != 12 {
+		t.Fatalf("expected 12 distinct tags across pages, got %d", len(seen))
+	}
+}
+
+func TestListTagsOfResourceInvalidNextTokenReturnsValidationException(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("tagging-invalid-token"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema:   []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode: types.BillingModePayPerRequest,
+		Tags: []types.Tag{
+			{Key: aws.String("env"), Value: aws.String("dev")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	desc, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("tagging-invalid-token")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.ListTagsOfResource(ctx, &dynamodb.ListTagsOfResourceInput{
+		ResourceArn: desc.Table.TableArn,
+		NextToken:   aws.String("not-base64"),
+	})
+	if err == nil {
+		t.Fatal("expected ValidationException")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected API error, got %T: %v", err, err)
+	}
+	if apiErr.ErrorCode() != "ValidationException" {
+		t.Fatalf("expected ValidationException, got %q", apiErr.ErrorCode())
+	}
+}
+
 func hasTag(tags []types.Tag, key string, value string) bool {
 	for _, tag := range tags {
 		if tag.Key != nil && tag.Value != nil && *tag.Key == key && *tag.Value == value {
