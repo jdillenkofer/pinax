@@ -50,4 +50,9 @@ type Store interface {
 	GetBackupByName(ctx context.Context, tx *sql.Tx, backupName string) (model.Backup, error)
 	ListBackups(ctx context.Context, tx *sql.Tx) ([]model.Backup, error)
 	DeleteBackup(ctx context.Context, tx *sql.Tx, backupARN string) error
+	AppendStreamRecord(ctx context.Context, tx *sql.Tx, record model.StreamRecord) error
+	ListStreamRecordsAfterSequence(ctx context.Context, tx *sql.Tx, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error)
+	GetStreamSequenceBounds(ctx context.Context, tx *sql.Tx, streamARN string) (int64, int64, bool, error)
+	GetStreamRecordChangedAt(ctx context.Context, tx *sql.Tx, streamARN string, sequence int64) (int64, bool, error)
+	DeleteStreamRecordsBefore(ctx context.Context, tx *sql.Tx, streamARN string, before int64) (int64, error)
 }

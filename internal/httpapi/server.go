@@ -3,7 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -37,6 +40,7 @@ import (
 )
 
 const targetPrefix = "DynamoDB_20120810."
+const streamsTargetPrefix = "DynamoDBStreams_20120810."
 
 const (
 	defaultAccountMaxReadCapacityUnits  int64 = 80000
@@ -45,6 +49,13 @@ const (
 	defaultTableMaxWriteCapacityUnits   int64 = 40000
 	defaultDescribeEndpointsCachePeriod int64 = 60
 	listTagsOfResourcePageSize                = 10
+	defaultStreamReadLimit                    = 1000
+	defaultListStreamsLimit                   = 100
+	defaultDescribeStreamLimit                = 100
+	defaultStreamIteratorTTL                  = 15 * time.Minute
+	streamRetentionMillis                     = 24 * 60 * 60 * 1000
+	streamResponseMaxBytes                    = 1024 * 1024
+	streamDefaultShardID                      = "shardId-000000000000"
 )
 
 var (
@@ -89,6 +100,8 @@ type Server struct {
 	capacityWindows               map[string]capacityWindow
 	metricsHandler                http.Handler
 	pitrLatestRestorableLagMillis int64
+	streamIteratorTTL             time.Duration
+	streamIteratorSigningKey      []byte
 }
 
 type capacityWindow struct {
@@ -108,6 +121,25 @@ func WithPITRLatestRestorableLagMillis(ms int64) ServerOption {
 	}
 }
 
+func WithStreamIteratorTTL(ttl time.Duration) ServerOption {
+	if ttl <= 0 {
+		ttl = defaultStreamIteratorTTL
+	}
+	return func(s *Server) {
+		s.streamIteratorTTL = ttl
+	}
+}
+
+func WithStreamIteratorSigningKey(key []byte) ServerOption {
+	trimmed := append([]byte(nil), key...)
+	if len(trimmed) == 0 {
+		trimmed = newStreamIteratorSigningKey()
+	}
+	return func(s *Server) {
+		s.streamIteratorSigningKey = trimmed
+	}
+}
+
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	s := &Server{
 		store:                         store,
@@ -115,6 +147,8 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 		capacityWindows:               map[string]capacityWindow{},
 		metricsHandler:                promhttp.Handler(),
 		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisFromEnv(),
+		streamIteratorTTL:             defaultStreamIteratorTTL,
+		streamIteratorSigningKey:      newStreamIteratorSigningKey(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -151,13 +185,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := strings.TrimSpace(r.Header.Get("X-Amz-Target"))
-	if !strings.HasPrefix(target, targetPrefix) {
-		err := awserr.Validation("X-Amz-Target header must look like DynamoDB_20120810.<Operation>")
+	op, ok := parseTargetOperation(target)
+	if !ok {
+		err := awserr.Validation("X-Amz-Target header must look like DynamoDB_20120810.<Operation> or DynamoDBStreams_20120810.<Operation>")
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
 	}
-	op := strings.TrimPrefix(target, targetPrefix)
 	operation = op
 
 	body, err := io.ReadAll(r.Body)
@@ -207,6 +241,26 @@ func (s *Server) observeRequest(operation string, statusCode int, errorCode stri
 	if errorCode == "ProvisionedThroughputExceededException" {
 		throttlingFailuresTotal.WithLabelValues(operation).Inc()
 	}
+}
+
+func parseTargetOperation(target string) (string, bool) {
+	target = strings.TrimSpace(target)
+	if strings.HasPrefix(target, targetPrefix) {
+		return strings.TrimPrefix(target, targetPrefix), true
+	}
+	if strings.HasPrefix(target, streamsTargetPrefix) {
+		return strings.TrimPrefix(target, streamsTargetPrefix), true
+	}
+	return "", false
+}
+
+func newStreamIteratorSigningKey() []byte {
+	key := make([]byte, 32)
+	if _, err := crand.Read(key); err == nil {
+		return key
+	}
+	fallback := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return fallback[:]
 }
 
 func apiErrorCodeForMetrics(err error) string {
@@ -380,6 +434,14 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.untagResource(r, body)
 	case "ListTagsOfResource":
 		return s.listTagsOfResource(r, body)
+	case "ListStreams":
+		return s.listStreams(r, body)
+	case "DescribeStream":
+		return s.describeStream(r, body)
+	case "GetShardIterator":
+		return s.getShardIterator(r, body)
+	case "GetRecords":
+		return s.getRecords(r, body)
 	default:
 		return nil, awserr.Validation("unsupported operation " + operation)
 	}
@@ -1741,6 +1803,531 @@ func encodeListTagsOfResourceStartToken(start int) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(start)))
 }
 
+type listStreamsRequest struct {
+	TableName               string `json:"TableName"`
+	Limit                   int    `json:"Limit"`
+	ExclusiveStartStreamARN string `json:"ExclusiveStartStreamArn"`
+}
+
+type describeStreamRequest struct {
+	StreamARN             string `json:"StreamArn"`
+	Limit                 int    `json:"Limit"`
+	ExclusiveStartShardID string `json:"ExclusiveStartShardId"`
+}
+
+type getShardIteratorRequest struct {
+	StreamARN         string `json:"StreamArn"`
+	ShardID           string `json:"ShardId"`
+	ShardIteratorType string `json:"ShardIteratorType"`
+	SequenceNumber    string `json:"SequenceNumber"`
+}
+
+type getRecordsRequest struct {
+	ShardIterator string `json:"ShardIterator"`
+	Limit         int    `json:"Limit"`
+}
+
+type streamIteratorToken struct {
+	StreamARN string `json:"streamArn"`
+	ShardID   string `json:"shardId"`
+	Sequence  int64  `json:"sequence"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+func (s *Server) listStreams(r *http.Request, body []byte) (map[string]any, error) {
+	var req listStreamsRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	limit := req.Limit
+	if limit < 0 {
+		return nil, awserr.Validation("Limit must be greater than or equal to 0")
+	}
+	if limit <= 0 {
+		limit = defaultListStreamsLimit
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	streams := make([]map[string]any, 0)
+	start := ""
+	for {
+		names, err := s.store.ListTables(r.Context(), tx, start, defaultListStreamsLimit)
+		if err != nil {
+			return nil, err
+		}
+		if len(names) == 0 {
+			break
+		}
+		for _, name := range names {
+			if strings.TrimSpace(req.TableName) != "" && name != req.TableName {
+				continue
+			}
+			t, err := s.getTableWithLifecycle(r.Context(), tx, name)
+			if err != nil {
+				continue
+			}
+			if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" {
+				continue
+			}
+			if strings.TrimSpace(req.ExclusiveStartStreamARN) != "" && t.Stream.ARN <= req.ExclusiveStartStreamARN {
+				continue
+			}
+			streams = append(streams, map[string]any{
+				"StreamArn":   t.Stream.ARN,
+				"TableName":   t.Name,
+				"StreamLabel": t.Stream.Label,
+			})
+		}
+		start = names[len(names)-1]
+	}
+	sort.Slice(streams, func(i, j int) bool {
+		return streams[i]["StreamArn"].(string) < streams[j]["StreamArn"].(string)
+	})
+	truncated := streams
+	if len(truncated) > limit {
+		truncated = truncated[:limit]
+	}
+	resp := map[string]any{"Streams": truncated}
+	if len(streams) > limit {
+		resp["LastEvaluatedStreamArn"] = truncated[len(truncated)-1]["StreamArn"]
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *Server) describeStream(r *http.Request, body []byte) (map[string]any, error) {
+	var req describeStreamRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.StreamARN) == "" {
+		return nil, awserr.Validation("StreamArn is required")
+	}
+	limit := req.Limit
+	if limit < 0 {
+		return nil, awserr.Validation("Limit must be greater than or equal to 0")
+	}
+	if limit <= 0 {
+		limit = defaultDescribeStreamLimit
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	t, err := s.getTableByStreamARN(r.Context(), tx, req.StreamARN)
+	if err != nil {
+		return nil, err
+	}
+	firstSeq, _, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, req.StreamARN)
+	if err != nil {
+		return nil, err
+	}
+	starting := "0"
+	if found {
+		starting = strconv.FormatInt(firstSeq, 10)
+	}
+	shards := []map[string]any{}
+	if strings.TrimSpace(req.ExclusiveStartShardID) == "" {
+		shards = append(shards, map[string]any{
+			"ShardId": streamDefaultShardID,
+			"SequenceNumberRange": map[string]any{
+				"StartingSequenceNumber": starting,
+			},
+		})
+	}
+	if len(shards) > limit {
+		shards = shards[:limit]
+	}
+	resp := map[string]any{
+		"StreamDescription": map[string]any{
+			"StreamArn":               t.Stream.ARN,
+			"StreamStatus":            "ENABLED",
+			"StreamViewType":          t.Stream.ViewType,
+			"CreationRequestDateTime": t.CreatedAt,
+			"TableName":               t.Name,
+			"KeySchema":               t.KeySchema(),
+			"Shards":                  shards,
+		},
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *Server) getShardIterator(r *http.Request, body []byte) (map[string]any, error) {
+	var req getShardIteratorRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.StreamARN) == "" {
+		return nil, awserr.Validation("StreamArn is required")
+	}
+	if strings.TrimSpace(req.ShardID) == "" {
+		return nil, awserr.Validation("ShardId is required")
+	}
+	if req.ShardID != streamDefaultShardID {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
+	}
+	iteratorType := strings.TrimSpace(req.ShardIteratorType)
+	if iteratorType == "" {
+		return nil, awserr.Validation("ShardIteratorType is required")
+	}
+	if (iteratorType == "TRIM_HORIZON" || iteratorType == "LATEST") && strings.TrimSpace(req.SequenceNumber) != "" {
+		return nil, awserr.Validation("SequenceNumber is not valid for this ShardIteratorType")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := s.getTableByStreamARN(r.Context(), tx, req.StreamARN); err != nil {
+		return nil, err
+	}
+	_, last, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, req.StreamARN)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		last = 0
+	}
+
+	sequence := int64(0)
+	switch iteratorType {
+	case "TRIM_HORIZON":
+		sequence = 0
+	case "LATEST":
+		sequence = last
+	case "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER":
+		if strings.TrimSpace(req.SequenceNumber) == "" {
+			return nil, awserr.Validation("SequenceNumber is required for this ShardIteratorType")
+		}
+		parsed, err := strconv.ParseInt(strings.TrimSpace(req.SequenceNumber), 10, 64)
+		if err != nil || parsed < 0 {
+			return nil, awserr.Validation("Invalid SequenceNumber")
+		}
+		if iteratorType == "AT_SEQUENCE_NUMBER" {
+			sequence = parsed - 1
+		} else {
+			sequence = parsed
+		}
+	default:
+		return nil, awserr.Validation("Invalid ShardIteratorType")
+	}
+	if sequence < 0 {
+		sequence = 0
+	}
+	token, err := s.encodeStreamIterator(streamIteratorToken{
+		StreamARN: req.StreamARN,
+		ShardID:   req.ShardID,
+		Sequence:  sequence,
+		ExpiresAt: time.Now().Add(s.streamIteratorTTL).UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ShardIterator": token}, nil
+}
+
+func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error) {
+	var req getRecordsRequest
+	if err := decode(body, &req); err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if strings.TrimSpace(req.ShardIterator) == "" {
+		return nil, awserr.Validation("ShardIterator is required")
+	}
+	limit := req.Limit
+	if limit < 0 {
+		return nil, awserr.Validation("Limit must be greater than or equal to 0")
+	}
+	if limit <= 0 {
+		limit = defaultStreamReadLimit
+	}
+	if limit > 1000 {
+		return nil, awserr.Validation("Limit must be less than or equal to 1000")
+	}
+	token, err := s.decodeStreamIterator(req.ShardIterator)
+	if err != nil {
+		return nil, awserr.Validation("Invalid ShardIterator")
+	}
+	if token.ExpiresAt <= time.Now().UnixMilli() {
+		return nil, awserr.ExpiredIterator("Shard iterator has expired")
+	}
+
+	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := s.getTableByStreamARN(r.Context(), tx, token.StreamARN); err != nil {
+		return nil, err
+	}
+	records, err := s.store.ListStreamRecordsAfterSequence(r.Context(), tx, token.StreamARN, token.Sequence, limit)
+	if err != nil {
+		return nil, err
+	}
+	_, last, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, token.StreamARN)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		last = token.Sequence
+	}
+	latestChangedAt := int64(0)
+	if found {
+		latestChangedAt, _, err = s.store.GetStreamRecordChangedAt(r.Context(), tx, token.StreamARN, last)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	outRecords := make([]map[string]any, 0, len(records))
+	nextSeq := token.Sequence
+	bytesUsed := 0
+	for _, record := range records {
+		recordSize := itemSizeOrZero(record.Keys) + itemSizeOrZero(record.OldImage) + itemSizeOrZero(record.NewImage)
+		if bytesUsed+recordSize > streamResponseMaxBytes && len(outRecords) > 0 {
+			break
+		}
+		outRecords = append(outRecords, streamRecordResponse(record))
+		nextSeq = record.Sequence
+		bytesUsed += recordSize
+	}
+	nextIterator, err := s.encodeStreamIterator(streamIteratorToken{
+		StreamARN: token.StreamARN,
+		ShardID:   token.ShardID,
+		Sequence:  nextSeq,
+		ExpiresAt: time.Now().Add(s.streamIteratorTTL).UnixMilli(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	behind := int64(0)
+	if latestChangedAt > 0 {
+		cursorChangedAt, cursorFound, err := s.store.GetStreamRecordChangedAt(r.Context(), tx, token.StreamARN, nextSeq)
+		if err != nil {
+			return nil, err
+		}
+		if !cursorFound {
+			cursorChangedAt = time.Now().UnixMilli()
+		}
+		if latestChangedAt > cursorChangedAt {
+			behind = latestChangedAt - cursorChangedAt
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"Records":            outRecords,
+		"NextShardIterator":  nextIterator,
+		"MillisBehindLatest": behind,
+	}, nil
+}
+
+type streamIteratorEnvelope struct {
+	Token streamIteratorToken `json:"token"`
+	Sig   string              `json:"sig"`
+}
+
+func (s *Server) encodeStreamIterator(token streamIteratorToken) (string, error) {
+	raw, err := json.Marshal(token)
+	if err != nil {
+		return "", err
+	}
+	sig := hmac.New(sha256.New, s.streamIteratorSigningKey)
+	_, _ = sig.Write(raw)
+	envelopeRaw, err := json.Marshal(streamIteratorEnvelope{
+		Token: token,
+		Sig:   hex.EncodeToString(sig.Sum(nil)),
+	})
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(envelopeRaw), nil
+}
+
+func (s *Server) decodeStreamIterator(raw string) (streamIteratorToken, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return streamIteratorToken{}, err
+	}
+	var envelope streamIteratorEnvelope
+	if err := json.Unmarshal(decoded, &envelope); err != nil {
+		return streamIteratorToken{}, err
+	}
+	rawToken, err := json.Marshal(envelope.Token)
+	if err != nil {
+		return streamIteratorToken{}, err
+	}
+	sig := hmac.New(sha256.New, s.streamIteratorSigningKey)
+	_, _ = sig.Write(rawToken)
+	expectedSig := hex.EncodeToString(sig.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(envelope.Sig)) != 1 {
+		return streamIteratorToken{}, fmt.Errorf("invalid shard iterator")
+	}
+	token := envelope.Token
+	if strings.TrimSpace(token.StreamARN) == "" || strings.TrimSpace(token.ShardID) == "" {
+		return streamIteratorToken{}, fmt.Errorf("invalid shard iterator")
+	}
+	return token, nil
+}
+
+func streamRecordResponse(record model.StreamRecord) map[string]any {
+	dynamodbRecord := map[string]any{
+		"ApproximateCreationDateTime": float64(record.ChangedAt) / 1000,
+		"SequenceNumber":              strconv.FormatInt(record.Sequence, 10),
+		"StreamViewType":              streamViewTypeForRecord(record),
+		"Keys":                        record.Keys,
+		"SizeBytes":                   itemSizeOrZero(record.Keys) + itemSizeOrZero(record.OldImage) + itemSizeOrZero(record.NewImage),
+	}
+	if record.NewImage != nil {
+		dynamodbRecord["NewImage"] = record.NewImage
+	}
+	if record.OldImage != nil {
+		dynamodbRecord["OldImage"] = record.OldImage
+	}
+	return map[string]any{
+		"eventID":        strconv.FormatInt(record.Sequence, 10),
+		"eventName":      record.EventName,
+		"eventVersion":   "1.1",
+		"eventSource":    "aws:dynamodb",
+		"awsRegion":      "local",
+		"eventSourceARN": record.StreamARN,
+		"dynamodb":       dynamodbRecord,
+	}
+}
+
+func itemSizeOrZero(item map[string]any) int {
+	if item == nil {
+		return 0
+	}
+	return model.CalculateItemSizeBytes(item)
+}
+
+func streamViewTypeForRecord(record model.StreamRecord) string {
+	if record.NewImage != nil && record.OldImage != nil {
+		return "NEW_AND_OLD_IMAGES"
+	}
+	if record.NewImage != nil {
+		return "NEW_IMAGE"
+	}
+	if record.OldImage != nil {
+		return "OLD_IMAGE"
+	}
+	return "KEYS_ONLY"
+}
+
+func (s *Server) getTableByStreamARN(ctx context.Context, tx *sql.Tx, streamARN string) (model.Table, error) {
+	name, err := tableNameFromStreamARN(streamARN)
+	if err != nil {
+		return model.Table{}, awserr.ResourceNotFound("Requested resource not found")
+	}
+	t, err := s.getTableWithLifecycle(ctx, tx, name)
+	if err != nil {
+		return model.Table{}, awserr.ResourceNotFound("Requested resource not found")
+	}
+	if !t.Stream.Enabled || t.Stream.ARN != strings.TrimSpace(streamARN) {
+		return model.Table{}, awserr.ResourceNotFound("Requested resource not found")
+	}
+	return t, nil
+}
+
+func tableNameFromStreamARN(streamARN string) (string, error) {
+	streamARN = strings.TrimSpace(streamARN)
+	if !strings.HasPrefix(streamARN, "arn:") {
+		return "", fmt.Errorf("invalid stream arn")
+	}
+	marker := ":table/"
+	start := strings.Index(streamARN, marker)
+	if start < 0 {
+		marker = "/table/"
+		start = strings.Index(streamARN, marker)
+	}
+	if start < 0 {
+		return "", fmt.Errorf("invalid stream arn")
+	}
+	remainder := streamARN[start+len(marker):]
+	parts := strings.Split(remainder, "/")
+	if len(parts) < 3 || parts[1] != "stream" {
+		return "", fmt.Errorf("invalid stream arn")
+	}
+	if strings.TrimSpace(parts[0]) == "" {
+		return "", fmt.Errorf("invalid stream arn")
+	}
+	return strings.TrimSpace(parts[0]), nil
+}
+
+func keyAttributesFromItem(t model.Table, item map[string]any) map[string]any {
+	keys := map[string]any{}
+	keys[t.HashKey] = item[t.HashKey]
+	if t.RangeKey != "" {
+		keys[t.RangeKey] = item[t.RangeKey]
+	}
+	return keys
+}
+
+func keyAttributesFromKey(t model.Table, key map[string]any) map[string]any {
+	keys := map[string]any{}
+	keys[t.HashKey] = key[t.HashKey]
+	if t.RangeKey != "" {
+		keys[t.RangeKey] = key[t.RangeKey]
+	}
+	return keys
+}
+
+func filterStreamImages(viewType string, oldImage, newImage map[string]any) (map[string]any, map[string]any) {
+	switch viewType {
+	case "KEYS_ONLY":
+		return nil, nil
+	case "NEW_IMAGE":
+		return nil, newImage
+	case "OLD_IMAGE":
+		return oldImage, nil
+	case "NEW_AND_OLD_IMAGES":
+		return oldImage, newImage
+	default:
+		return nil, nil
+	}
+}
+
+func (s *Server) appendStreamRecordForMutation(ctx context.Context, tx *sql.Tx, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
+	if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" {
+		return nil
+	}
+	oldView, newView := filterStreamImages(t.Stream.ViewType, oldImage, newImage)
+	if err := s.store.AppendStreamRecord(ctx, tx, model.StreamRecord{
+		StreamARN: t.Stream.ARN,
+		ShardID:   streamDefaultShardID,
+		EventName: eventName,
+		Keys:      keys,
+		OldImage:  oldView,
+		NewImage:  newView,
+		ChangedAt: changedAt,
+	}); err != nil {
+		return err
+	}
+	_, err := s.store.DeleteStreamRecordsBefore(ctx, tx, t.Stream.ARN, changedAt-streamRetentionMillis)
+	return err
+}
+
 type putItemRequest struct {
 	TableName                           string            `json:"TableName"`
 	Item                                map[string]any    `json:"Item"`
@@ -1803,8 +2390,19 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
+	changedAt := time.Now().UnixMilli()
 
 	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, req.Item); err != nil {
+		return nil, err
+	}
+	eventName := "INSERT"
+	streamOld := current
+	if existed {
+		eventName = "MODIFY"
+	} else {
+		streamOld = nil
+	}
+	if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt); err != nil {
 		return nil, err
 	}
 
@@ -1949,8 +2547,14 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
+	changedAt := time.Now().UnixMilli()
 	if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 		return nil, err
+	}
+	if existed {
+		if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -2047,7 +2651,18 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return nil, err
 	}
+	changedAt := time.Now().UnixMilli()
 	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
+		return nil, err
+	}
+	eventName := "INSERT"
+	streamOld := oldItem
+	if itemExisted {
+		eventName = "MODIFY"
+	} else {
+		streamOld = nil
+	}
+	if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt); err != nil {
 		return nil, err
 	}
 
@@ -3167,6 +3782,15 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("Provided list of item keys contains duplicates")
 				}
 				seenKeys[k] = struct{}{}
+				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+				existed := true
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return nil, err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					existed = false
+					current = map[string]any{}
+				}
 				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
 				if !s.reserveWriteCapacity(t, writeUnits) {
 					if unprocessed[tableName] == nil {
@@ -3176,6 +3800,16 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					continue
 				}
 				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
+					return nil, err
+				}
+				eventName := "INSERT"
+				streamOld := current
+				if existed {
+					eventName = "MODIFY"
+				} else {
+					streamOld = nil
+				}
+				if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
 					return nil, err
 				}
 				writeByTable[tableName] += writeUnits
@@ -3204,10 +3838,12 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				}
 				seenKeys[k] = struct{}{}
 				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+				existed := true
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return nil, err
 				}
 				if errors.Is(err, sql.ErrNoRows) {
+					existed = false
 					current = op.DeleteRequest.Key
 				}
 				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
@@ -3220,6 +3856,13 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				}
 				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
 					return nil, err
+				}
+				if existed {
+					if len(current) > 0 {
+						if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
+							return nil, err
+						}
+					}
 				}
 				writeByTable[tableName] += writeUnits
 				if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
@@ -3488,6 +4131,16 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
 				return nil, err
 			}
+			eventName := "INSERT"
+			streamOld := current
+			if itemExisted {
+				eventName = "MODIFY"
+			} else {
+				streamOld = nil
+			}
+			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
+				return nil, err
+			}
 			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
 			continue
 		}
@@ -3533,6 +4186,11 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			}
 			if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 				return nil, err
+			}
+			if itemExisted {
+				if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
+					return nil, err
+				}
 			}
 			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
 			continue
@@ -3604,6 +4262,16 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
 			}
 			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
+				return nil, err
+			}
+			eventName := "INSERT"
+			streamOld := existing
+			if itemExisted {
+				eventName = "MODIFY"
+			} else {
+				streamOld = nil
+			}
+			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
 			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))

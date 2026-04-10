@@ -51,6 +51,10 @@ func IdempotentParameterMismatch(msg string) *APIError {
 	return &APIError{Code: "IdempotentParameterMismatchException", Message: msg, Status: http.StatusBadRequest}
 }
 
+func ExpiredIterator(msg string) *APIError {
+	return &APIError{Code: "ExpiredIteratorException", Message: msg, Status: http.StatusBadRequest}
+}
+
 type CancellationReason struct {
 	Code    string         `json:"Code"`
 	Message string         `json:"Message,omitempty"`

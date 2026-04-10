@@ -21,8 +21,12 @@ const contentSHA256Header = "x-amz-content-sha256"
 const contentSHA256UnsignedPayload = "UNSIGNED-PAYLOAD"
 
 const signatureAlgorithm = "AWS4-HMAC-SHA256"
-const expectedService = "dynamodb"
 const expectedRequest = "aws4_request"
+
+var allowedServices = map[string]struct{}{
+	"dynamodb":        {},
+	"dynamodbstreams": {},
+}
 
 type AccessKeyIDContextKey struct{}
 type AuthTypeContextKey struct{}
@@ -280,14 +284,15 @@ func checkAuthentication(validCredentials []Credentials, expectedRegion string, 
 	if region != expectedRegion {
 		return nil, false
 	}
-	if accessKeyIDAndScope[3] != expectedService {
+	service := accessKeyIDAndScope[3]
+	if _, ok := allowedServices[service]; !ok {
 		return nil, false
 	}
 	if accessKeyIDAndScope[4] != expectedRequest {
 		return nil, false
 	}
 
-	scope := createScope(expectedDate, region, expectedService, expectedRequest)
+	scope := createScope(expectedDate, region, service, expectedRequest)
 
 	parsedTimestamp, err := time.Parse("20060102T150405Z", timestamp)
 	if err != nil {
@@ -321,7 +326,7 @@ func checkAuthentication(validCredentials []Credentials, expectedRegion string, 
 	if err != nil {
 		return nil, false
 	}
-	signingKey := createSigningKey(expectedCredentials.SecretAccessKey, expectedDate, region, expectedService, expectedRequest)
+	signingKey := createSigningKey(expectedCredentials.SecretAccessKey, expectedDate, region, service, expectedRequest)
 	calculatedSignature := createSignature(signingKey, *stringToSign)
 	isSignatureValid := subtle.ConstantTimeCompare([]byte(signature), []byte(calculatedSignature)) == 1
 	if !isSignatureValid {

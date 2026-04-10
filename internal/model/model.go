@@ -99,6 +99,17 @@ type ItemChange struct {
 	Sequence   int64
 }
 
+type StreamRecord struct {
+	StreamARN string
+	ShardID   string
+	EventName string
+	Keys      map[string]any
+	OldImage  map[string]any
+	NewImage  map[string]any
+	ChangedAt int64
+	Sequence  int64
+}
+
 type ItemChangeCursor struct {
 	Found     bool
 	ChangedAt int64
