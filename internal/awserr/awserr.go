@@ -55,6 +55,10 @@ func ExpiredIterator(msg string) *APIError {
 	return &APIError{Code: "ExpiredIteratorException", Message: msg, Status: http.StatusBadRequest}
 }
 
+func PolicyNotFound(msg string) *APIError {
+	return &APIError{Code: "PolicyNotFoundException", Message: msg, Status: http.StatusBadRequest}
+}
+
 type CancellationReason struct {
 	Code    string         `json:"Code"`
 	Message string         `json:"Message,omitempty"`

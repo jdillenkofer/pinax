@@ -55,4 +55,7 @@ type Store interface {
 	GetStreamSequenceBounds(ctx context.Context, tx *sql.Tx, streamARN string) (int64, int64, bool, error)
 	GetStreamRecordChangedAt(ctx context.Context, tx *sql.Tx, streamARN string, sequence int64) (int64, bool, error)
 	DeleteStreamRecordsBefore(ctx context.Context, tx *sql.Tx, streamARN string, before int64) (int64, error)
+	PutResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string, policy string, revisionID string, updatedAt int64) error
+	GetResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string) (string, string, error)
+	DeleteResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string) (string, bool, error)
 }

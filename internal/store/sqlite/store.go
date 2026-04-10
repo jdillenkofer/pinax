@@ -1467,6 +1467,43 @@ func streamTableNameFromARN(streamARN string) string {
 	return strings.TrimSpace(remainder)
 }
 
+func (s *Store) PutResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string, policy string, revisionID string, updatedAt int64) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO resource_policies(resource_arn, policy_json, revision_id, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(resource_arn) DO UPDATE SET
+			policy_json = excluded.policy_json,
+			revision_id = excluded.revision_id,
+			updated_at = excluded.updated_at
+	`, resourceARN, policy, revisionID, updatedAt)
+	return err
+}
+
+func (s *Store) GetResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string) (string, string, error) {
+	var policy string
+	var revisionID string
+	err := tx.QueryRowContext(ctx, `SELECT policy_json, revision_id FROM resource_policies WHERE resource_arn = ?`, resourceARN).Scan(&policy, &revisionID)
+	if err != nil {
+		return "", "", err
+	}
+	return policy, revisionID, nil
+}
+
+func (s *Store) DeleteResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string) (string, bool, error) {
+	_, revisionID, err := s.GetResourcePolicy(ctx, tx, resourceARN)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM resource_policies WHERE resource_arn = ?`, resourceARN)
+	if err != nil {
+		return "", false, err
+	}
+	return revisionID, true, nil
+}
+
 type backupScanner interface {
 	Scan(dest ...any) error
 }

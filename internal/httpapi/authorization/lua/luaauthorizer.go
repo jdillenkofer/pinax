@@ -623,6 +623,8 @@ func isReadOnly(operation string) bool {
 		return true
 	case "DescribeBackup", "ListBackups", "ListTagsOfResource":
 		return true
+	case "GetResourcePolicy":
+		return true
 	case "ListStreams", "DescribeStream", "GetShardIterator", "GetRecords":
 		return true
 	case "CreateTable", "DeleteTable", "PutItem", "DeleteItem", "UpdateItem", "BatchWriteItem", "CreateBackup", "DeleteBackup", "RestoreTableFromBackup", "UpdateContinuousBackups", "RestoreTableToPointInTime", "TagResource", "UntagResource":
