@@ -271,6 +271,8 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	if err != nil {
 		t.Fatal(err)
 	}
+	createTableStatus := descAfterCreate.Table.TableStatus
+	updateTableStatus := createTableStatus
 	crcDescribeTableValid := crcHeaderParseable(cc.recorder.last())
 
 	for _, sk := range []string{"1", "2", "10"} {
@@ -391,28 +393,7 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	batchWriteDupCode := apiErrorCode(err)
 	batchWriteDupHasMsg := apiErrorMessage(err) != ""
 
-	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
-		TableName: aws.String(table),
-		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String("gsiPk"), AttributeType: types.ScalarAttributeTypeS},
-		},
-		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{{
-			Create: &types.CreateGlobalSecondaryIndexAction{
-				IndexName:  aws.String("gsi_1"),
-				KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("gsiPk"), KeyType: types.KeyTypeHash}},
-				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-			},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	descAfterUpdate, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal, TransactItems: []types.TransactWriteItem{
+	txCancelInput := &dynamodb.TransactWriteItemsInput{ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal, TransactItems: []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: aws.String(table),
 			Key: map[string]types.AttributeValue{
@@ -428,7 +409,8 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 			},
 		}},
 		{Put: &types.Put{TableName: aws.String(table), Item: map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "u#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}}}},
-	}})
+	}}
+	_, err = client.TransactWriteItems(ctx, txCancelInput)
 	if err == nil {
 		t.Fatal("expected transaction cancellation")
 	}
@@ -509,6 +491,51 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	statusTable := fmt.Sprintf("cf_status_%s_%d", prefix, time.Now().UnixNano())
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(statusTable),
+		AttributeDefinitions: []types.AttributeDefinition{{
+			AttributeName: aws.String("pk"),
+			AttributeType: types.ScalarAttributeTypeS,
+		}},
+		KeySchema: []types.KeySchemaElement{{
+			AttributeName: aws.String("pk"),
+			KeyType:       types.KeyTypeHash,
+		}},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusDescAfterCreate, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(statusTable)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createTableStatus = statusDescAfterCreate.Table.TableStatus
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String(statusTable),
+		AttributeDefinitions: []types.AttributeDefinition{{
+			AttributeName: aws.String("gsiPk"),
+			AttributeType: types.ScalarAttributeTypeS,
+		}},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{{
+			Create: &types.CreateGlobalSecondaryIndexAction{
+				IndexName:  aws.String("gsi_1"),
+				KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("gsiPk"), KeyType: types.KeyTypeHash}},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusDescAfterUpdate, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(statusTable)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateTableStatus = statusDescAfterUpdate.Table.TableStatus
 
 	indexTable := fmt.Sprintf("cf_idx_%s_%d", prefix, time.Now().UnixNano())
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
@@ -716,8 +743,8 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 		NestedPathFilterCount:    nestedScan.Count,
 		IfNotExistsInitialized:   missingCounterAttr.Value == "1" && counterAttr.Value == "2",
 		ListAppendLength:         len(tagsAttr.Value),
-		CreateTableStatus:        descAfterCreate.Table.TableStatus,
-		UpdateTableStatus:        descAfterUpdate.Table.TableStatus,
+		CreateTableStatus:        createTableStatus,
+		UpdateTableStatus:        updateTableStatus,
 		BatchGetDupErrorCode:     batchGetDupCode,
 		BatchWriteDupErrorCode:   batchWriteDupCode,
 		TransactionErrorCode:     txCode,

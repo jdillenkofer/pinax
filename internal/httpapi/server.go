@@ -443,6 +443,12 @@ func (s *Server) dispatch(r *http.Request, operation string, body []byte) (map[s
 		return s.getResourcePolicy(r, body)
 	case "DeleteResourcePolicy":
 		return s.deleteResourcePolicy(r, body)
+	case "ExecuteStatement":
+		return s.executeStatement(r, body)
+	case "BatchExecuteStatement":
+		return s.batchExecuteStatement(r, body)
+	case "ExecuteTransaction":
+		return s.executeTransaction(r, body)
 	case "ListStreams":
 		return s.listStreams(r, body)
 	case "DescribeStream":
