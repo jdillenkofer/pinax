@@ -503,31 +503,48 @@ func (s *Store) Scan(ctx context.Context, tx *sql.Tx, tableName, startPK, startS
 }
 
 func (s *Store) BackfillGSIEntries(ctx context.Context, tx *sql.Tx, tableName string, gsi model.GlobalSecondaryIndex) error {
+	const backfillPageSize = 500
+
 	t, err := s.GetTable(ctx, tx, tableName)
-	if err != nil {
-		return err
-	}
-	items, err := s.Scan(ctx, tx, tableName, "", "", 0)
 	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND index_name = ?`, tableName, gsi.IndexName); err != nil {
 		return err
 	}
-	for _, item := range items {
-		pk, sk, err := model.ExtractItemKeys(t, item)
+
+	startPK := ""
+	startSK := ""
+	for {
+		items, err := s.Scan(ctx, tx, tableName, startPK, startSK, backfillPageSize)
 		if err != nil {
 			return err
 		}
-		gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
-		if !ok {
-			continue
+		if len(items) == 0 {
+			break
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, tableName, gsi.IndexName, gpk, gsk, pk, sk); err != nil {
-			return err
+
+		for _, item := range items {
+			pk, sk, err := model.ExtractItemKeys(t, item)
+			if err != nil {
+				return err
+			}
+			startPK, startSK = pk, sk
+
+			gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
+			if !ok {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
+				VALUES (?, ?, ?, ?, ?, ?)
+			`, tableName, gsi.IndexName, gpk, gsk, pk, sk); err != nil {
+				return err
+			}
+		}
+
+		if len(items) < backfillPageSize {
+			break
 		}
 	}
 	return nil
