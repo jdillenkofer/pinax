@@ -320,8 +320,7 @@ jobs:
           sha256sum * > checksums.txt
 
           cosign sign-blob --yes \
-            --output-certificate checksums.txt.pem \
-            --output-signature checksums.txt.sig \
+            --bundle checksums.txt.sigstore.json \
             checksums.txt
       - name: Create Release
         uses: softprops/action-gh-release@v2.6.1
