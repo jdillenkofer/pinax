@@ -3372,19 +3372,6 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
 			return nil, err
 		}
-		items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
-		if err != nil {
-			return nil, err
-		}
-		for _, item := range items {
-			pk, sk, err := model.ExtractItemKeys(t, item)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, item); err != nil {
-				return nil, err
-			}
-		}
 	}
 
 	count, err := s.store.CountItems(r.Context(), tx, t.Name)
@@ -3709,7 +3696,7 @@ func applyGSIUpdates(table model.Table, updates []struct {
 			RangeKey:       rangeKey,
 			RangeType:      rangeType,
 			Status:         model.IndexStatusCreating,
-			StatusAt:       now + lifecycleDelayMillis(),
+			StatusAt:       0,
 			ReadCapacity:   gReadCapacity,
 			WriteCapacity:  gWriteCapacity,
 			ProjectionType: projectionType,
@@ -3861,7 +3848,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		}
 		items, err = orderItemsForGSI(items, t, *queryGSI, req.ExclusiveStartKey, scanForward)
 	} else if queryLSI != nil {
-		items, err = s.store.QueryByPK(r.Context(), tx, t.Name, pk, "", true, 0)
+		items, err = s.store.QueryByGSI(r.Context(), tx, t.Name, req.IndexName, pk, "", true, 0)
 		if err != nil {
 			return nil, err
 		}

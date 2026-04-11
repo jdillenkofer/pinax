@@ -126,7 +126,12 @@ func TestConformanceAgainstDynamoDBLocal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pinaxSrv := httptest.NewServer(NewServer(store, nil))
+	pinaxHandler := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go pinaxHandler.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+
+	pinaxSrv := httptest.NewServer(pinaxHandler)
 	t.Cleanup(pinaxSrv.Close)
 
 	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)
@@ -531,11 +536,21 @@ func runConformanceScenario(ctx context.Context, t *testing.T, cc conformanceCli
 	if err != nil {
 		t.Fatal(err)
 	}
-	statusDescAfterUpdate, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(statusTable)})
-	if err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		statusDescAfterUpdate, descErr := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(statusTable)})
+		if descErr != nil {
+			t.Fatal(descErr)
+		}
+		updateTableStatus = statusDescAfterUpdate.Table.TableStatus
+		if updateTableStatus != types.TableStatusUpdating {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("table %s remained UPDATING after UpdateTable", statusTable)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	updateTableStatus = statusDescAfterUpdate.Table.TableStatus
 
 	indexTable := fmt.Sprintf("cf_idx_%s_%d", prefix, time.Now().UnixNano())
 	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{

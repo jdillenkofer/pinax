@@ -21,6 +21,7 @@ type Store interface {
 	QueryByGSI(ctx context.Context, tx *sql.Tx, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
 	QueryByPKSK(ctx context.Context, tx *sql.Tx, tableKey, pk, sk string) ([]map[string]any, error)
 	Scan(ctx context.Context, tx *sql.Tx, tableKey, startPK, startSK string, limit int) ([]map[string]any, error)
+	BackfillGSIEntries(ctx context.Context, tx *sql.Tx, tableKey string, gsi model.GlobalSecondaryIndex) error
 	UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
 	UpdateTableBilling(ctx context.Context, tx *sql.Tx, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
 	UpdateTableOptions(ctx context.Context, tx *sql.Tx, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error

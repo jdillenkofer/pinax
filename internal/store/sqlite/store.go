@@ -111,14 +111,6 @@ func applyDatabaseMigrations(db *sql.DB) error {
 }
 
 func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) error {
-	gsiJSON, err := json.Marshal(t.GSIs)
-	if err != nil {
-		return err
-	}
-	lsiJSON, err := json.Marshal(t.LSIs)
-	if err != nil {
-		return err
-	}
 	ttlEnabled := 0
 	if t.TimeToLive.Enabled {
 		ttlEnabled = 1
@@ -153,10 +145,13 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 		pitrRecoveryDays = 35
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, string(gsiJSON), string(lsiJSON), t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt, pitrEnabled, pitrRecoveryDays, t.PITR.EnabledAt)
+		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt, pitrEnabled, pitrRecoveryDays, t.PITR.EnabledAt)
 	if err != nil {
+		return err
+	}
+	if err := s.replaceSecondaryIndexes(ctx, tx, t.Name, t.GSIs, t.LSIs); err != nil {
 		return err
 	}
 	return nil
@@ -182,8 +177,6 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var tagsJSON string
 	var readCapacityUnits int64
 	var writeCapacityUnits int64
-	var gsiJSON string
-	var lsiJSON string
 	var ttlEnabled int
 	var ttlAttr sql.NullString
 	var ttlStatus string
@@ -192,10 +185,10 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var pitrRecoveryDays int64
 	var pitrEnabledAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, gsi_json, lsi_json, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at
+		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at
 		FROM tables
 		WHERE name = ?
-	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &gsiJSON, &lsiJSON, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt, &pitrEnabled, &pitrRecoveryDays, &pitrEnabledAt)
+	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt, &pitrEnabled, &pitrRecoveryDays, &pitrEnabledAt)
 	if err != nil {
 		return model.Table{}, err
 	}
@@ -221,16 +214,12 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	t.WriteCapacityUnits = writeCapacityUnits
 	t.Status = tableStatus
 	t.StatusAt = tableStatusAt
-	if strings.TrimSpace(gsiJSON) != "" {
-		if err := json.Unmarshal([]byte(gsiJSON), &t.GSIs); err != nil {
-			return model.Table{}, err
-		}
+	gsis, lsis, err := s.loadSecondaryIndexes(ctx, tx, t.Name)
+	if err != nil {
+		return model.Table{}, err
 	}
-	if strings.TrimSpace(lsiJSON) != "" {
-		if err := json.Unmarshal([]byte(lsiJSON), &t.LSIs); err != nil {
-			return model.Table{}, err
-		}
-	}
+	t.GSIs = gsis
+	t.LSIs = lsis
 	t.TimeToLive.Enabled = ttlEnabled == 1
 	t.TimeToLive.AttrName = ttlAttr.String
 	t.TimeToLive.Status = ttlStatus
@@ -326,8 +315,7 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 		return err
 	}
 
-	// Delete old GSI entries
-	_, err = tx.ExecContext(ctx, `DELETE FROM item_gsis WHERE table_key = ? AND pk = ? AND sk = ?`, tableName, pk, sk)
+	_, err = tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND base_pk = ? AND base_sk = ?`, tableName, pk, sk)
 	if err != nil {
 		return err
 	}
@@ -338,9 +326,22 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 			continue
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO item_gsis(table_key, pk, sk, index_name, gsi_pk, gsi_sk)
+			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`, tableName, pk, sk, gsi.IndexName, gpk, gsk)
+		`, tableName, gsi.IndexName, gpk, gsk, pk, sk)
+		if err != nil {
+			return err
+		}
+	}
+	for _, lsi := range t.LSIs {
+		lsk, ok := model.ExtractLSISortKey(lsi, item)
+		if !ok {
+			continue
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, tableName, lsi.IndexName, pk, lsk, pk, sk)
 		if err != nil {
 			return err
 		}
@@ -427,10 +428,10 @@ func (s *Store) QueryByGSI(ctx context.Context, tx *sql.Tx, tableName, indexName
 		comp = "<"
 	}
 	q := fmt.Sprintf(`
-		SELECT i.item_json FROM item_gsis g
-		JOIN items i ON g.table_key = i.table_key AND g.pk = i.pk AND g.sk = i.sk
-		WHERE g.table_key = ? AND g.index_name = ? AND g.gsi_pk = ? AND g.gsi_sk %s ?
-		ORDER BY g.gsi_sk %s
+		SELECT i.item_json FROM secondary_index_entries e
+		JOIN items i ON e.table_key = i.table_key AND e.base_pk = i.pk AND e.base_sk = i.sk
+		WHERE e.table_key = ? AND e.index_name = ? AND e.index_pk = ? AND e.index_sk %s ?
+		ORDER BY e.index_sk %s
 	`, comp, order)
 	args := []any{tableName, indexName, pk, startSK}
 	if limit > 0 {
@@ -501,6 +502,201 @@ func (s *Store) Scan(ctx context.Context, tx *sql.Tx, tableName, startPK, startS
 	return items, rows.Err()
 }
 
+func (s *Store) BackfillGSIEntries(ctx context.Context, tx *sql.Tx, tableName string, gsi model.GlobalSecondaryIndex) error {
+	t, err := s.GetTable(ctx, tx, tableName)
+	if err != nil {
+		return err
+	}
+	items, err := s.Scan(ctx, tx, tableName, "", "", 0)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND index_name = ?`, tableName, gsi.IndexName); err != nil {
+		return err
+	}
+	for _, item := range items {
+		pk, sk, err := model.ExtractItemKeys(t, item)
+		if err != nil {
+			return err
+		}
+		gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
+		if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, tableName, gsi.IndexName, gpk, gsk, pk, sk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) loadSecondaryIndexes(ctx context.Context, tx *sql.Tx, tableName string) ([]model.GlobalSecondaryIndex, []model.LocalSecondaryIndex, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT index_name, index_type, hash_key, hash_type, range_key, range_type, index_status, index_status_at, read_capacity_units, write_capacity_units, projection_type
+		FROM secondary_indexes
+		WHERE table_key = ?
+		ORDER BY index_name ASC
+	`, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		indexType string
+		gsi       model.GlobalSecondaryIndex
+		lsi       model.LocalSecondaryIndex
+	}
+	indexRows := make([]rowData, 0)
+	for rows.Next() {
+		var d rowData
+		var hashKey sql.NullString
+		var hashType sql.NullString
+		var rangeKey sql.NullString
+		var rangeType sql.NullString
+		var status sql.NullString
+		var projectionType sql.NullString
+		if err := rows.Scan(&d.gsi.IndexName, &d.indexType, &hashKey, &hashType, &rangeKey, &rangeType, &status, &d.gsi.StatusAt, &d.gsi.ReadCapacity, &d.gsi.WriteCapacity, &projectionType); err != nil {
+			return nil, nil, err
+		}
+		d.gsi.HashKey = hashKey.String
+		d.gsi.HashType = hashType.String
+		d.gsi.RangeKey = rangeKey.String
+		d.gsi.RangeType = rangeType.String
+		d.gsi.Status = status.String
+		d.gsi.ProjectionType = firstNonEmpty(projectionType.String, "ALL")
+
+		d.lsi.IndexName = d.gsi.IndexName
+		d.lsi.RangeKey = d.gsi.RangeKey
+		d.lsi.RangeType = d.gsi.RangeType
+		d.lsi.ProjectionType = d.gsi.ProjectionType
+		indexRows = append(indexRows, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	attrsRows, err := tx.QueryContext(ctx, `
+		SELECT index_name, attr_name
+		FROM secondary_index_non_key_attrs
+		WHERE table_key = ?
+		ORDER BY index_name ASC, ordinal ASC
+	`, tableName)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer attrsRows.Close()
+
+	nonKeyAttrsByIndex := map[string][]string{}
+	for attrsRows.Next() {
+		var indexName string
+		var attrName string
+		if err := attrsRows.Scan(&indexName, &attrName); err != nil {
+			return nil, nil, err
+		}
+		nonKeyAttrsByIndex[indexName] = append(nonKeyAttrsByIndex[indexName], attrName)
+	}
+	if err := attrsRows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	gsis := make([]model.GlobalSecondaryIndex, 0)
+	lsis := make([]model.LocalSecondaryIndex, 0)
+	for _, d := range indexRows {
+		switch d.indexType {
+		case "GSI":
+			d.gsi.NonKeyAttrs = append([]string(nil), nonKeyAttrsByIndex[d.gsi.IndexName]...)
+			gsis = append(gsis, d.gsi)
+		case "LSI":
+			d.lsi.NonKeyAttrs = append([]string(nil), nonKeyAttrsByIndex[d.lsi.IndexName]...)
+			lsis = append(lsis, d.lsi)
+		}
+	}
+	return gsis, lsis, nil
+}
+
+func (s *Store) replaceSecondaryIndexes(ctx context.Context, tx *sql.Tx, tableName string, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+	existingRows, err := tx.QueryContext(ctx, `SELECT index_name FROM secondary_indexes WHERE table_key = ?`, tableName)
+	if err != nil {
+		return err
+	}
+	existing := map[string]struct{}{}
+	for existingRows.Next() {
+		var indexName string
+		if err := existingRows.Scan(&indexName); err != nil {
+			existingRows.Close()
+			return err
+		}
+		existing[indexName] = struct{}{}
+	}
+	if err := existingRows.Err(); err != nil {
+		existingRows.Close()
+		return err
+	}
+	existingRows.Close()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM secondary_indexes WHERE table_key = ?`, tableName); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM secondary_index_non_key_attrs WHERE table_key = ?`, tableName); err != nil {
+		return err
+	}
+
+	keep := map[string]struct{}{}
+
+	for _, g := range gsis {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO secondary_indexes(table_key, index_name, index_type, hash_key, hash_type, range_key, range_type, index_status, index_status_at, read_capacity_units, write_capacity_units, projection_type)
+			VALUES (?, ?, 'GSI', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, tableName, g.IndexName, g.HashKey, g.HashType, nullIfEmpty(g.RangeKey), nullIfEmpty(g.RangeType), firstNonEmpty(g.Status, model.IndexStatusActive), g.StatusAt, g.ReadCapacity, g.WriteCapacity, firstNonEmpty(g.ProjectionType, "ALL"))
+		if err != nil {
+			return err
+		}
+		keep[g.IndexName] = struct{}{}
+		for i, attr := range g.NonKeyAttrs {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO secondary_index_non_key_attrs(table_key, index_name, attr_name, ordinal)
+				VALUES (?, ?, ?, ?)
+			`, tableName, g.IndexName, attr, i); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, l := range lsis {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO secondary_indexes(table_key, index_name, index_type, hash_key, hash_type, range_key, range_type, index_status, index_status_at, read_capacity_units, write_capacity_units, projection_type)
+			VALUES (?, ?, 'LSI', NULL, NULL, ?, ?, 'ACTIVE', 0, 0, 0, ?)
+		`, tableName, l.IndexName, l.RangeKey, l.RangeType, firstNonEmpty(l.ProjectionType, "ALL"))
+		if err != nil {
+			return err
+		}
+		keep[l.IndexName] = struct{}{}
+		for i, attr := range l.NonKeyAttrs {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO secondary_index_non_key_attrs(table_key, index_name, attr_name, ordinal)
+				VALUES (?, ?, ?, ?)
+			`, tableName, l.IndexName, attr, i); err != nil {
+				return err
+			}
+		}
+	}
+
+	for indexName := range existing {
+		if _, ok := keep[indexName]; ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND index_name = ?`, tableName, indexName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func decodeItem(raw []byte) (map[string]any, error) {
 	var item map[string]any
 	if err := json.Unmarshal(raw, &item); err != nil {
@@ -517,19 +713,14 @@ func nullIfEmpty(s string) any {
 }
 
 func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
-	gsiJSON, err := json.Marshal(gsis)
-	if err != nil {
+	if err := s.replaceSecondaryIndexes(ctx, tx, tableName, gsis, lsis); err != nil {
 		return err
 	}
-	lsiJSON, err := json.Marshal(lsis)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		UPDATE tables
-		SET table_status = ?, table_status_at = ?, gsi_json = ?, lsi_json = ?
+		SET table_status = ?, table_status_at = ?
 		WHERE name = ?
-	`, firstNonEmpty(tableStatus, model.TableStatusActive), tableStatusAt, string(gsiJSON), string(lsiJSON), tableName)
+	`, firstNonEmpty(tableStatus, model.TableStatusActive), tableStatusAt, tableName)
 	return err
 }
 

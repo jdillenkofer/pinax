@@ -81,6 +81,7 @@ func main() {
 		requestAuthorizer,
 		httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()),
 	)
+	go srv.StartGSIBackfillWorker(context.Background(), 200*time.Millisecond)
 
 	var rootHandler http.Handler = srv
 	if s.AuthenticationEnabled() {

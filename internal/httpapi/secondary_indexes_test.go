@@ -30,7 +30,11 @@ func TestCreateTableWithGSIAndQueryByIndexName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -106,7 +110,11 @@ func TestQueryGSIKeysOnlyProjectionReturnsOnlyKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -204,7 +212,11 @@ func TestQueryGSIIncludeProjectionReturnsConfiguredNonKeyAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -309,7 +321,11 @@ func TestQueryLSIKeysOnlyProjectionAndOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -469,7 +485,11 @@ func TestUpdateTableCreateAndDeleteGSI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -603,7 +623,11 @@ func TestUpdateTableGSITransitionDelayCanBeConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	h := NewServer(store, nil)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	t.Cleanup(stopWorker)
+	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
+	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -653,19 +677,26 @@ func TestUpdateTableGSITransitionDelayCanBeConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String("orders_update_gsi_nodelay"),
-		IndexName:              aws.String("status-index"),
-		KeyConditionExpression: aws.String("status = :status"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":status": &types.AttributeValueMemberS{Value: "OPEN"},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Count != 1 {
-		t.Fatalf("expected 1 item from immediate GSI query, got %d", out.Count)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		out, qErr := client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String("orders_update_gsi_nodelay"),
+			IndexName:              aws.String("status-index"),
+			KeyConditionExpression: aws.String("status = :status"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":status": &types.AttributeValueMemberS{Value: "OPEN"},
+			},
+		})
+		if qErr == nil {
+			if out.Count != 1 {
+				t.Fatalf("expected 1 item from created GSI query, got %d", out.Count)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected GSI query to succeed after async backfill, got: %v", qErr)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

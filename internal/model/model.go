@@ -495,6 +495,18 @@ func ExtractGSIKeys(g GlobalSecondaryIndex, item map[string]any) (pk string, sk 
 	return pk, sk, true
 }
 
+func ExtractLSISortKey(l LocalSecondaryIndex, item map[string]any) (sk string, ok bool) {
+	sv, ok := item[l.RangeKey]
+	if !ok {
+		return "", false
+	}
+	sk, err := SerializeKeyValue(sv)
+	if err != nil {
+		return "", false
+	}
+	return sk, true
+}
+
 func ExtractTTL(t Table, item map[string]any) (int64, bool) {
 	if !t.TimeToLive.Enabled || t.TimeToLive.AttrName == "" {
 		return 0, false
