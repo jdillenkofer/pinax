@@ -25,6 +25,8 @@ Server defaults:
 
 - bind address: `0.0.0.0`
 - port: `8000`
+- monitoring port: `9090`
+- monitoring port enabled: `true`
 - region: `eu-central-1`
 - sqlite db: `./pinax.db`
 
@@ -39,6 +41,8 @@ Environment values override only explicitly set fields, matching the merge model
 - `-region`
 - `-bindAddress`
 - `-port`
+- `-monitoringPort`
+- `-monitoringPortEnabled`
 - `-dbPath`
 - `-authorizerPath`
 - `-trustForwardedHeaders`
@@ -51,6 +55,8 @@ Environment values override only explicitly set fields, matching the merge model
 - `PINAX_REGION`
 - `PINAX_BIND_ADDRESS`
 - `PINAX_PORT`
+- `PINAX_MONITORING_PORT`
+- `PINAX_MONITORING_PORT_ENABLED`
 - `PINAX_DB_PATH`
 - `PINAX_AUTHORIZER_PATH`
 - `PINAX_TRUST_FORWARDED_HEADERS`
@@ -61,6 +67,17 @@ Environment values override only explicitly set fields, matching the merge model
   - `PINAX_CREDENTIALS_0_SECRET_ACCESS_KEY`
   - `PINAX_CREDENTIALS_1_ACCESS_KEY_ID`
   - ...
+
+## Monitoring endpoints
+
+`/health` and `/metrics` are served on the monitoring port (default `9090`) rather than the DynamoDB API port.
+
+Examples:
+
+```bash
+curl -sS http://localhost:9090/health
+curl -sS http://localhost:9090/metrics
+```
 
 ## Authorization script
 

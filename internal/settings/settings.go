@@ -12,6 +12,8 @@ const defaultAuthenticationEnabled = true
 const defaultRegion = "eu-central-1"
 const defaultBindAddress = "0.0.0.0"
 const defaultPort = 8000
+const defaultMonitoringPort = 9090
+const defaultMonitoringPortEnabled = true
 const defaultDBPath = "./pinax.db"
 const defaultAuthorizerPath = "./authorizer.lua"
 const defaultTrustForwardedHeaders = false
@@ -31,6 +33,8 @@ type Settings struct {
 	region                        *string       `mergable:""`
 	bindAddress                   *string       `mergable:""`
 	port                          *int          `mergable:""`
+	monitoringPort                *int          `mergable:""`
+	monitoringPortEnabled         *bool         `mergable:""`
 	dbPath                        *string       `mergable:""`
 	authorizerPath                *string       `mergable:""`
 	trustForwardedHeaders         *bool         `mergable:""`
@@ -67,6 +71,14 @@ func (s *Settings) Region() string { return valueOrDefault(s.region, defaultRegi
 func (s *Settings) BindAddress() string { return valueOrDefault(s.bindAddress, defaultBindAddress) }
 
 func (s *Settings) Port() int { return valueOrDefault(s.port, defaultPort) }
+
+func (s *Settings) MonitoringPort() int {
+	return valueOrDefault(s.monitoringPort, defaultMonitoringPort)
+}
+
+func (s *Settings) MonitoringPortEnabled() bool {
+	return valueOrDefault(s.monitoringPortEnabled, defaultMonitoringPortEnabled)
+}
 
 func (s *Settings) DBPath() string { return valueOrDefault(s.dbPath, defaultDBPath) }
 

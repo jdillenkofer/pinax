@@ -39,8 +39,10 @@ func TestMetricsFailureCountersIncrement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
-	t.Cleanup(srv.Close)
+	apiSrv := httptest.NewServer(NewServer(store, nil))
+	t.Cleanup(apiSrv.Close)
+	monitoringSrv := httptest.NewServer(NewMonitoringHandler(store))
+	t.Cleanup(monitoringSrv.Close)
 
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("eu-central-1"),
@@ -49,9 +51,9 @@ func TestMetricsFailureCountersIncrement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(srv.URL) })
+	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(apiSrv.URL) })
 
-	before, err := readMetrics(srv.URL)
+	before, err := readMetrics(monitoringSrv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +125,7 @@ func TestMetricsFailureCountersIncrement(t *testing.T) {
 		t.Fatalf("expected ProvisionedThroughputExceededException, got %T: %v", err, err)
 	}
 
-	after, err := readMetrics(srv.URL)
+	after, err := readMetrics(monitoringSrv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}

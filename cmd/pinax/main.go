@@ -74,7 +74,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := httpapi.NewServer(store, requestAuthorizer, httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()))
+	srv := httpapi.NewServer(
+		store,
+		requestAuthorizer,
+		httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()),
+	)
 
 	var rootHandler http.Handler = srv
 	if s.AuthenticationEnabled() {
@@ -104,6 +108,26 @@ func main() {
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
+	}
+
+	if s.MonitoringPortEnabled() {
+		monitoringAddr := fmt.Sprintf("%s:%d", s.BindAddress(), s.MonitoringPort())
+		monitoringServer := &http.Server{
+			BaseContext:       func(net.Listener) context.Context { return context.Background() },
+			Addr:              monitoringAddr,
+			Handler:           httpapi.NewMonitoringHandler(store),
+			ReadHeaderTimeout: readHeaderTimeout,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    maxHeaderBytes,
+		}
+		go func() {
+			slog.Info("monitoring listening", "addr", monitoringAddr)
+			if err := monitoringServer.ListenAndServe(); err != nil {
+				slog.Error("monitoring server failed", "err", err)
+			}
+		}()
 	}
 
 	slog.Info("listening", "addr", addr, "dbPath", dbPath)

@@ -12,6 +12,8 @@ const authenticationEnabledEnvKey = envKeyPrefix + "_AUTHENTICATION_ENABLED"
 const regionEnvKey = envKeyPrefix + "_REGION"
 const bindAddressEnvKey = envKeyPrefix + "_BIND_ADDRESS"
 const portEnvKey = envKeyPrefix + "_PORT"
+const monitoringPortEnvKey = envKeyPrefix + "_MONITORING_PORT"
+const monitoringPortEnabledEnvKey = envKeyPrefix + "_MONITORING_PORT_ENABLED"
 const dbPathEnvKey = envKeyPrefix + "_DB_PATH"
 const authorizerPathEnvKey = envKeyPrefix + "_AUTHORIZER_PATH"
 const trustForwardedHeadersEnvKey = envKeyPrefix + "_TRUST_FORWARDED_HEADERS"
@@ -92,6 +94,8 @@ func loadSettingsFromEnv() (*Settings, error) {
 		region:                        getStringFromEnv(regionEnvKey),
 		bindAddress:                   getStringFromEnv(bindAddressEnvKey),
 		port:                          getIntFromEnv(portEnvKey),
+		monitoringPort:                getIntFromEnv(monitoringPortEnvKey),
+		monitoringPortEnabled:         getBoolFromEnv(monitoringPortEnabledEnvKey),
 		dbPath:                        getStringFromEnv(dbPathEnvKey),
 		authorizerPath:                getStringFromEnv(authorizerPathEnvKey),
 		trustForwardedHeaders:         getBoolFromEnv(trustForwardedHeadersEnvKey),

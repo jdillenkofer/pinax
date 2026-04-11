@@ -62,6 +62,8 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 	regionAccessor := registerStringFlag(serveCommand, "region", defaultRegion, "the region for the DynamoDB API")
 	bindAddressAccessor := registerStringFlag(serveCommand, "bindAddress", defaultBindAddress, "the address the server is bound to")
 	portAccessor := registerIntFlag(serveCommand, "port", defaultPort, "the port for the DynamoDB API")
+	monitoringPortAccessor := registerIntFlag(serveCommand, "monitoringPort", defaultMonitoringPort, "the monitoring port of pinax")
+	monitoringPortEnabledAccessor := registerBoolFlag(serveCommand, "monitoringPortEnabled", defaultMonitoringPortEnabled, "determines if the monitoring port of pinax is enabled or not")
 	dbPathAccessor := registerStringFlag(serveCommand, "dbPath", defaultDBPath, "the path to the sqlite database")
 	authorizerPathAccessor := registerStringFlag(serveCommand, "authorizerPath", defaultAuthorizerPath, "the path to the authorizer script")
 	trustForwardedHeadersAccessor := registerBoolFlag(serveCommand, "trustForwardedHeaders", defaultTrustForwardedHeaders, "trust client forwarding headers")
@@ -94,6 +96,8 @@ func loadSettingsFromCmdArgs(cmdArgs []string) (*Settings, error) {
 		region:                        regionAccessor(),
 		bindAddress:                   bindAddressAccessor(),
 		port:                          portAccessor(),
+		monitoringPort:                monitoringPortAccessor(),
+		monitoringPortEnabled:         monitoringPortEnabledAccessor(),
 		dbPath:                        dbPathAccessor(),
 		authorizerPath:                authorizerPathAccessor(),
 		trustForwardedHeaders:         trustForwardedHeadersAccessor(),

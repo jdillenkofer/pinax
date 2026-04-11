@@ -13,7 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func TestHealthAndReadyEndpoints(t *testing.T) {
+func TestAPIServerDoesNotServeMonitoringEndpoints(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -25,6 +25,32 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	for _, path := range []string{"/health", "/metrics", "/healthz", "/ready", "/readyz"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 for %s, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestMonitoringServerEndpoints(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store, err := sqlite.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewMonitoringHandler(store))
 	defer srv.Close()
 
 	for _, path := range []string{"/health", "/metrics"} {
@@ -54,20 +80,9 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 			}
 		}
 	}
-
-	for _, path := range []string{"/healthz", "/ready", "/readyz"} {
-		resp, err := http.Get(srv.URL + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("expected 404 for %s, got %d", path, resp.StatusCode)
-		}
-	}
 }
 
-func TestHealthEndpointReturns503WhenDBUnavailable(t *testing.T) {
+func TestMonitoringHealthEndpointReturns503WhenDBUnavailable(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +96,7 @@ func TestHealthEndpointReturns503WhenDBUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(NewMonitoringHandler(store))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/health")

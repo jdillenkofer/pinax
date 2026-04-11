@@ -101,7 +101,6 @@ type Server struct {
 	requestAuthorizer             authorization.RequestAuthorizer
 	capMu                         sync.Mutex
 	capacityWindows               map[string]capacityWindow
-	metricsHandler                http.Handler
 	pitrLatestRestorableLagMillis int64
 	streamIteratorTTL             time.Duration
 	streamIteratorSigningKey      []byte
@@ -148,7 +147,6 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 		store:                         store,
 		requestAuthorizer:             requestAuthorizer,
 		capacityWindows:               map[string]capacityWindow{},
-		metricsHandler:                promhttp.Handler(),
 		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisFromEnv(),
 		streamIteratorTTL:             defaultStreamIteratorTTL,
 		streamIteratorSigningKey:      newStreamIteratorSigningKey(),
@@ -167,19 +165,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		s.observeRequest(operation, iw.statusCode, errCode, time.Since(start))
 	}()
-
-	if r.Method == http.MethodGet {
-		switch r.URL.Path {
-		case "/health":
-			operation = "health"
-			s.serveHealth(iw, r)
-			return
-		case "/metrics":
-			operation = "metrics"
-			s.metricsHandler.ServeHTTP(iw, r)
-			return
-		}
-	}
 
 	if r.Method != http.MethodPost || r.URL.Path != "/" {
 		errCode = "NotFound"
@@ -284,14 +269,35 @@ func (w *instrumentedResponseWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-func (s *Server) serveHealth(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DB().PingContext(r.Context()); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("Unhealthy"))
+type monitoringHandler struct {
+	store          store.Store
+	metricsHandler http.Handler
+}
+
+func NewMonitoringHandler(store store.Store) http.Handler {
+	return &monitoringHandler{store: store, metricsHandler: promhttp.Handler()}
+}
+
+func (h *monitoringHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Healthy"))
+	if r.URL.Path == "/health" {
+		if err := h.store.DB().PingContext(r.Context()); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("Unhealthy"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("Healthy"))
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		h.metricsHandler.ServeHTTP(w, r)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) authorizeRequest(r *http.Request, operation string, body []byte) error {
