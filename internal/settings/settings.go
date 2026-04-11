@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -189,6 +190,32 @@ func mergeSettings(settings ...*Settings) *Settings {
 	return result
 }
 
+func validateAccountID(accountID string) error {
+	if accountID == "" {
+		return nil
+	}
+	if len(accountID) != 12 {
+		return fmt.Errorf("must be exactly 12 digits")
+	}
+	for _, r := range accountID {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("must contain only digits")
+		}
+	}
+	return nil
+}
+
+func (s *Settings) validate() error {
+	for i := range s.credentials {
+		accountID := strings.TrimSpace(s.credentials[i].AccountID)
+		if err := validateAccountID(accountID); err != nil {
+			return fmt.Errorf("credentials %d account id %q %w", i, accountID, err)
+		}
+		s.credentials[i].AccountID = accountID
+	}
+	return nil
+}
+
 func LoadSettings(cmdArgs []string) (*Settings, error) {
 	cmdArgsSettings, err := loadSettingsFromCmdArgs(cmdArgs)
 	if err != nil {
@@ -198,5 +225,9 @@ func LoadSettings(cmdArgs []string) (*Settings, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mergeSettings(cmdArgsSettings, envSettings), nil
+	settings := mergeSettings(cmdArgsSettings, envSettings)
+	if err := settings.validate(); err != nil {
+		return nil, err
+	}
+	return settings, nil
 }
