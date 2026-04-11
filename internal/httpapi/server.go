@@ -181,6 +181,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operation = op
+	slog.InfoContext(r.Context(), "DynamoDB operation", "operation", op)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -190,6 +191,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.authorizeRequest(r, op, body); err != nil {
+		slog.WarnContext(r.Context(), "request authorization failed", "operation", op, "table", tableNameFromBody(body), "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
@@ -197,7 +199,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.dispatch(r, op, body)
 	if err != nil {
-		slog.Debug("request failed", "operation", op, "err", err)
+		slog.WarnContext(r.Context(), "operation failed", "operation", op, "table", tableNameFromBody(body), "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
@@ -213,6 +215,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	iw.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(encoded)), 10))
 	_, _ = iw.Write(encoded)
+	slog.InfoContext(r.Context(), "operation succeeded", "operation", op, "table", tableNameFromBody(body))
+}
+
+func tableNameFromBody(body []byte) string {
+	var payload struct {
+		TableName string `json:"TableName"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return payload.TableName
 }
 
 func (s *Server) observeRequest(operation string, statusCode int, errorCode string, duration time.Duration) {

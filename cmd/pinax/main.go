@@ -17,6 +17,7 @@ import (
 	authorizationLua "github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/settings"
+	storepkg "github.com/jdillenkofer/pinax/internal/store"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
 	"github.com/jdillenkofer/pinax/internal/ttl"
 
@@ -62,11 +63,12 @@ func main() {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	baseStore, err := sqlite.New(db)
 	if err != nil {
 		slog.Error("could not initialize storage", "err", err)
 		os.Exit(1)
 	}
+	store := storepkg.NewLoggingStore(baseStore)
 
 	requestAuthorizer, err := loadRequestAuthorizer(s.AuthorizerPath(), len(s.Credentials()) > 0, s.TrustForwardedHeaders(), s.TrustedProxyCIDRs())
 	if err != nil {
