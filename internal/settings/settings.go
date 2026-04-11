@@ -25,6 +25,7 @@ const mergableTagKey = "mergable"
 type Credentials struct {
 	AccessKeyId     string
 	SecretAccessKey string
+	AccountID       string
 }
 
 type Settings struct {

@@ -86,7 +86,7 @@ func main() {
 	if s.AuthenticationEnabled() {
 		authCreds := make([]authentication.Credentials, 0, len(s.Credentials()))
 		for _, cred := range s.Credentials() {
-			authCreds = append(authCreds, authentication.Credentials{AccessKeyID: cred.AccessKeyId, SecretAccessKey: cred.SecretAccessKey})
+			authCreds = append(authCreds, authentication.Credentials{AccessKeyID: cred.AccessKeyId, SecretAccessKey: cred.SecretAccessKey, AccountID: cred.AccountID})
 		}
 		rootHandler = authentication.MakeSignatureMiddleware(authCreds, s.Region(), rootHandler)
 	} else {

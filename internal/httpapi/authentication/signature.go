@@ -29,6 +29,7 @@ var allowedServices = map[string]struct{}{
 }
 
 type AccessKeyIDContextKey struct{}
+type AccountIDContextKey struct{}
 type AuthTypeContextKey struct{}
 type RequestIDContextKey struct{}
 type ClientIPContextKey struct{}
@@ -37,6 +38,7 @@ type IsAuthenticatedContextKey struct{}
 type Credentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
+	AccountID       string
 }
 
 func hmacSha256(secret []byte, data []byte) []byte {
@@ -203,7 +205,7 @@ func mustBeSignedHeader(headerKey string) bool {
 	return false
 }
 
-func checkAuthentication(validCredentials []Credentials, expectedRegion string, r *http.Request) (usedAccessKeyID *string, authenticated bool) {
+func checkAuthentication(validCredentials []Credentials, expectedRegion string, r *http.Request) (usedCredentials *Credentials, authenticated bool) {
 	now := time.Now().UTC()
 	expectedDate := now.Format("20060102")
 
@@ -333,7 +335,9 @@ func checkAuthentication(validCredentials []Credentials, expectedRegion string, 
 		return nil, false
 	}
 
-	return &accessKeyID, true
+	matched := expectedCredentials
+	matched.AccessKeyID = accessKeyID
+	return &matched, true
 }
 
 func authTypeForRequest(r *http.Request) string {
@@ -368,9 +372,10 @@ func MakeSignatureMiddleware(validCredentials []Credentials, region string, next
 			return
 		}
 
-		usedAccessKeyID, isAuthenticated := checkAuthentication(validCredentials, region, r)
+		usedCredentials, isAuthenticated := checkAuthentication(validCredentials, region, r)
 		if isAuthenticated {
-			ctx := context.WithValue(r.Context(), AccessKeyIDContextKey{}, *usedAccessKeyID)
+			ctx := context.WithValue(r.Context(), AccessKeyIDContextKey{}, usedCredentials.AccessKeyID)
+			ctx = context.WithValue(ctx, AccountIDContextKey{}, usedCredentials.AccountID)
 			ctx = context.WithValue(ctx, IsAuthenticatedContextKey{}, true)
 			ctx = context.WithValue(ctx, AuthTypeContextKey{}, authTypeForRequest(r))
 			next.ServeHTTP(w, r.Clone(ctx))

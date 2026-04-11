@@ -23,14 +23,14 @@ func NewLoggingStore(base Store) Store {
 func (s *loggingStore) CreateTable(ctx context.Context, tx *sql.Tx, table model.Table) error {
 	start := time.Now()
 	err := s.Store.CreateTable(ctx, tx, table)
-	s.logResult(ctx, "CreateTable", err, "table", table.Name, "durationMs", time.Since(start).Milliseconds())
+	s.logResult(ctx, "CreateTable", err, "tableKey", table.Name, "durationMs", time.Since(start).Milliseconds())
 	return err
 }
 
-func (s *loggingStore) GetTable(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
+func (s *loggingStore) GetTable(ctx context.Context, tx *sql.Tx, tableKey string) (model.Table, error) {
 	start := time.Now()
-	t, err := s.Store.GetTable(ctx, tx, tableName)
-	s.logResult(ctx, "GetTable", err, "table", tableName, "durationMs", time.Since(start).Milliseconds())
+	t, err := s.Store.GetTable(ctx, tx, tableKey)
+	s.logResult(ctx, "GetTable", err, "tableKey", tableKey, "durationMs", time.Since(start).Milliseconds())
 	return t, err
 }
 
@@ -45,24 +45,24 @@ func (s *loggingStore) ListTables(ctx context.Context, tx *sql.Tx, startName str
 	return out, err
 }
 
-func (s *loggingStore) DeleteTable(ctx context.Context, tx *sql.Tx, tableName string) error {
+func (s *loggingStore) DeleteTable(ctx context.Context, tx *sql.Tx, tableKey string) error {
 	start := time.Now()
-	err := s.Store.DeleteTable(ctx, tx, tableName)
-	s.logResult(ctx, "DeleteTable", err, "table", tableName, "durationMs", time.Since(start).Milliseconds())
+	err := s.Store.DeleteTable(ctx, tx, tableKey)
+	s.logResult(ctx, "DeleteTable", err, "tableKey", tableKey, "durationMs", time.Since(start).Milliseconds())
 	return err
 }
 
-func (s *loggingStore) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string, item map[string]any) error {
+func (s *loggingStore) PutItem(ctx context.Context, tx *sql.Tx, tableKey, pk, sk string, item map[string]any) error {
 	start := time.Now()
-	err := s.Store.PutItem(ctx, tx, tableName, pk, sk, item)
-	s.logResult(ctx, "PutItem", err, "table", tableName, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds())
+	err := s.Store.PutItem(ctx, tx, tableKey, pk, sk, item)
+	s.logResult(ctx, "PutItem", err, "tableKey", tableKey, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds())
 	return err
 }
 
-func (s *loggingStore) GetItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) (map[string]any, error) {
+func (s *loggingStore) GetItem(ctx context.Context, tx *sql.Tx, tableKey, pk, sk string) (map[string]any, error) {
 	start := time.Now()
-	item, err := s.Store.GetItem(ctx, tx, tableName, pk, sk)
-	attrs := []any{"table", tableName, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds()}
+	item, err := s.Store.GetItem(ctx, tx, tableKey, pk, sk)
+	attrs := []any{"tableKey", tableKey, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds()}
 	if err == nil {
 		attrs = append(attrs, "found", item != nil)
 	}
@@ -70,17 +70,17 @@ func (s *loggingStore) GetItem(ctx context.Context, tx *sql.Tx, tableName, pk, s
 	return item, err
 }
 
-func (s *loggingStore) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
+func (s *loggingStore) DeleteItem(ctx context.Context, tx *sql.Tx, tableKey, pk, sk string) error {
 	start := time.Now()
-	err := s.Store.DeleteItem(ctx, tx, tableName, pk, sk)
-	s.logResult(ctx, "DeleteItem", err, "table", tableName, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds())
+	err := s.Store.DeleteItem(ctx, tx, tableKey, pk, sk)
+	s.logResult(ctx, "DeleteItem", err, "tableKey", tableKey, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds())
 	return err
 }
 
-func (s *loggingStore) QueryByPK(ctx context.Context, tx *sql.Tx, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+func (s *loggingStore) QueryByPK(ctx context.Context, tx *sql.Tx, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	start := time.Now()
-	out, err := s.Store.QueryByPK(ctx, tx, tableName, pk, startSK, scanForward, limit)
-	attrs := []any{"table", tableName, "pk", pk, "startSK", startSK, "scanForward", scanForward, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
+	out, err := s.Store.QueryByPK(ctx, tx, tableKey, pk, startSK, scanForward, limit)
+	attrs := []any{"tableKey", tableKey, "pk", pk, "startSK", startSK, "scanForward", scanForward, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
 	if err == nil {
 		attrs = append(attrs, "count", len(out))
 	}
@@ -88,10 +88,10 @@ func (s *loggingStore) QueryByPK(ctx context.Context, tx *sql.Tx, tableName, pk,
 	return out, err
 }
 
-func (s *loggingStore) QueryByGSI(ctx context.Context, tx *sql.Tx, tableName, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+func (s *loggingStore) QueryByGSI(ctx context.Context, tx *sql.Tx, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	start := time.Now()
-	out, err := s.Store.QueryByGSI(ctx, tx, tableName, indexName, pk, startSK, scanForward, limit)
-	attrs := []any{"table", tableName, "index", indexName, "pk", pk, "startSK", startSK, "scanForward", scanForward, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
+	out, err := s.Store.QueryByGSI(ctx, tx, tableKey, indexName, pk, startSK, scanForward, limit)
+	attrs := []any{"tableKey", tableKey, "index", indexName, "pk", pk, "startSK", startSK, "scanForward", scanForward, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
 	if err == nil {
 		attrs = append(attrs, "count", len(out))
 	}
@@ -99,10 +99,10 @@ func (s *loggingStore) QueryByGSI(ctx context.Context, tx *sql.Tx, tableName, in
 	return out, err
 }
 
-func (s *loggingStore) QueryByPKSK(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) ([]map[string]any, error) {
+func (s *loggingStore) QueryByPKSK(ctx context.Context, tx *sql.Tx, tableKey, pk, sk string) ([]map[string]any, error) {
 	start := time.Now()
-	out, err := s.Store.QueryByPKSK(ctx, tx, tableName, pk, sk)
-	attrs := []any{"table", tableName, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds()}
+	out, err := s.Store.QueryByPKSK(ctx, tx, tableKey, pk, sk)
+	attrs := []any{"tableKey", tableKey, "pk", pk, "sk", sk, "durationMs", time.Since(start).Milliseconds()}
 	if err == nil {
 		attrs = append(attrs, "count", len(out))
 	}
@@ -110,10 +110,10 @@ func (s *loggingStore) QueryByPKSK(ctx context.Context, tx *sql.Tx, tableName, p
 	return out, err
 }
 
-func (s *loggingStore) Scan(ctx context.Context, tx *sql.Tx, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
+func (s *loggingStore) Scan(ctx context.Context, tx *sql.Tx, tableKey, startPK, startSK string, limit int) ([]map[string]any, error) {
 	start := time.Now()
-	out, err := s.Store.Scan(ctx, tx, tableName, startPK, startSK, limit)
-	attrs := []any{"table", tableName, "startPK", startPK, "startSK", startSK, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
+	out, err := s.Store.Scan(ctx, tx, tableKey, startPK, startSK, limit)
+	attrs := []any{"tableKey", tableKey, "startPK", startPK, "startSK", startSK, "limit", limit, "durationMs", time.Since(start).Milliseconds()}
 	if err == nil {
 		attrs = append(attrs, "count", len(out))
 	}

@@ -8,6 +8,8 @@ import (
 )
 
 const NoSortKey = "__PINAX_NO_SORT_KEY__"
+const DefaultLocalAccountID = "000000000000"
+const scopedTableKeySeparator = "#"
 
 const (
 	TableStatusCreating = "CREATING"
@@ -195,6 +197,7 @@ func (t Table) KeySchema() []map[string]any {
 }
 
 func (t Table) Description(itemCount int64) map[string]any {
+	_, tableName := splitScopedTableKey(t.Name)
 	gsis := make([]map[string]any, 0, len(t.GSIs))
 	for _, g := range t.GSIs {
 		keySchema := []map[string]any{{"AttributeName": g.HashKey, "KeyType": "HASH"}}
@@ -247,7 +250,7 @@ func (t Table) Description(itemCount int64) map[string]any {
 
 	desc := map[string]any{
 		"AttributeDefinitions": t.AttributeDefinitions(),
-		"TableName":            t.Name,
+		"TableName":            tableName,
 		"TableArn":             localTableARN(t.Name),
 		"TableId":              localTableID(t.Name),
 		"KeySchema":            t.KeySchema(),
@@ -323,11 +326,21 @@ func firstNonEmpty(v, fallback string) string {
 }
 
 func localTableARN(tableName string) string {
-	return "arn:aws:dynamodb:local:000000000000:table/" + tableName
+	accountID, logicalTableName := splitScopedTableKey(tableName)
+	return "arn:aws:dynamodb:local:" + accountID + ":table/" + logicalTableName
 }
 
 func localIndexARN(tableName string, indexName string) string {
 	return localTableARN(tableName) + "/index/" + indexName
+}
+
+func splitScopedTableKey(tableName string) (string, string) {
+	tableName = strings.TrimSpace(tableName)
+	parts := strings.SplitN(tableName, scopedTableKeySeparator, 2)
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return DefaultLocalAccountID, tableName
 }
 
 func localTableID(tableName string) string {

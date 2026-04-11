@@ -284,7 +284,7 @@ func (s *Store) DeleteTable(ctx context.Context, tx *sql.Tx, name string) error 
 
 func (s *Store) CountItems(ctx context.Context, tx *sql.Tx, tableName string) (int64, error) {
 	var n int64
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM items WHERE table_name = ?`, tableName).Scan(&n)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM items WHERE table_key = ?`, tableName).Scan(&n)
 	return n, err
 }
 
@@ -292,7 +292,7 @@ func (s *Store) GetItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 	var raw []byte
 	err := tx.QueryRowContext(ctx, `
 		SELECT item_json FROM items
-		WHERE table_name = ? AND pk = ? AND sk = ?
+		WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk).Scan(&raw)
 	if err != nil {
 		return nil, err
@@ -317,9 +317,9 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO items(table_name, pk, sk, item_json, updated_at, ttl)
+		INSERT INTO items(table_key, pk, sk, item_json, updated_at, ttl)
 		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(table_name, pk, sk)
+		ON CONFLICT(table_key, pk, sk)
 		DO UPDATE SET item_json = excluded.item_json, updated_at = excluded.updated_at, ttl = excluded.ttl
 	`, tableName, pk, sk, raw, time.Now().Unix(), ttlVal)
 	if err != nil {
@@ -327,7 +327,7 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 	}
 
 	// Delete old GSI entries
-	_, err = tx.ExecContext(ctx, `DELETE FROM item_gsis WHERE table_name = ? AND pk = ? AND sk = ?`, tableName, pk, sk)
+	_, err = tx.ExecContext(ctx, `DELETE FROM item_gsis WHERE table_key = ? AND pk = ? AND sk = ?`, tableName, pk, sk)
 	if err != nil {
 		return err
 	}
@@ -338,7 +338,7 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 			continue
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO item_gsis(table_name, pk, sk, index_name, gsi_pk, gsi_sk)
+			INSERT INTO item_gsis(table_key, pk, sk, index_name, gsi_pk, gsi_sk)
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, tableName, pk, sk, gsi.IndexName, gpk, gsk)
 		if err != nil {
@@ -360,7 +360,7 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 
 func (s *Store) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
 	_, err := tx.ExecContext(ctx, `
-		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
+		DELETE FROM items WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
 	if err != nil {
 		return err
@@ -390,7 +390,7 @@ func (s *Store) QueryByPK(ctx context.Context, tx *sql.Tx, tableName, pk, startS
 	}
 	q := fmt.Sprintf(`
 		SELECT item_json FROM items
-		WHERE table_name = ? AND pk = ? AND sk %s ?
+		WHERE table_key = ? AND pk = ? AND sk %s ?
 		ORDER BY sk %s
 	`, comp, order)
 	args := []any{tableName, pk, startSK}
@@ -428,8 +428,8 @@ func (s *Store) QueryByGSI(ctx context.Context, tx *sql.Tx, tableName, indexName
 	}
 	q := fmt.Sprintf(`
 		SELECT i.item_json FROM item_gsis g
-		JOIN items i ON g.table_name = i.table_name AND g.pk = i.pk AND g.sk = i.sk
-		WHERE g.table_name = ? AND g.index_name = ? AND g.gsi_pk = ? AND g.gsi_sk %s ?
+		JOIN items i ON g.table_key = i.table_key AND g.pk = i.pk AND g.sk = i.sk
+		WHERE g.table_key = ? AND g.index_name = ? AND g.gsi_pk = ? AND g.gsi_sk %s ?
 		ORDER BY g.gsi_sk %s
 	`, comp, order)
 	args := []any{tableName, indexName, pk, startSK}
@@ -472,7 +472,7 @@ func (s *Store) QueryByPKSK(ctx context.Context, tx *sql.Tx, tableName, pk, sk s
 func (s *Store) Scan(ctx context.Context, tx *sql.Tx, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
 	q := `
 		SELECT item_json FROM items
-		WHERE table_name = ? AND (pk > ? OR (pk = ? AND sk > ?))
+		WHERE table_key = ? AND (pk > ? OR (pk = ? AND sk > ?))
 		ORDER BY pk ASC, sk ASC
 	`
 	args := []any{tableName, startPK, startPK, startSK}
@@ -605,7 +605,7 @@ func (s *Store) ListItemChangesUpTo(ctx context.Context, tx *sql.Tx, tableName s
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk, change_type, item_json, changed_at, id
 		FROM item_history
-		WHERE table_name = ? AND changed_at <= ?
+		WHERE table_key = ? AND changed_at <= ?
 		ORDER BY changed_at ASC, id ASC
 	`, tableName, upTo)
 	if err != nil {
@@ -639,7 +639,7 @@ func (s *Store) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tx *sql.T
 	err := tx.QueryRowContext(ctx, `
 		SELECT changed_at, id
 		FROM item_history
-		WHERE table_name = ? AND changed_at <= ?
+		WHERE table_key = ? AND changed_at <= ?
 		ORDER BY changed_at DESC, id DESC
 		LIMIT 1
 	`, tableName, upTo).Scan(&cursor.ChangedAt, &cursor.Sequence)
@@ -660,7 +660,7 @@ func (s *Store) ListItemChangesUpToCursor(ctx context.Context, tx *sql.Tx, table
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk, change_type, item_json, changed_at, id
 		FROM item_history
-		WHERE table_name = ?
+		WHERE table_key = ?
 		  AND (changed_at < ? OR (changed_at = ? AND id <= ?))
 		ORDER BY changed_at ASC, id ASC
 	`, tableName, cursor.ChangedAt, cursor.ChangedAt, cursor.Sequence)
@@ -700,7 +700,7 @@ func (s *Store) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tx *sq
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk, change_type, item_json, changed_at, id
 		FROM item_history
-		WHERE table_name = ?
+		WHERE table_key = ?
 		  AND (changed_at > ? OR (changed_at = ? AND id > ?))
 		  AND (changed_at < ? OR (changed_at = ? AND id <= ?))
 		ORDER BY changed_at ASC, id ASC
@@ -739,7 +739,7 @@ func (s *Store) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tx *sql.T
 	err := tx.QueryRowContext(ctx, `
 		SELECT changed_at, history_sequence
 		FROM pitr_checkpoints
-		WHERE table_name = ? AND changed_at <= ?
+		WHERE table_key = ? AND changed_at <= ?
 		ORDER BY changed_at DESC, history_sequence DESC
 		LIMIT 1
 	`, tableName, upTo).Scan(&cursor.ChangedAt, &cursor.Sequence)
@@ -775,7 +775,7 @@ func (s *Store) CreatePITRCheckpointFromCurrentState(ctx context.Context, tx *sq
 	err = tx.QueryRowContext(ctx, `
 		SELECT 1
 		FROM pitr_checkpoints
-		WHERE table_name = ? AND history_sequence = ?
+		WHERE table_key = ? AND history_sequence = ?
 		LIMIT 1
 	`, tableName, sequence).Scan(&existing)
 	if err == nil {
@@ -788,7 +788,7 @@ func (s *Store) CreatePITRCheckpointFromCurrentState(ctx context.Context, tx *sq
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk, item_json
 		FROM items
-		WHERE table_name = ?
+		WHERE table_key = ?
 		ORDER BY pk ASC, sk ASC
 	`, tableName)
 	if err != nil {
@@ -827,7 +827,7 @@ func (s *Store) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tx 
 	err := tx.QueryRowContext(ctx, `
 		SELECT id, changed_at, history_sequence
 		FROM pitr_checkpoints
-		WHERE table_name = ?
+		WHERE table_key = ?
 		  AND (changed_at < ? OR (changed_at = ? AND history_sequence <= ?))
 		ORDER BY changed_at DESC, history_sequence DESC
 		LIMIT 1
@@ -883,7 +883,7 @@ func (s *Store) listPITRCheckpointItems(ctx context.Context, tx *sql.Tx, checkpo
 func (s *Store) DeleteItemChangesBefore(ctx context.Context, tx *sql.Tx, tableName string, before int64) (int64, error) {
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM item_history
-		WHERE table_name = ? AND changed_at < ?
+		WHERE table_key = ? AND changed_at < ?
 	`, tableName, before)
 	if err != nil {
 		return 0, err
@@ -903,7 +903,7 @@ func (s *Store) CompactItemChangesBefore(ctx context.Context, tx *sql.Tx, tableN
 	err := tx.QueryRowContext(ctx, `
 		SELECT 1
 		FROM item_history
-		WHERE table_name = ? AND changed_at < ?
+		WHERE table_key = ? AND changed_at < ?
 		LIMIT 1
 	`, tableName, before).Scan(&hasRows)
 	if err != nil {
@@ -935,7 +935,7 @@ func (s *Store) createPITRCheckpointForCursor(ctx context.Context, tx *sql.Tx, t
 	err := tx.QueryRowContext(ctx, `
 		SELECT 1
 		FROM pitr_checkpoints
-		WHERE table_name = ? AND history_sequence = ?
+		WHERE table_key = ? AND history_sequence = ?
 		LIMIT 1
 	`, tableName, cursor.Sequence).Scan(&existing)
 	if err == nil {
@@ -999,7 +999,7 @@ func (s *Store) createPITRCheckpointForCursor(ctx context.Context, tx *sql.Tx, t
 
 func (s *Store) insertPITRCheckpoint(ctx context.Context, tx *sql.Tx, tableName string, changedAt int64, sequence int64, items []model.PITRCheckpointItem) error {
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO pitr_checkpoints(table_name, changed_at, history_sequence, created_at)
+		INSERT INTO pitr_checkpoints(table_key, changed_at, history_sequence, created_at)
 		VALUES (?, ?, ?, ?)
 	`, tableName, changedAt, sequence, time.Now().UnixMilli())
 	if err != nil {
@@ -1057,7 +1057,7 @@ func (s *Store) appendItemHistory(ctx context.Context, tx *sql.Tx, tableName, pk
 		raw = string(payload)
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO item_history(table_name, pk, sk, change_type, item_json, changed_at)
+		INSERT INTO item_history(table_key, pk, sk, change_type, item_json, changed_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, tableName, pk, sk, changeType, raw, changedAt)
 	return err
@@ -1107,7 +1107,7 @@ func (s *Store) GetExpiredItems(ctx context.Context, tx *sql.Tx, tableName strin
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pk, sk FROM items
-		WHERE table_name = ? AND ttl > 0 AND ttl < ?
+		WHERE table_key = ? AND ttl > 0 AND ttl < ?
 		ORDER BY ttl ASC, pk ASC, sk ASC
 		LIMIT ?
 	`, tableName, before, limit)
@@ -1140,7 +1140,7 @@ func (s *Store) DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		DELETE FROM items WHERE table_name = ? AND pk = ? AND sk = ?
+		DELETE FROM items WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
 	if err != nil {
 		return err
@@ -1192,7 +1192,7 @@ func (s *Store) CreateBackup(ctx context.Context, tx *sql.Tx, backup model.Backu
 		INSERT INTO backups(
 			backup_arn,
 			backup_name,
-			table_name,
+			table_key,
 			table_arn,
 			table_id,
 			backup_status,
@@ -1228,7 +1228,7 @@ func (s *Store) GetBackup(ctx context.Context, tx *sql.Tx, backupARN string) (mo
 		SELECT
 			backup_arn,
 			backup_name,
-			table_name,
+			table_key,
 			table_arn,
 			table_id,
 			backup_status,
@@ -1258,7 +1258,7 @@ func (s *Store) GetBackupByName(ctx context.Context, tx *sql.Tx, backupName stri
 		SELECT
 			backup_arn,
 			backup_name,
-			table_name,
+			table_key,
 			table_arn,
 			table_id,
 			backup_status,
@@ -1288,7 +1288,7 @@ func (s *Store) ListBackups(ctx context.Context, tx *sql.Tx) ([]model.Backup, er
 		SELECT
 			backup_arn,
 			backup_name,
-			table_name,
+			table_key,
 			table_arn,
 			table_id,
 			backup_status,
@@ -1356,7 +1356,7 @@ func (s *Store) AppendStreamRecord(ctx context.Context, tx *sql.Tx, record model
 		newImage = newJSON
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO stream_records(table_name, stream_arn, shard_id, event_name, keys_json, old_image_json, new_image_json, changed_at)
+		INSERT INTO stream_records(table_key, stream_arn, shard_id, event_name, keys_json, old_image_json, new_image_json, changed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, streamTableNameFromARN(record.StreamARN), record.StreamARN, firstNonEmpty(record.ShardID, "shardId-000000000000"), record.EventName, keysJSON, oldImage, newImage, record.ChangedAt)
 	return err
@@ -1451,6 +1451,11 @@ func (s *Store) DeleteStreamRecordsBefore(ctx context.Context, tx *sql.Tx, strea
 }
 
 func streamTableNameFromARN(streamARN string) string {
+	accountID := "000000000000"
+	parts := strings.SplitN(strings.TrimSpace(streamARN), ":", 6)
+	if len(parts) >= 5 && strings.TrimSpace(parts[4]) != "" {
+		accountID = strings.TrimSpace(parts[4])
+	}
 	marker := "/table/"
 	start := strings.Index(streamARN, marker)
 	if start < 0 {
@@ -1464,7 +1469,11 @@ func streamTableNameFromARN(streamARN string) string {
 	if slash := strings.Index(remainder, "/"); slash >= 0 {
 		remainder = remainder[:slash]
 	}
-	return strings.TrimSpace(remainder)
+	remainder = strings.TrimSpace(remainder)
+	if remainder == "" {
+		return ""
+	}
+	return accountID + "#" + remainder
 }
 
 func (s *Store) PutResourcePolicy(ctx context.Context, tx *sql.Tx, resourceARN string, policy string, revisionID string, updatedAt int64) error {

@@ -57,6 +57,8 @@ const (
 	streamResponseMaxBytes                    = 1024 * 1024
 	streamDefaultShardID                      = "shardId-000000000000"
 	maxResourcePolicyBytes                    = 20 * 1024
+	defaultLocalAccountID                     = "000000000000"
+	scopedTableKeySeparator                   = "#"
 )
 
 const policyNotFoundMessage = "The operation tried to access a nonexistent resource-based policy."
@@ -314,6 +316,10 @@ func (h *monitoringHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authorizeRequest(r *http.Request, operation string, body []byte) error {
+	if v, ok := r.Context().Value(authentication.IsAuthenticatedContextKey{}).(bool); ok && !v {
+		return &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
+	}
+
 	if s.requestAuthorizer == nil {
 		return nil
 	}
@@ -584,8 +590,10 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	accountID := accountIDFromContext(r.Context())
+	scopedTableKey := scopedTableKeyFromAccountAndName(accountID, req.TableName)
 	if streamSpec.Enabled {
-		setStreamMetadata(&streamSpec, req.TableName)
+		setStreamMetadata(&streamSpec, accountID, req.TableName)
 	}
 	sseSpec, err := normalizeSSESpecCreate(req.SSESpecification)
 	if err != nil {
@@ -598,7 +606,7 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 
 	now := lifecycleNow()
 	t := model.Table{
-		Name:               req.TableName,
+		Name:               scopedTableKey,
 		HashKey:            hashKey,
 		HashType:           hashType,
 		RangeKey:           rangeKey,
@@ -802,21 +810,49 @@ func (s *Server) listTables(r *http.Request, body []byte) (map[string]any, error
 	}
 	defer tx.Rollback()
 
-	names, err := s.store.ListTables(r.Context(), tx, req.ExclusiveStartTableName, req.Limit)
-	if err != nil {
-		return nil, err
+	accountID := accountIDFromContext(r.Context())
+	startName := ""
+	if strings.TrimSpace(req.ExclusiveStartTableName) != "" {
+		startName = scopedTableKeyFromAccountAndName(accountID, req.ExclusiveStartTableName)
 	}
-	filtered := make([]string, 0, len(names))
-	for _, name := range names {
-		t, err := s.getTableWithLifecycle(r.Context(), tx, name)
+	batchLimit := req.Limit
+	if batchLimit <= 0 {
+		batchLimit = 100
+	}
+	filtered := make([]string, 0, batchLimit)
+	for {
+		names, err := s.store.ListTables(r.Context(), tx, startName, batchLimit)
 		if err != nil {
-			var apiErr *awserr.APIError
-			if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
-				continue
-			}
 			return nil, err
 		}
-		filtered = append(filtered, t.Name)
+		if len(names) == 0 {
+			break
+		}
+		for _, name := range names {
+			startName = name
+			storedAccountID, storedTableName := splitScopedTableKey(name)
+			if storedAccountID != accountID {
+				continue
+			}
+			t, err := s.getTableWithLifecycle(r.Context(), tx, storedTableName)
+			if err != nil {
+				var apiErr *awserr.APIError
+				if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+					continue
+				}
+				return nil, err
+			}
+			filtered = append(filtered, logicalTableNameFromKey(t.Name))
+			if req.Limit > 0 && len(filtered) >= req.Limit {
+				break
+			}
+		}
+		if req.Limit > 0 && len(filtered) >= req.Limit {
+			break
+		}
+		if len(names) < batchLimit {
+			break
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -824,7 +860,7 @@ func (s *Server) listTables(r *http.Request, body []byte) (map[string]any, error
 	}
 
 	resp := map[string]any{"TableNames": filtered}
-	if req.Limit > 0 && len(filtered) == req.Limit {
+	if req.Limit > 0 && len(filtered) >= req.Limit {
 		resp["LastEvaluatedTableName"] = filtered[len(filtered)-1]
 	}
 	return resp, nil
@@ -848,7 +884,7 @@ func (s *Server) deleteTable(r *http.Request, body []byte) (map[string]any, erro
 	if t.Status == model.TableStatusDeleting {
 		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
 	}
-	count, err := s.store.CountItems(r.Context(), tx, req.TableName)
+	count, err := s.store.CountItems(r.Context(), tx, t.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -945,7 +981,10 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	tableName := normalizeTableNameIdentifier(req.TableName)
+	tableName, _, _, err := parseTableARN(req.TableName)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
 	if err != nil {
 		return nil, err
@@ -1017,6 +1056,9 @@ func (s *Server) describeBackup(r *http.Request, body []byte) (map[string]any, e
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
 	}
+	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
+		return nil, err
+	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1044,6 +1086,9 @@ func (s *Server) deleteBackup(r *http.Request, body []byte) (map[string]any, err
 	}
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
+	}
+	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
+		return nil, err
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -1106,16 +1151,29 @@ func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, erro
 		return nil, err
 	}
 
+	currentAccountID := accountIDFromContext(r.Context())
 	tableNameFilter := normalizeTableNameIdentifier(req.TableName)
+	tableARNFilter := strings.TrimSpace(req.TableName)
+	if strings.HasPrefix(tableARNFilter, "arn:") {
+		var err error
+		tableNameFilter, err = validateTableARNAccountForRequest(r.Context(), tableARNFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
 	filtered := make([]model.Backup, 0, len(backups))
 	for _, b := range backups {
+		backupAccountID, backupTableName := splitScopedTableKey(b.TableName)
+		if backupAccountID != currentAccountID {
+			continue
+		}
 		if backupType == model.BackupTypeUser && b.BackupType != model.BackupTypeUser {
 			continue
 		}
 		if backupType == "SYSTEM" || backupType == "AWS_BACKUP" {
 			continue
 		}
-		if tableNameFilter != "" && b.TableName != tableNameFilter && b.TableARN != strings.TrimSpace(req.TableName) {
+		if tableNameFilter != "" && backupTableName != tableNameFilter && b.TableARN != tableARNFilter {
 			continue
 		}
 		if req.TimeRangeLowerBound != nil && float64(b.BackupCreationDateTime) < *req.TimeRangeLowerBound {
@@ -1124,6 +1182,7 @@ func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, erro
 		if req.TimeRangeUpperBound != nil && float64(b.BackupCreationDateTime) >= *req.TimeRangeUpperBound {
 			continue
 		}
+		b.TableName = backupTableName
 		filtered = append(filtered, b)
 	}
 
@@ -1182,6 +1241,9 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
 	}
+	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(req.TargetTableName) == "" {
 		return nil, awserr.Validation("TargetTableName is required")
 	}
@@ -1203,7 +1265,8 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 		return nil, err
 	}
 
-	if existing, err := s.store.GetTable(r.Context(), tx, req.TargetTableName); err == nil {
+	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
+	if existing, err := s.store.GetTable(r.Context(), tx, targetScopedTableKey); err == nil {
 		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
 			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
 		}
@@ -1213,7 +1276,7 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 	}
 
 	tableToCreate := backup.SnapshotTable
-	tableToCreate.Name = req.TargetTableName
+	tableToCreate.Name = targetScopedTableKey
 	tableToCreate.Status = model.TableStatusCreating
 	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
 	tableToCreate.CreatedAt = time.Now().Unix()
@@ -1388,7 +1451,7 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 	}
 	defer tx.Rollback()
 
-	t, err := s.getTableWithLifecycle(r.Context(), tx, normalizeTableNameIdentifier(req.TableName))
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1466,7 +1529,7 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 	}
 	defer tx.Rollback()
 
-	t, err := s.getTableWithLifecycle(r.Context(), tx, normalizeTableNameIdentifier(req.TableName))
+	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1512,7 +1575,7 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 	}
 	defer tx.Rollback()
 
-	sourceName := normalizeTableNameIdentifier(firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn)))
+	sourceName := firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn))
 	source, err := s.getTableWithLifecycle(r.Context(), tx, sourceName)
 	if err != nil {
 		var apiErr *awserr.APIError
@@ -1535,7 +1598,8 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return nil, &awserr.APIError{Code: "InvalidRestoreTimeException", Message: "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.", Status: http.StatusBadRequest}
 	}
 
-	if existing, err := s.store.GetTable(r.Context(), tx, req.TargetTableName); err == nil {
+	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
+	if existing, err := s.store.GetTable(r.Context(), tx, targetScopedTableKey); err == nil {
 		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
 			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
 		}
@@ -1545,7 +1609,7 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 	}
 
 	tableToCreate := source
-	tableToCreate.Name = req.TargetTableName
+	tableToCreate.Name = targetScopedTableKey
 	tableToCreate.Status = model.TableStatusCreating
 	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
 	tableToCreate.CreatedAt = time.Now().Unix()
@@ -1676,9 +1740,12 @@ func (s *Server) tagResource(r *http.Request, body []byte) (map[string]any, erro
 		return nil, awserr.Validation(err.Error())
 	}
 
-	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(req.ResourceARN)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -1727,9 +1794,12 @@ func (s *Server) untagResource(r *http.Request, body []byte) (map[string]any, er
 		return nil, awserr.Validation(err.Error())
 	}
 
-	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(req.ResourceARN)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -1767,9 +1837,12 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 		return nil, awserr.Validation("ResourceArn is required")
 	}
 
-	tableName, err := taggableTableNameFromResourceARN(req.ResourceARN)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(req.ResourceARN)
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
+	}
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
 
 	tx, err := s.store.DB().BeginTx(r.Context(), nil)
@@ -2007,7 +2080,7 @@ func validateResourcePolicyARN(resourceARN string) (string, bool, error) {
 	if !strings.HasPrefix(resourceARN, "arn:") {
 		return "", false, fmt.Errorf("ResourceArn must be a valid ARN")
 	}
-	tableName, err := taggableTableNameFromResourceARN(resourceARN)
+	tableName, _, err := taggableTableNameFromResourceARN(resourceARN)
 	if err != nil || strings.TrimSpace(tableName) == "" {
 		return "", false, fmt.Errorf("ResourceArn must identify a DynamoDB table or stream")
 	}
@@ -2254,8 +2327,11 @@ func resourcePolicyRevisionID(resourceARN, policy string) string {
 }
 
 func (s *Server) ensureResourcePolicyTarget(ctx context.Context, tx *sql.Tx, resourceARN string, isStream bool) error {
-	tableName, err := taggableTableNameFromResourceARN(resourceARN)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(resourceARN)
 	if err != nil {
+		return awserr.ResourceNotFound("Requested resource not found")
+	}
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(ctx) {
 		return awserr.ResourceNotFound("Requested resource not found")
 	}
 	t, err := s.getTableWithLifecycle(ctx, tx, tableName)
@@ -2331,10 +2407,14 @@ func (s *Server) listStreams(r *http.Request, body []byte) (map[string]any, erro
 			break
 		}
 		for _, name := range names {
-			if strings.TrimSpace(req.TableName) != "" && name != req.TableName {
+			storedAccountID, storedTableName := splitScopedTableKey(name)
+			if storedAccountID != accountIDFromContext(r.Context()) {
 				continue
 			}
-			t, err := s.getTableWithLifecycle(r.Context(), tx, name)
+			if strings.TrimSpace(req.TableName) != "" && storedTableName != req.TableName {
+				continue
+			}
+			t, err := s.getTableWithLifecycle(r.Context(), tx, storedTableName)
 			if err != nil {
 				continue
 			}
@@ -2346,7 +2426,7 @@ func (s *Server) listStreams(r *http.Request, body []byte) (map[string]any, erro
 			}
 			streams = append(streams, map[string]any{
 				"StreamArn":   t.Stream.ARN,
-				"TableName":   t.Name,
+				"TableName":   logicalTableNameFromKey(t.Name),
 				"StreamLabel": t.Stream.Label,
 			})
 		}
@@ -2422,7 +2502,7 @@ func (s *Server) describeStream(r *http.Request, body []byte) (map[string]any, e
 			"StreamStatus":            "ENABLED",
 			"StreamViewType":          t.Stream.ViewType,
 			"CreationRequestDateTime": t.CreatedAt,
-			"TableName":               t.Name,
+			"TableName":               logicalTableNameFromKey(t.Name),
 			"KeySchema":               t.KeySchema(),
 			"Shards":                  shards,
 		},
@@ -3338,7 +3418,11 @@ func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model
 }
 
 func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
-	t, err := s.store.GetTable(ctx, tx, tableName)
+	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
+	if err != nil {
+		return model.Table{}, err
+	}
+	t, err := s.store.GetTable(ctx, tx, scopedTableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
@@ -4096,7 +4180,7 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 			}
 			processed++
 
-			item, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+			item, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					units := model.CalculateReadCapacityUnits(1, itemReq.ConsistentRead)
@@ -4249,7 +4333,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("Provided list of item keys contains duplicates")
 				}
 				seenKeys[k] = struct{}{}
-				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+				current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 				existed := true
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return nil, err
@@ -4266,7 +4350,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
 					continue
 				}
-				if err := s.store.PutItem(r.Context(), tx, tableName, pk, sk, op.PutRequest.Item); err != nil {
+				if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, op.PutRequest.Item); err != nil {
 					return nil, err
 				}
 				eventName := "INSERT"
@@ -4304,7 +4388,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					return nil, awserr.Validation("Provided list of item keys contains duplicates")
 				}
 				seenKeys[k] = struct{}{}
-				current, err := s.store.GetItem(r.Context(), tx, tableName, pk, sk)
+				current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 				existed := true
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return nil, err
@@ -4321,7 +4405,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
 					continue
 				}
-				if err := s.store.DeleteItem(r.Context(), tx, tableName, pk, sk); err != nil {
+				if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
 					return nil, err
 				}
 				if existed {
@@ -4405,7 +4489,7 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
-		item, err := s.store.GetItem(r.Context(), tx, g.TableName, pk, sk)
+		item, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				if _, err := applyProjection(map[string]any{}, g.ProjectionExpression, g.ExpressionAttributeNames); err != nil {
@@ -4608,7 +4692,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
-			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
+			writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
 			continue
 		}
 
@@ -4659,7 +4743,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 					return nil, err
 				}
 			}
-			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+			writeByTable[txItem.Delete.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
 			continue
 		}
 
@@ -4741,7 +4825,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
-			writeByTable[t.Name] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
+			writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
 			continue
 		}
 
@@ -4914,14 +4998,14 @@ func pitrLatestRestorableLagMillisFromEnv() int64 {
 
 func (s *Server) ensureReadCapacity(t model.Table, units float64) error {
 	if !s.reserveReadCapacity(t, units) {
-		return awserr.ProvisionedThroughputExceeded("read capacity exceeded for table " + t.Name)
+		return awserr.ProvisionedThroughputExceeded("read capacity exceeded for table " + logicalTableNameFromKey(t.Name))
 	}
 	return nil
 }
 
 func (s *Server) ensureWriteCapacity(t model.Table, units float64) error {
 	if !s.reserveWriteCapacity(t, units) {
-		return awserr.ProvisionedThroughputExceeded("write capacity exceeded for table " + t.Name)
+		return awserr.ProvisionedThroughputExceeded("write capacity exceeded for table " + logicalTableNameFromKey(t.Name))
 	}
 	return nil
 }
@@ -5095,7 +5179,7 @@ func normalizeStreamSpec(spec *struct {
 	}
 }
 
-func setStreamMetadata(spec *model.StreamSpecification, tableName string) {
+func setStreamMetadata(spec *model.StreamSpecification, accountID string, tableName string) {
 	if spec == nil || !spec.Enabled {
 		return
 	}
@@ -5103,7 +5187,7 @@ func setStreamMetadata(spec *model.StreamSpecification, tableName string) {
 		spec.Label = time.Now().UTC().Format("2006-01-02T15:04:05.000")
 	}
 	if strings.TrimSpace(spec.ARN) == "" {
-		spec.ARN = fmt.Sprintf("arn:aws:dynamodb:local:000000000000:table/%s/stream/%s", tableName, spec.Label)
+		spec.ARN = fmt.Sprintf("arn:aws:dynamodb:local:%s:table/%s/stream/%s", accountID, tableName, spec.Label)
 	}
 }
 
@@ -5208,33 +5292,15 @@ func removeTags(existing []model.Tag, keys []string) []model.Tag {
 	return out
 }
 
-func taggableTableNameFromResourceARN(resourceARN string) (string, error) {
-	resourceARN = strings.TrimSpace(resourceARN)
-	if !strings.HasPrefix(resourceARN, "arn:") {
-		return "", fmt.Errorf("ResourceArn must be a valid ARN")
+func taggableTableNameFromResourceARN(resourceARN string) (string, string, error) {
+	tableName, accountID, isARN, err := parseTableARN(resourceARN)
+	if err != nil {
+		return "", "", err
 	}
-	marker := ":table/"
-	start := strings.Index(resourceARN, marker)
-	if start < 0 {
-		marker = "/table/"
-		start = strings.Index(resourceARN, marker)
+	if !isARN {
+		return "", "", fmt.Errorf("ResourceArn must be a valid ARN")
 	}
-	if start < 0 {
-		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	remainder := resourceARN[start+len(marker):]
-	if remainder == "" {
-		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	tableName := remainder
-	if slash := strings.Index(tableName, "/"); slash >= 0 {
-		tableName = tableName[:slash]
-	}
-	tableName = strings.TrimSpace(tableName)
-	if tableName == "" {
-		return "", fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	return tableName, nil
+	return tableName, accountID, nil
 }
 
 func normalizeGSIThroughputForCreate(billingMode string, throughput *struct {
@@ -5274,7 +5340,8 @@ func applyUpdateTableOptions(t *model.Table, req updateTableRequest) error {
 		}
 		if stream.Enabled {
 			if !t.Stream.Enabled || t.Stream.ViewType != stream.ViewType {
-				setStreamMetadata(&stream, t.Name)
+				accountID, tableName := splitScopedTableKey(t.Name)
+				setStreamMetadata(&stream, accountID, tableName)
 			} else {
 				stream.ARN = t.Stream.ARN
 				stream.Label = t.Stream.Label
@@ -5345,19 +5412,98 @@ func normalizeBillingConfig(mode string, throughput *struct {
 	}
 }
 
-func normalizeTableNameIdentifier(v string) string {
-	v = strings.TrimSpace(v)
-	if strings.HasPrefix(v, "arn:") {
-		parts := strings.Split(v, "/")
-		if len(parts) >= 2 {
-			for i := 0; i < len(parts)-1; i++ {
-				if parts[i] == "table" {
-					return strings.TrimSpace(parts[i+1])
-				}
-			}
+func accountIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(authentication.AccountIDContextKey{}).(string); ok {
+		trimmed := strings.TrimSpace(v)
+		if trimmed != "" {
+			return trimmed
 		}
 	}
-	return v
+	return defaultLocalAccountID
+}
+
+func scopedTableKeyFromAccountAndName(accountID string, tableName string) string {
+	return strings.TrimSpace(accountID) + scopedTableKeySeparator + strings.TrimSpace(tableName)
+}
+
+func splitScopedTableKey(v string) (string, string) {
+	v = strings.TrimSpace(v)
+	parts := strings.SplitN(v, scopedTableKeySeparator, 2)
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return defaultLocalAccountID, v
+}
+
+func normalizeTableNameIdentifier(v string) string {
+	name, _, _, err := parseTableARN(v)
+	if err == nil {
+		return name
+	}
+	return strings.TrimSpace(v)
+}
+
+func parseTableARN(v string) (tableName string, accountID string, isARN bool, err error) {
+	v = strings.TrimSpace(v)
+	if !strings.HasPrefix(v, "arn:") {
+		return strings.TrimSpace(v), "", false, nil
+	}
+	parts := strings.SplitN(v, ":", 6)
+	if len(parts) < 6 {
+		return "", "", true, fmt.Errorf("ResourceArn must be a valid ARN")
+	}
+	accountID = strings.TrimSpace(parts[4])
+	resource := strings.TrimSpace(parts[5])
+	if !strings.HasPrefix(resource, "table/") {
+		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	remainder := strings.TrimPrefix(resource, "table/")
+	if remainder == "" {
+		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	tableName = remainder
+	if slash := strings.Index(tableName, "/"); slash >= 0 {
+		tableName = tableName[:slash]
+	}
+	tableName = strings.TrimSpace(tableName)
+	if tableName == "" {
+		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
+	}
+	return tableName, accountID, true, nil
+}
+
+func scopedTableNameFromIdentifier(ctx context.Context, tableIdentifier string) (string, error) {
+	tableName, arnAccountID, isARN, err := parseTableARN(tableIdentifier)
+	if err != nil {
+		return "", awserr.Validation(err.Error())
+	}
+	accountID := accountIDFromContext(ctx)
+	if isARN && arnAccountID != "" && arnAccountID != accountID {
+		return "", &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
+	}
+	if strings.TrimSpace(tableName) == "" {
+		return "", awserr.Validation("TableName is required")
+	}
+	return scopedTableKeyFromAccountAndName(accountID, tableName), nil
+}
+
+func validateTableARNAccountForRequest(ctx context.Context, resourceARN string) (string, error) {
+	tableName, arnAccountID, isARN, err := parseTableARN(resourceARN)
+	if err != nil {
+		return "", awserr.Validation(err.Error())
+	}
+	if !isARN {
+		return "", awserr.Validation("ResourceArn must be a valid ARN")
+	}
+	if arnAccountID != "" && arnAccountID != accountIDFromContext(ctx) {
+		return "", &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
+	}
+	return tableName, nil
+}
+
+func logicalTableNameFromKey(v string) string {
+	_, tableName := splitScopedTableKey(v)
+	return tableName
 }
 
 func (s *Server) pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
@@ -5401,9 +5547,10 @@ func (s *Server) continuousBackupsDescription(t model.Table, nowMs int64) map[st
 }
 
 func localBackupARN(tableName string, backupName string, createdAt int64) string {
+	accountID, logicalName := splitScopedTableKey(tableName)
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(tableName + "|" + backupName + "|" + strconv.FormatInt(createdAt, 10)))
-	return fmt.Sprintf("arn:aws:dynamodb:local:000000000000:table/%s/backup/%016x", tableName, h.Sum64())
+	return fmt.Sprintf("arn:aws:dynamodb:local:%s:table/%s/backup/%016x", accountID, logicalName, h.Sum64())
 }
 
 func anyString(v any) string {
@@ -6051,7 +6198,7 @@ func (s *Server) updateTimeToLive(r *http.Request, body []byte) (map[string]any,
 	} else {
 		ttl.Status = model.TTLStatusDisabling
 	}
-	if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, ttl); err != nil {
+	if err := s.store.UpdateTimeToLive(r.Context(), tx, t.Name, ttl); err != nil {
 		return nil, err
 	}
 
@@ -6096,7 +6243,7 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 		t.TimeToLive.Status = model.TTLStatusEnabled
 		t.TimeToLive.StatusAt = 0
 		t.TimeToLive.Enabled = true
-		if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, t.TimeToLive); err != nil {
+		if err := s.store.UpdateTimeToLive(r.Context(), tx, t.Name, t.TimeToLive); err != nil {
 			return nil, err
 		}
 	}
@@ -6104,7 +6251,7 @@ func (s *Server) describeTimeToLive(r *http.Request, body []byte) (map[string]an
 		t.TimeToLive.Status = model.TTLStatusDisabled
 		t.TimeToLive.StatusAt = 0
 		t.TimeToLive.Enabled = false
-		if err := s.store.UpdateTimeToLive(r.Context(), tx, req.TableName, t.TimeToLive); err != nil {
+		if err := s.store.UpdateTimeToLive(r.Context(), tx, t.Name, t.TimeToLive); err != nil {
 			return nil, err
 		}
 	}
@@ -6138,7 +6285,7 @@ func addConsumedCapacity(resp map[string]any, capacity string, tableName string,
 	}
 	list := resp["ConsumedCapacity"].([]map[string]any)
 	entry := map[string]any{
-		"TableName": tableName,
+		"TableName": logicalTableNameFromKey(tableName),
 	}
 	if readUnits > 0 {
 		entry["ReadCapacityUnits"] = readUnits
@@ -6158,7 +6305,7 @@ func setSingleConsumedCapacity(resp map[string]any, capacity string, tableName s
 	if capacity == "" || capacity == "NONE" {
 		return
 	}
-	entry := map[string]any{"TableName": tableName}
+	entry := map[string]any{"TableName": logicalTableNameFromKey(tableName)}
 	if readUnits > 0 {
 		entry["ReadCapacityUnits"] = readUnits
 		entry["CapacityUnits"] = readUnits
@@ -6178,7 +6325,7 @@ func setSingleQueryConsumedCapacity(resp map[string]any, mode string, tableName,
 		return
 	}
 	entry := map[string]any{
-		"TableName":         tableName,
+		"TableName":         logicalTableNameFromKey(tableName),
 		"ReadCapacityUnits": readUnits,
 		"CapacityUnits":     readUnits,
 	}
@@ -6210,7 +6357,7 @@ func addQueryConsumedCapacity(resp map[string]any, mode string, tableName, index
 		resp["ConsumedCapacity"] = []map[string]any{}
 	}
 	entry := map[string]any{
-		"TableName":         tableName,
+		"TableName":         logicalTableNameFromKey(tableName),
 		"ReadCapacityUnits": readUnits,
 		"CapacityUnits":     readUnits,
 	}

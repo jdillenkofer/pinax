@@ -28,6 +28,7 @@ func getCredentialsFromEnv() []Credentials {
 	for i := 0; ; i++ {
 		accessKeyID := getStringFromEnv(envKeyPrefix + "_CREDENTIALS_" + strconv.Itoa(i) + "_ACCESS_KEY_ID")
 		secretAccessKey := getStringFromEnv(envKeyPrefix + "_CREDENTIALS_" + strconv.Itoa(i) + "_SECRET_ACCESS_KEY")
+		accountID := getStringFromEnv(envKeyPrefix + "_CREDENTIALS_" + strconv.Itoa(i) + "_ACCOUNT_ID")
 
 		if accessKeyID == nil || secretAccessKey == nil {
 			if i == 0 {
@@ -36,7 +37,11 @@ func getCredentialsFromEnv() []Credentials {
 			break
 		}
 
-		credentials = append(credentials, Credentials{AccessKeyId: *accessKeyID, SecretAccessKey: *secretAccessKey})
+		cred := Credentials{AccessKeyId: *accessKeyID, SecretAccessKey: *secretAccessKey}
+		if accountID != nil {
+			cred.AccountID = strings.TrimSpace(*accountID)
+		}
+		credentials = append(credentials, cred)
 	}
 	return credentials
 }
