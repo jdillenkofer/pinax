@@ -145,7 +145,7 @@ func (s *Store) CreateTable(ctx context.Context, tx *sql.Tx, t model.Table) erro
 		pitrRecoveryDays = 35
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO tables(name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at)
+		INSERT INTO tables("key", hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, t.Name, t.HashKey, t.HashType, nullIfEmpty(t.RangeKey), nullIfEmpty(t.RangeType), firstNonEmpty(t.BillingMode, "PAY_PER_REQUEST"), t.ReadCapacityUnits, t.WriteCapacityUnits, firstNonEmpty(t.TableClass, "STANDARD"), deletionProtection, streamEnabled, nullIfEmpty(t.Stream.ViewType), nullIfEmpty(t.Stream.ARN), nullIfEmpty(t.Stream.Label), sseEnabled, nullIfEmpty(t.SSE.SSEType), sseStatus, nullIfEmpty(t.SSE.KMSMasterKeyID), string(tagsJSON), nullIfEmpty(firstNonEmpty(t.Status, model.TableStatusActive)), t.StatusAt, t.CreatedAt, ttlEnabled, nullIfEmpty(t.TimeToLive.AttrName), ttlStatus, t.TimeToLive.StatusAt, pitrEnabled, pitrRecoveryDays, t.PITR.EnabledAt)
 	if err != nil {
@@ -185,9 +185,9 @@ func (s *Store) GetTable(ctx context.Context, tx *sql.Tx, name string) (model.Ta
 	var pitrRecoveryDays int64
 	var pitrEnabledAt int64
 	err := tx.QueryRowContext(ctx, `
-		SELECT name, hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at
+		SELECT "key", hash_key, hash_type, range_key, range_type, billing_mode, read_capacity_units, write_capacity_units, table_class, deletion_protection_enabled, stream_enabled, stream_view_type, stream_arn, stream_label, sse_enabled, sse_type, sse_status, sse_kms_key_id, tags_json, table_status, table_status_at, created_at, ttl_enabled, ttl_attribute, ttl_status, ttl_status_at, pitr_enabled, pitr_recovery_period_days, pitr_enabled_at
 		FROM tables
-		WHERE name = ?
+		WHERE "key" = ?
 	`, name).Scan(&t.Name, &t.HashKey, &t.HashType, &rangeKey, &rangeType, &billingMode, &readCapacityUnits, &writeCapacityUnits, &tableClass, &deletionProtection, &streamEnabled, &streamViewType, &streamARN, &streamLabel, &sseEnabled, &sseType, &sseStatus, &sseKMSKeyID, &tagsJSON, &tableStatus, &tableStatusAt, &t.CreatedAt, &ttlEnabled, &ttlAttr, &ttlStatus, &ttlStatusAt, &pitrEnabled, &pitrRecoveryDays, &pitrEnabledAt)
 	if err != nil {
 		return model.Table{}, err
@@ -235,9 +235,9 @@ func (s *Store) ListTables(ctx context.Context, tx *sql.Tx, start string, limit 
 		limit = 100
 	}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT name FROM tables
-		WHERE name > ?
-		ORDER BY name ASC
+		SELECT "key" FROM tables
+		WHERE "key" > ?
+		ORDER BY "key" ASC
 		LIMIT ?
 	`, start, limit)
 	if err != nil {
@@ -257,7 +257,7 @@ func (s *Store) ListTables(ctx context.Context, tx *sql.Tx, start string, limit 
 }
 
 func (s *Store) DeleteTable(ctx context.Context, tx *sql.Tx, name string) error {
-	res, err := tx.ExecContext(ctx, `DELETE FROM tables WHERE name = ?`, name)
+	res, err := tx.ExecContext(ctx, `DELETE FROM tables WHERE "key" = ?`, name)
 	if err != nil {
 		return err
 	}
@@ -719,7 +719,7 @@ func (s *Store) UpdateTableIndexes(ctx context.Context, tx *sql.Tx, tableName st
 	_, err := tx.ExecContext(ctx, `
 		UPDATE tables
 		SET table_status = ?, table_status_at = ?
-		WHERE name = ?
+		WHERE "key" = ?
 	`, firstNonEmpty(tableStatus, model.TableStatusActive), tableStatusAt, tableName)
 	return err
 }
@@ -728,7 +728,7 @@ func (s *Store) UpdateTableBilling(ctx context.Context, tx *sql.Tx, tableName st
 	_, err := tx.ExecContext(ctx, `
 		UPDATE tables
 		SET billing_mode = ?, read_capacity_units = ?, write_capacity_units = ?
-		WHERE name = ?
+		WHERE "key" = ?
 	`, firstNonEmpty(billingMode, "PAY_PER_REQUEST"), readCapacityUnits, writeCapacityUnits, tableName)
 	return err
 }
@@ -753,7 +753,7 @@ func (s *Store) UpdateTableOptions(ctx context.Context, tx *sql.Tx, tableName st
 	_, err = tx.ExecContext(ctx, `
 		UPDATE tables
 		SET table_class = ?, deletion_protection_enabled = ?, stream_enabled = ?, stream_view_type = ?, stream_arn = ?, stream_label = ?, sse_enabled = ?, sse_type = ?, sse_status = ?, sse_kms_key_id = ?, tags_json = ?
-		WHERE name = ?
+		WHERE "key" = ?
 	`, firstNonEmpty(tableClass, "STANDARD"), deletionProtectionInt, streamEnabled, nullIfEmpty(stream.ViewType), nullIfEmpty(stream.ARN), nullIfEmpty(stream.Label), sseEnabled, nullIfEmpty(sse.SSEType), firstNonEmpty(sse.Status, "DISABLED"), nullIfEmpty(sse.KMSMasterKeyID), string(tagsJSON), tableName)
 	return err
 }
@@ -772,7 +772,7 @@ func (s *Store) UpdateTimeToLive(ctx context.Context, tx *sql.Tx, tableName stri
 		ttlEnabled = 1
 	}
 	_, err := tx.ExecContext(ctx, `
-		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ?, ttl_status = ?, ttl_status_at = ? WHERE name = ?
+		UPDATE tables SET ttl_enabled = ?, ttl_attribute = ?, ttl_status = ?, ttl_status_at = ? WHERE "key" = ?
 	`, ttlEnabled, nullIfEmpty(ttl.AttrName), ttl.Status, ttl.StatusAt, tableName)
 	return err
 }
@@ -787,7 +787,7 @@ func (s *Store) UpdatePointInTimeRecovery(ctx context.Context, tx *sql.Tx, table
 		recoveryDays = 35
 	}
 	_, err := tx.ExecContext(ctx, `
-		UPDATE tables SET pitr_enabled = ?, pitr_recovery_period_days = ?, pitr_enabled_at = ? WHERE name = ?
+		UPDATE tables SET pitr_enabled = ?, pitr_recovery_period_days = ?, pitr_enabled_at = ? WHERE "key" = ?
 	`, pitrEnabled, recoveryDays, pitr.EnabledAt, tableName)
 	return err
 }

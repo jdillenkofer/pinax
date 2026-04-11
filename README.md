@@ -79,6 +79,16 @@ curl -sS http://localhost:9090/health
 curl -sS http://localhost:9090/metrics
 ```
 
+## Table identifiers
+
+`pinax` uses three related table identifiers in different contexts:
+
+- `table_name`: the logical DynamoDB table name from API requests and responses (for example `orders`).
+- `table_key`: the internal storage key used in SQLite rows and foreign keys. It is built exactly as `<account_id>#<table_name>` (`scopedTableKeyFromAccountAndName`).
+  - `account_id` comes from request context; if missing/blank it defaults to `000000000000`.
+  - logical `table_name` is recovered from `table_key` by splitting on the first `#`.
+- `table_arn`: the ARN-form identifier used for resource-addressed APIs. For local mode, it is built as `arn:aws:dynamodb:local:<account_id>:table/<table_name>`.
+
 ## Authorization script
 
 If no authorizer file is found:
