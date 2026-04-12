@@ -33,6 +33,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
 	"github.com/jdillenkofer/pinax/internal/model"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -101,7 +102,7 @@ var (
 type Server struct {
 	store                         store.Store
 	requestAuthorizer             authorization.RequestAuthorizer
-	mutationHooks                 []MutationHook
+	mutationExecutor              *mutation.Executor
 	capMu                         sync.Mutex
 	capacityWindows               map[string]capacityWindow
 	pitrLatestRestorableLagMillis int64
@@ -145,10 +146,9 @@ func WithStreamIteratorSigningKey(key []byte) ServerOption {
 	}
 }
 
-func WithMutationHooks(hooks ...MutationHook) ServerOption {
-	hooksCopy := append([]MutationHook(nil), hooks...)
+func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 	return func(s *Server) {
-		s.mutationHooks = hooksCopy
+		s.mutationExecutor = mutation.NewExecutor(hooks...)
 	}
 }
 
@@ -156,7 +156,7 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 	s := &Server{
 		store:                         store,
 		requestAuthorizer:             requestAuthorizer,
-		mutationHooks:                 []MutationHook{newStreamMutationHook(store)},
+		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
 		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisFromEnv(),
 		streamIteratorTTL:             defaultStreamIteratorTTL,
@@ -207,7 +207,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		awserr.Write(iw, err)
 		return
 	}
-
 	resp, err := s.dispatch(r, op, body)
 	if err != nil {
 		slog.WarnContext(r.Context(), "operation failed", "operation", op, "table", tableNameFromBody(body), "err", err)
@@ -2849,15 +2848,44 @@ func keyAttributesFromKey(t model.Table, key map[string]any) map[string]any {
 	return keys
 }
 
-func (s *Server) appendStreamRecordForMutation(ctx context.Context, tx *sql.Tx, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
-	return s.emitMutationHooks(ctx, tx, MutationEvent{
+func (s *Server) emitMutationEventForWrite(ctx context.Context, tx *sql.Tx, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
+	pk, sk, err := primaryKeyStringsFromMutationKeys(t, keys)
+	if err != nil {
+		return err
+	}
+	return s.mutationExecutor.Emit(ctx, tx, mutation.Event{
 		Table:     t,
 		EventName: eventName,
+		PK:        pk,
+		SK:        sk,
 		Keys:      keys,
 		OldImage:  oldImage,
 		NewImage:  newImage,
 		ChangedAt: changedAt,
 	})
+}
+
+func primaryKeyStringsFromMutationKeys(t model.Table, keys map[string]any) (string, string, error) {
+	hashValue, ok := keys[t.HashKey]
+	if !ok {
+		return "", "", fmt.Errorf("missing hash key attribute in mutation event")
+	}
+	pk, err := model.SerializeKeyValue(hashValue)
+	if err != nil {
+		return "", "", err
+	}
+	sk := model.NoSortKey
+	if strings.TrimSpace(t.RangeKey) != "" {
+		rangeValue, ok := keys[t.RangeKey]
+		if !ok {
+			return "", "", fmt.Errorf("missing range key attribute in mutation event")
+		}
+		sk, err = model.SerializeKeyValue(rangeValue)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return pk, sk, nil
 }
 
 type putItemRequest struct {
@@ -2934,7 +2962,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	} else {
 		streamOld = nil
 	}
-	if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt); err != nil {
+	if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt); err != nil {
 		return nil, err
 	}
 
@@ -3084,7 +3112,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, err
 	}
 	if existed {
-		if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt); err != nil {
+		if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt); err != nil {
 			return nil, err
 		}
 	}
@@ -3194,7 +3222,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 	} else {
 		streamOld = nil
 	}
-	if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt); err != nil {
+	if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt); err != nil {
 		return nil, err
 	}
 
@@ -4332,7 +4360,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				} else {
 					streamOld = nil
 				}
-				if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
 					return nil, err
 				}
 				writeByTable[tableName] += writeUnits
@@ -4382,7 +4410,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 				}
 				if existed {
 					if len(current) > 0 {
-						if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
+						if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
 							return nil, err
 						}
 					}
@@ -4661,7 +4689,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			} else {
 				streamOld = nil
 			}
-			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
+			if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
 			writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
@@ -4711,7 +4739,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				return nil, err
 			}
 			if itemExisted {
-				if err := s.appendStreamRecordForMutation(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
 					return nil, err
 				}
 			}
@@ -4794,7 +4822,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 			} else {
 				streamOld = nil
 			}
-			if err := s.appendStreamRecordForMutation(r.Context(), tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
+			if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
 			writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))

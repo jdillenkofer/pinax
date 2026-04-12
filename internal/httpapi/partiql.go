@@ -480,7 +480,7 @@ func (s *Server) runPartiQLInsert(ctx context.Context, tx *sql.Tx, tableName str
 	if existed {
 		eventName = "MODIFY"
 	}
-	if err := s.appendStreamRecordForMutation(ctx, tx, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, tx, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
@@ -572,7 +572,7 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, tx *sql.Tx, tableName str
 	if t.RangeKey != "" {
 		streamKey[t.RangeKey] = rangeValue
 	}
-	if err := s.appendStreamRecordForMutation(ctx, tx, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, tx, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
@@ -645,7 +645,7 @@ func (s *Server) runPartiQLDelete(ctx context.Context, tx *sql.Tx, tableName str
 		if t.RangeKey != "" {
 			streamKey[t.RangeKey] = rangeValue
 		}
-		if err := s.appendStreamRecordForMutation(ctx, tx, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
+		if err := s.emitMutationEventForWrite(ctx, tx, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
 			return partiqlResult{}, err
 		}
 	}

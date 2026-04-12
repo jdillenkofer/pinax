@@ -65,7 +65,7 @@ func TestDeleteItemChangesBeforePrunesOlderHistory(t *testing.T) {
 	}
 }
 
-func TestPutItemPrunesHistoryByRecoveryWindow(t *testing.T) {
+func TestPutItemDoesNotWritePITRHistoryInline(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -114,9 +114,9 @@ func TestPutItemPrunesHistoryByRecoveryWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(changes) != 1 {
-		t.Fatalf("expected old history to be pruned and latest put kept, got %d rows", len(changes))
+		t.Fatalf("expected no inline PITR history append on PutItem and existing history preserved, got %d rows", len(changes))
 	}
-	if changes[0].ChangedAt < nowMs-(24*60*60*1000) {
-		t.Fatalf("expected remaining change within retention window, got %d", changes[0].ChangedAt)
+	if changes[0].ChangedAt != oldTs {
+		t.Fatalf("expected existing PITR history row to remain unchanged, got %d", changes[0].ChangedAt)
 	}
 }

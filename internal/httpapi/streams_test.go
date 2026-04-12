@@ -26,6 +26,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 
@@ -43,7 +44,9 @@ func newStreamTestClients(t *testing.T, serverOpts ...ServerOption) (*dynamodb.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil, serverOpts...))
+	defaultOpts := []ServerOption{WithMutationHooks(mutation.DefaultHooks(store)...)}
+	allOpts := append(defaultOpts, serverOpts...)
+	srv := httptest.NewServer(NewServer(store, nil, allOpts...))
 
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("eu-central-1"),

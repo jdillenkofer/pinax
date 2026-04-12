@@ -346,16 +346,6 @@ func (s *Store) PutItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk strin
 			return err
 		}
 	}
-	if t.PITR.Enabled {
-		nowMs := time.Now().UnixMilli()
-		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "PUT", item, nowMs); err != nil {
-			return err
-		}
-		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -365,19 +355,6 @@ func (s *Store) DeleteItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk st
 	`, tableName, pk, sk)
 	if err != nil {
 		return err
-	}
-	t, err := s.GetTable(ctx, tx, tableName)
-	if err != nil {
-		return err
-	}
-	if t.PITR.Enabled {
-		nowMs := time.Now().UnixMilli()
-		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, nowMs); err != nil {
-			return err
-		}
-		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -1342,26 +1319,11 @@ func (s *Store) GetExpiredItems(ctx context.Context, tx *sql.Tx, tableName strin
 }
 
 func (s *Store) DeleteExpiredItem(ctx context.Context, tx *sql.Tx, tableName, pk, sk string) error {
-	t, err := s.GetTable(ctx, tx, tableName)
-	if err != nil {
-		return err
-	}
-
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
 	if err != nil {
 		return err
-	}
-
-	if t.PITR.Enabled {
-		nowMs := time.Now().UnixMilli()
-		if err := s.appendItemHistory(ctx, tx, tableName, pk, sk, "DELETE", nil, nowMs); err != nil {
-			return err
-		}
-		if err := s.pruneItemHistoryByRetention(ctx, tx, t, nowMs); err != nil {
-			return err
-		}
 	}
 
 	return nil

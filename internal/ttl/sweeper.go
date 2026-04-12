@@ -2,17 +2,20 @@ package ttl
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"time"
 
 	"github.com/jdillenkofer/pinax/internal/model"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/store"
 )
 
 type Sweeper struct {
-	store    store.Store
-	interval time.Duration
-	stopCh   chan struct{}
+	store            store.Store
+	mutationExecutor *mutation.Executor
+	interval         time.Duration
+	stopCh           chan struct{}
 }
 
 const (
@@ -20,11 +23,15 @@ const (
 	sweepBatchSize = 1000
 )
 
-func NewSweeper(store store.Store, interval time.Duration) *Sweeper {
+func NewSweeper(store store.Store, interval time.Duration, mutationExecutor *mutation.Executor) *Sweeper {
+	if mutationExecutor == nil {
+		panic("ttl sweeper requires a mutation executor")
+	}
 	return &Sweeper{
-		store:    store,
-		interval: interval,
-		stopCh:   make(chan struct{}),
+		store:            store,
+		mutationExecutor: mutationExecutor,
+		interval:         interval,
+		stopCh:           make(chan struct{}),
 	}
 }
 
@@ -116,21 +123,9 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 		default:
 		}
 
-		tx, err := s.store.DB().BeginTx(ctx, nil)
+		deleted, err := s.deleteExpiredBatch(ctx, t, now, sweepBatchSize)
 		if err != nil {
-			slog.Error("failed to start transaction for TTL batch delete", "table", tableName, "err", err)
-			return
-		}
-
-		deleted, err := s.store.DeleteExpiredItems(ctx, tx, tableName, now, sweepBatchSize)
-		if err != nil {
-			_ = tx.Rollback()
 			slog.Error("failed to delete expired items", "table", tableName, "err", err)
-			return
-		}
-
-		if err := tx.Commit(); err != nil {
-			slog.Error("failed to commit transaction for TTL batch delete", "table", tableName, "err", err)
 			return
 		}
 
@@ -138,6 +133,54 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 			break
 		}
 	}
+}
+
+func (s *Sweeper) deleteExpiredBatch(ctx context.Context, t model.Table, before int64, limit int) (int64, error) {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	expired, err := s.store.GetExpiredItems(ctx, tx, t.Name, t.TimeToLive.AttrName, before, limit)
+	if err != nil {
+		return 0, err
+	}
+	deleted := int64(0)
+	for _, key := range expired {
+		oldItem, err := s.store.GetItem(ctx, tx, t.Name, key.PK, key.SK)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return 0, err
+		}
+		if err := s.store.DeleteExpiredItem(ctx, tx, t.Name, key.PK, key.SK); err != nil {
+			return 0, err
+		}
+		changedAt := time.Now().UnixMilli()
+		keys := map[string]any{t.HashKey: oldItem[t.HashKey]}
+		if t.RangeKey != "" {
+			keys[t.RangeKey] = oldItem[t.RangeKey]
+		}
+		if err := s.mutationExecutor.Emit(ctx, tx, mutation.Event{
+			Table:     t,
+			EventName: "REMOVE",
+			PK:        key.PK,
+			SK:        key.SK,
+			Keys:      keys,
+			OldImage:  oldItem,
+			NewImage:  nil,
+			ChangedAt: changedAt,
+		}); err != nil {
+			return 0, err
+		}
+		deleted++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 func (s *Sweeper) prunePITRHistory(ctx context.Context, t model.Table) error {

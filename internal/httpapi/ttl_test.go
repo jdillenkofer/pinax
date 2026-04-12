@@ -16,6 +16,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
 	"github.com/jdillenkofer/pinax/internal/ttl"
 
@@ -191,7 +192,7 @@ func TestTTLSweeper(t *testing.T) {
 	}
 
 	// Manual sweep
-	sweeper := ttl.NewSweeper(store, time.Hour)
+	sweeper := ttl.NewSweeper(store, time.Hour, mutation.NewExecutor(mutation.NewPITRHook(store)))
 	sweeper.RunOnce(ctx)
 
 	// Verify

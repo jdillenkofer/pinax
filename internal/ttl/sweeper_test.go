@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jdillenkofer/pinax/internal/model"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 
@@ -74,7 +75,7 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewSweeper(store, 0).RunOnce(ctx)
+	NewSweeper(store, 0, mutation.NewExecutor()).RunOnce(ctx)
 
 	tx, err = store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -141,7 +142,7 @@ func TestSweeperPrunesPITRHistoryWithoutTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewSweeper(store, 0).RunOnce(ctx)
+	NewSweeper(store, 0, mutation.NewExecutor()).RunOnce(ctx)
 
 	tx, err = store.DB().BeginTx(ctx, nil)
 	if err != nil {

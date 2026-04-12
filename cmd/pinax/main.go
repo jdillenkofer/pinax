@@ -16,6 +16,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
 	authorizationLua "github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
+	"github.com/jdillenkofer/pinax/internal/mutation"
 	"github.com/jdillenkofer/pinax/internal/settings"
 	storepkg "github.com/jdillenkofer/pinax/internal/store"
 	"github.com/jdillenkofer/pinax/internal/store/sqlite"
@@ -80,6 +81,7 @@ func main() {
 		store,
 		requestAuthorizer,
 		httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()),
+		httpapi.WithMutationHooks(mutation.DefaultHooks(store)...),
 	)
 	go srv.StartGSIBackfillWorker(context.Background(), 200*time.Millisecond)
 
@@ -97,7 +99,7 @@ func main() {
 
 	var sweeper *ttl.Sweeper
 	if s.TTLSweeperEnabled() {
-		sweeper = ttl.NewSweeper(store, s.TTLSweeperInterval())
+		sweeper = ttl.NewSweeper(store, s.TTLSweeperInterval(), mutation.NewExecutor(mutation.NewPITRHook(store)))
 		go sweeper.Start(context.Background())
 		slog.Info("TTL sweeper started", "interval", s.TTLSweeperInterval())
 	}
