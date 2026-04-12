@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
@@ -101,6 +102,7 @@ var (
 
 type Server struct {
 	store                         store.Store
+	backupService                 *backupapp.Service
 	requestAuthorizer             authorization.RequestAuthorizer
 	mutationExecutor              *mutation.Executor
 	capMu                         sync.Mutex
@@ -155,6 +157,7 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	s := &Server{
 		store:                         store,
+		backupService:                 backupapp.NewService(store),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -993,64 +996,43 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 
-	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
+	backup, err := s.backupService.CreateBackup(
+		r.Context(),
+		tableName,
+		req.BackupName,
+		s.getTableWithLifecycle,
+		func(t model.Table, count int64, items []map[string]any) (model.Backup, error) {
+			tableDesc := t.Description(count)
+			now := time.Now().Unix()
+			return model.Backup{
+				BackupARN:                 localBackupARN(t.Name, req.BackupName, now),
+				BackupName:                req.BackupName,
+				TableName:                 t.Name,
+				TableARN:                  anyString(tableDesc["TableArn"]),
+				TableID:                   anyString(tableDesc["TableId"]),
+				BackupStatus:              model.BackupStatusAvailable,
+				BackupType:                model.BackupTypeUser,
+				BackupCreationDateTime:    now,
+				BackupSizeBytes:           estimateBackupSizeBytes(items),
+				SourceTableDetails:        sourceTableDetailsFromDescription(tableDesc, count),
+				SourceTableFeatureDetails: sourceTableFeatureDetailsFromDescription(tableDesc),
+				SnapshotTable:             t,
+				SnapshotItems:             items,
+			}, nil
+		},
+	)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-	if t.Status != model.TableStatusActive {
-		return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
-	}
-
-	if _, err := s.store.GetBackupByName(r.Context(), tx, req.BackupName); err == nil {
-		return nil, &awserr.APIError{Code: "BackupInUseException", Message: "Backup with the requested name already exists", Status: http.StatusBadRequest}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	count, err := s.store.CountItems(r.Context(), tx, t.Name)
-	if err != nil {
-		return nil, err
-	}
-	items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
-	if err != nil {
-		return nil, err
-	}
-
-	tableDesc := t.Description(count)
-	now := time.Now().Unix()
-	backup := model.Backup{
-		BackupARN:                 localBackupARN(t.Name, req.BackupName, now),
-		BackupName:                req.BackupName,
-		TableName:                 t.Name,
-		TableARN:                  anyString(tableDesc["TableArn"]),
-		TableID:                   anyString(tableDesc["TableId"]),
-		BackupStatus:              model.BackupStatusAvailable,
-		BackupType:                model.BackupTypeUser,
-		BackupCreationDateTime:    now,
-		BackupSizeBytes:           estimateBackupSizeBytes(items),
-		SourceTableDetails:        sourceTableDetailsFromDescription(tableDesc, count),
-		SourceTableFeatureDetails: sourceTableFeatureDetailsFromDescription(tableDesc),
-		SnapshotTable:             t,
-		SnapshotItems:             items,
-	}
-	if err := s.store.CreateBackup(r.Context(), tx, backup); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if errors.Is(err, backupapp.ErrTargetTableInUse) {
+			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
+		}
+		if errors.Is(err, backupapp.ErrBackupExists) {
 			return nil, &awserr.APIError{Code: "BackupInUseException", Message: "Backup with the requested name already exists", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"BackupDetails": backupDetailsMap(backup)}, nil
@@ -1068,20 +1050,11 @@ func (s *Server) describeBackup(r *http.Request, body []byte) (map[string]any, e
 		return nil, err
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+	backup, err := s.backupService.DescribeBackup(r.Context(), req.BackupArn)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"BackupDescription": backupDescriptionMap(backup)}, nil
@@ -1099,29 +1072,11 @@ func (s *Server) deleteBackup(r *http.Request, body []byte) (map[string]any, err
 		return nil, err
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+	deleted, err := s.backupService.DeleteBackup(r.Context(), req.BackupArn)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-	deleted := backup
-	deleted.BackupStatus = model.BackupStatusDeleted
-	if err := s.store.DeleteBackup(r.Context(), tx, req.BackupArn); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
-		}
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"BackupDescription": backupDescriptionMap(deleted)}, nil
@@ -1148,13 +1103,7 @@ func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, erro
 		req.Limit = 100
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	backups, err := s.store.ListBackups(r.Context(), tx)
+	backups, err := s.backupService.ListBackups(r.Context())
 	if err != nil {
 		return nil, err
 	}
@@ -1235,9 +1184,6 @@ func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, erro
 		resp["LastEvaluatedBackupArn"] = page[len(page)-1].BackupARN
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return resp, nil
 }
 
@@ -1259,103 +1205,77 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 		return nil, awserr.Validation("TargetTableName must match [a-zA-Z0-9_.-]+ and be between 3 and 255 characters")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
+	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
+	tableToCreate, restoredItems, err := s.backupService.RestoreTableFromBackup(r.Context(), req.BackupArn, targetScopedTableKey, func(backup model.Backup) (model.Table, error) {
+		t := backup.SnapshotTable
+		t.Name = targetScopedTableKey
+		t.Status = model.TableStatusCreating
+		t.StatusAt = lifecycleNow() + lifecycleDelayMillis()
+		t.CreatedAt = time.Now().Unix()
+		t.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: 35}
 
-	backup, err := s.store.GetBackup(r.Context(), tx, req.BackupArn)
+		billingMode := t.BillingMode
+		readCapacity := t.ReadCapacityUnits
+		writeCapacity := t.WriteCapacityUnits
+		if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
+			var err error
+			billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
+			if err != nil {
+				return model.Table{}, awserr.Validation(err.Error())
+			}
+		}
+		t.BillingMode = billingMode
+		t.ReadCapacityUnits = readCapacity
+		t.WriteCapacityUnits = writeCapacity
+
+		if req.SSESpecificationOverride != nil {
+			normalizedSSE, err := normalizeSSESpecCreate(&struct {
+				Enabled        bool   `json:"Enabled"`
+				SSEType        string `json:"SSEType"`
+				KMSMasterKeyID string `json:"KMSMasterKeyId"`
+			}{
+				Enabled:        req.SSESpecificationOverride.Enabled,
+				SSEType:        req.SSESpecificationOverride.SSEType,
+				KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
+			})
+			if err != nil {
+				return model.Table{}, awserr.Validation(err.Error())
+			}
+			t.SSE = normalizedSSE
+		}
+
+		if req.OnDemandThroughputOverride != nil {
+			if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
+				return model.Table{}, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
+			}
+		}
+
+		updatedGSIs, err := applyRestoreGSIOverride(t.GSIs, req.GlobalSecondaryIndexOverride, t.BillingMode)
+		if err != nil {
+			return model.Table{}, awserr.Validation(err.Error())
+		}
+		t.GSIs = updatedGSIs
+		updatedLSIs, err := applyRestoreLSIOverride(t.LSIs, req.LocalSecondaryIndexOverride)
+		if err != nil {
+			return model.Table{}, awserr.Validation(err.Error())
+		}
+		t.LSIs = updatedLSIs
+		return t, nil
+	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-
-	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
-	if existing, err := s.store.GetTable(r.Context(), tx, targetScopedTableKey); err == nil {
-		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
+		if errors.Is(err, backupapp.ErrTargetTableInUse) {
 			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
 		}
-		return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	tableToCreate := backup.SnapshotTable
-	tableToCreate.Name = targetScopedTableKey
-	tableToCreate.Status = model.TableStatusCreating
-	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
-	tableToCreate.CreatedAt = time.Now().Unix()
-	tableToCreate.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: 35}
-
-	billingMode := tableToCreate.BillingMode
-	readCapacity := tableToCreate.ReadCapacityUnits
-	writeCapacity := tableToCreate.WriteCapacityUnits
-	if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
-		billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-	}
-	tableToCreate.BillingMode = billingMode
-	tableToCreate.ReadCapacityUnits = readCapacity
-	tableToCreate.WriteCapacityUnits = writeCapacity
-
-	if req.SSESpecificationOverride != nil {
-		normalizedSSE, err := normalizeSSESpecCreate(&struct {
-			Enabled        bool   `json:"Enabled"`
-			SSEType        string `json:"SSEType"`
-			KMSMasterKeyID string `json:"KMSMasterKeyId"`
-		}{
-			Enabled:        req.SSESpecificationOverride.Enabled,
-			SSEType:        req.SSESpecificationOverride.SSEType,
-			KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
-		})
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		tableToCreate.SSE = normalizedSSE
-	}
-
-	if req.OnDemandThroughputOverride != nil {
-		if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
-			return nil, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
-		}
-	}
-
-	updatedGSIs, err := applyRestoreGSIOverride(tableToCreate.GSIs, req.GlobalSecondaryIndexOverride, tableToCreate.BillingMode)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	tableToCreate.GSIs = updatedGSIs
-	updatedLSIs, err := applyRestoreLSIOverride(tableToCreate.LSIs, req.LocalSecondaryIndexOverride)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	tableToCreate.LSIs = updatedLSIs
-
-	if err := s.store.CreateTable(r.Context(), tx, tableToCreate); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if errors.Is(err, backupapp.ErrTargetTableExists) {
 			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
 		}
 		return nil, err
 	}
-	for _, item := range backup.SnapshotItems {
-		pk, sk, err := model.ExtractItemKeys(tableToCreate, item)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		if err := s.store.PutItem(r.Context(), tx, tableToCreate.Name, pk, sk, item); err != nil {
-			return nil, err
-		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"TableDescription": tableToCreate.Description(int64(len(backup.SnapshotItems)))}, nil
+	return map[string]any{"TableDescription": tableToCreate.Description(int64(restoredItems))}, nil
 }
 
 type updateContinuousBackupsRequest struct {
