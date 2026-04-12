@@ -45,11 +45,14 @@ type ItemRepo interface {
 type PITRRepo interface {
 	AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error
 	ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.ItemChangeCursor, error)
+	ListItemChangesUpTo(ctx context.Context, tableKey string, upTo int64) ([]model.ItemChange, error)
+	ListItemChangesUpToCursor(ctx context.Context, tableKey string, cursor model.ItemChangeCursor) ([]model.ItemChange, error)
 	ListItemChangesAfterCursorUpToCursor(ctx context.Context, tableKey string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error)
 	GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableKey string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error)
 	GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.PITRCheckpoint, error)
 	CreatePITRCheckpointFromCurrentState(ctx context.Context, tableKey string, changedAt int64) error
 	CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error)
+	DeleteItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error)
 }
 
 type BackupRepo interface {

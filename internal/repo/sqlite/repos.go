@@ -13,6 +13,7 @@ type TTLRepo interface {
 		SK string
 	}, error)
 	DeleteExpiredItem(ctx context.Context, tableKey, pk, sk string) error
+	DeleteExpiredItems(ctx context.Context, tableKey string, before int64, limit int) (int64, error)
 }
 
 type Factory struct {
@@ -39,28 +40,6 @@ type sqlTxRepo struct {
 	backend *Backend
 	tx      *sql.Tx
 }
-
-type TxRepo struct {
-	sqlTxRepo
-}
-
-func NewTxRepo(backend *Backend, tx *sql.Tx) TxRepo {
-	return TxRepo{sqlTxRepo: sqlTxRepo{backend: backend, tx: tx}}
-}
-
-func (r TxRepo) Tables() uow.TableRepo   { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Items() uow.ItemRepo     { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Streams() uow.StreamRepo { return streamRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) PITR() uow.PITRRepo      { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Backups() uow.BackupRepo { return backupRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) ResourcePolicies() uow.ResourcePolicyRepo {
-	return resourcePolicyRepo{sqlTxRepo: r.sqlTxRepo}
-}
-
-func (r TxRepo) PITRRepo() pitrRepo   { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) ItemRepo() itemRepo   { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) TableRepo() tableRepo { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) TTLRepo() ttlRepo     { return ttlRepo{sqlTxRepo: r.sqlTxRepo} }
 
 type txRepos struct {
 	tables   *tableRepo

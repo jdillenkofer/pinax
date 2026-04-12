@@ -28,7 +28,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo := NewTxRepo(s, tx)
+	repos := NewRepos(s, tx)
 
 	table := model.Table{
 		Name:      "ttl_cleanup",
@@ -40,7 +40,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 			AttrName: "ttl",
 		},
 	}
-	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
+	if err := repos.Tables().CreateTable(ctx, table); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 			"pk":  map[string]any{"S": fmt.Sprintf("e#%03d", i)},
 			"ttl": map[string]any{"N": "100"},
 		}
-		if err := repo.ItemRepo().PutItem(ctx, table, "S|"+fmt.Sprintf("e#%03d", i), model.NoSortKey, item); err != nil {
+		if err := repos.Items().PutItem(ctx, table, "S|"+fmt.Sprintf("e#%03d", i), model.NoSortKey, item); err != nil {
 			tx.Rollback()
 			t.Fatal(err)
 		}
@@ -59,7 +59,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 		"pk":  map[string]any{"S": "valid"},
 		"ttl": map[string]any{"N": "9999999999"},
 	}
-	if err := repo.ItemRepo().PutItem(ctx, table, "S|valid", model.NoSortKey, validItem); err != nil {
+	if err := repos.Items().PutItem(ctx, table, "S|valid", model.NoSortKey, validItem); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -72,18 +72,20 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo = NewTxRepo(s, tx)
+	repos = NewRepos(s, tx)
 	defer tx.Rollback()
 
-	deleted1, err := repo.TTLRepo().DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	ttlRepo := NewFactory(s).TTL(tx)
+
+	deleted1, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted2, err := repo.TTLRepo().DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	deleted2, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted3, err := repo.TTLRepo().DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	deleted3, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 		t.Fatalf("unexpected batch deletes: got (%d, %d, %d)", deleted1, deleted2, deleted3)
 	}
 
-	valid, err := repo.ItemRepo().GetItem(ctx, table.Name, "S|valid", model.NoSortKey)
+	valid, err := repos.Items().GetItem(ctx, table.Name, "S|valid", model.NoSortKey)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -33,7 +33,7 @@ func TestPITRHookAppendsAndPrunesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	repo := sqlite.NewTxRepo(s, tx)
+	repos := sqlite.NewRepos(s, tx)
 
 	nowMs := time.Now().UnixMilli()
 	table := model.Table{
@@ -43,12 +43,12 @@ func TestPITRHookAppendsAndPrunesHistory(t *testing.T) {
 		CreatedAt: 1,
 		PITR:      model.PointInTimeRecovery{Enabled: true, RecoveryPeriodInDays: 1},
 	}
-	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
+	if err := repos.Tables().CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
 	oldTs := nowMs - (2 * 24 * 60 * 60 * 1000)
-	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
+	if err := repos.PITR().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -64,7 +64,7 @@ func TestPITRHookAppendsAndPrunesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changes, err := repo.PITRRepo().ListItemChangesUpTo(ctx, table.Name, nowMs)
+	changes, err := repos.PITR().ListItemChangesUpTo(ctx, table.Name, nowMs)
 	if err != nil {
 		t.Fatal(err)
 	}
