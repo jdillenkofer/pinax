@@ -21,9 +21,12 @@ import (
 	"time"
 
 	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
+	itemopsapp "github.com/jdillenkofer/pinax/internal/app/itemops"
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
+	queryapp "github.com/jdillenkofer/pinax/internal/app/query"
 	resourcepolicyapp "github.com/jdillenkofer/pinax/internal/app/resourcepolicy"
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
+	transactionapp "github.com/jdillenkofer/pinax/internal/app/transaction"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
@@ -99,6 +102,9 @@ type Server struct {
 	unitOfWork                    uow.UnitOfWork
 	tableLifecycle                *tableapp.LifecycleService
 	tableService                  *tableapp.Service
+	queryService                  *queryapp.Service
+	itemOpsService                *itemopsapp.Service
+	transactionService            *transactionapp.Service
 	backupService                 *backupapp.Service
 	pitrService                   *pitrapp.Service
 	resourcePolicyService         *resourcepolicyapp.Service
@@ -171,6 +177,9 @@ func NewServer(db *sql.DB, txReposFactory reposqlite.Factory, requestAuthorizer 
 		streamIteratorTTL:             defaultStreamIteratorTTL,
 		streamIteratorSigningKey:      newStreamIteratorSigningKey(),
 	}
+	s.queryService = queryapp.NewService(unitOfWork, s.getActiveTableFromRepo)
+	s.itemOpsService = itemopsapp.NewService(unitOfWork, s.getActiveTableFromRepo)
+	s.transactionService = transactionapp.NewService(unitOfWork, s.getActiveTableFromRepo)
 	for _, opt := range opts {
 		opt(s)
 	}

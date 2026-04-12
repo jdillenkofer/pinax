@@ -3,18 +3,19 @@ package httpapi
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	itemopsapp "github.com/jdillenkofer/pinax/internal/app/itemops"
+	queryapp "github.com/jdillenkofer/pinax/internal/app/query"
+	transactionapp "github.com/jdillenkofer/pinax/internal/app/transaction"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
@@ -59,217 +60,156 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		return nil, awserr.Validation("ConditionalOperator is not supported")
 	}
 
-	var t model.Table
-	var items []map[string]any
-	targetHashKey := ""
-	targetRangeKey := ""
-	targetRangeType := ""
-	var queryGSI *model.GlobalSecondaryIndex
-	var queryLSI *model.LocalSecondaryIndex
+	target, err := s.queryService.ResolveQueryTarget(r.Context(), queryapp.ResolveQueryTargetInput{
+		TableName:      req.TableName,
+		IndexName:      strings.TrimSpace(req.IndexName),
+		ConsistentRead: req.ConsistentRead,
+	})
+	if err != nil {
+		var unknownIndexErr queryapp.ErrUnknownIndex
+		if errors.As(err, &unknownIndexErr) {
+			return nil, awserr.Validation("unknown index " + strings.TrimSpace(req.IndexName))
+		}
+		var indexNotActiveErr queryapp.ErrIndexNotActive
+		if errors.As(err, &indexNotActiveErr) {
+			return nil, awserr.ResourceInUse("Index " + strings.TrimSpace(req.IndexName) + " is not ACTIVE")
+		}
+		if errors.Is(err, queryapp.ErrConsistentReadOnGSI{}) {
+			return nil, awserr.Validation("ConsistentRead is not supported on global secondary indexes")
+		}
+		return nil, err
+	}
+
+	t := target.Table
+	targetHashKey := target.TargetHashKey
+	targetRangeKey := target.TargetRangeKey
+	targetRangeType := target.TargetRangeType
+	queryGSI := target.QueryGSI
+	queryLSI := target.QueryLSI
 	selectMode := ""
 	projectionExpression := ""
 	var expressionValues map[string]any
 	var skToken *sortKeyCondition
 	pk := ""
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		var err error
-		t, err = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
+	targetHashType := target.TargetHashType
+
+	selectMode, projectionExpression, err = normalizeQuerySelect(req, strings.TrimSpace(req.IndexName) != "", queryGSI != nil)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+
+	if strings.TrimSpace(req.KeyConditionExpression) != "" && len(req.KeyConditions) > 0 {
+		return nil, awserr.Validation("KeyConditionExpression and KeyConditions cannot both be set")
+	}
+
+	expressionValues = cloneExpressionValues(req.ExpressionAttributeValues)
+	var pkToken keyExprToken
+	if strings.TrimSpace(req.KeyConditionExpression) != "" {
+		pkToken, skToken, err = parseKeyCondition(req.KeyConditionExpression)
 		if err != nil {
-			return err
+			return nil, awserr.Validation(err.Error())
 		}
-
-		targetHashKey = t.HashKey
-		targetRangeKey = t.RangeKey
-		targetHashType := t.HashType
-		targetRangeType = t.RangeType
-		if strings.TrimSpace(req.IndexName) != "" {
-			gsi, ok := t.GetGSI(req.IndexName)
-			if ok {
-				if gsi.Status != "" && gsi.Status != model.IndexStatusActive {
-					return awserr.ResourceInUse("Index " + req.IndexName + " is not ACTIVE")
-				}
-				if req.ConsistentRead {
-					return awserr.Validation("ConsistentRead is not supported on global secondary indexes")
-				}
-				queryGSI = &gsi
-				targetHashKey = gsi.HashKey
-				targetRangeKey = gsi.RangeKey
-				targetHashType = gsi.HashType
-				targetRangeType = gsi.RangeType
-			} else {
-				lsi, ok := t.GetLSI(req.IndexName)
-				if !ok {
-					return awserr.Validation("unknown index " + req.IndexName)
-				}
-				queryLSI = &lsi
-				targetHashKey = t.HashKey
-				targetRangeKey = lsi.RangeKey
-				targetHashType = t.HashType
-				targetRangeType = lsi.RangeType
-			}
-		}
-
-		selectMode, projectionExpression, err = normalizeQuerySelect(req, strings.TrimSpace(req.IndexName) != "", queryGSI != nil)
+	} else {
+		pkToken, skToken, expressionValues, err = parseLegacyQueryKeyConditions(req.KeyConditions, targetHashKey, targetRangeKey, expressionValues)
 		if err != nil {
-			return awserr.Validation(err.Error())
+			return nil, awserr.Validation(err.Error())
 		}
+	}
 
-		if strings.TrimSpace(req.KeyConditionExpression) != "" && len(req.KeyConditions) > 0 {
-			return awserr.Validation("KeyConditionExpression and KeyConditions cannot both be set")
-		}
+	pkAttr, err := resolveNameStrict(pkToken.attr, req.ExpressionAttributeNames)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
+	if pkAttr != targetHashKey {
+		return nil, awserr.Validation("partition key condition must target HASH key")
+	}
+	pkValue, ok := expressionValues[pkToken.value]
+	if !ok {
+		return nil, awserr.Validation("missing partition key expression value")
+	}
+	if err := model.ValidateKeyAttributeType(pkValue, targetHashType, targetHashKey); err != nil {
+		return nil, awserr.Validation("One or more parameter values were invalid: Condition parameter type does not match schema type")
+	}
+	pk, err = model.SerializeKeyValue(pkValue)
+	if err != nil {
+		return nil, awserr.Validation(err.Error())
+	}
 
-		expressionValues = cloneExpressionValues(req.ExpressionAttributeValues)
-		var pkToken keyExprToken
-		if strings.TrimSpace(req.KeyConditionExpression) != "" {
-			pkToken, skToken, err = parseKeyCondition(req.KeyConditionExpression)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-		} else {
-			pkToken, skToken, expressionValues, err = parseLegacyQueryKeyConditions(req.KeyConditions, targetHashKey, targetRangeKey, expressionValues)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-		}
-
-		pkAttr, err := resolveNameStrict(pkToken.attr, req.ExpressionAttributeNames)
+	scanForward := true
+	if req.ScanIndexForward != nil {
+		scanForward = *req.ScanIndexForward
+	}
+	if skToken != nil {
+		skAttr, err := resolveNameStrict(skToken.attr, req.ExpressionAttributeNames)
 		if err != nil {
-			return awserr.Validation(err.Error())
+			return nil, awserr.Validation(err.Error())
 		}
-		if pkAttr != targetHashKey {
-			return awserr.Validation("partition key condition must target HASH key")
+		if skAttr != targetRangeKey {
+			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
-		pkValue, ok := expressionValues[pkToken.value]
-		if !ok {
-			return awserr.Validation("missing partition key expression value")
-		}
-		if err := model.ValidateKeyAttributeType(pkValue, targetHashType, targetHashKey); err != nil {
-			return awserr.Validation("One or more parameter values were invalid: Condition parameter type does not match schema type")
-		}
-		pk, err = model.SerializeKeyValue(pkValue)
-		if err != nil {
-			return awserr.Validation(err.Error())
-		}
+	}
 
-		scanForward := true
-		if req.ScanIndexForward != nil {
-			scanForward = *req.ScanIndexForward
-		}
-
-		if queryGSI != nil {
-			items, err = repos.Items().QueryByGSI(txCtx, t.Name, req.IndexName, pk, "", true, 0)
-			if err != nil {
-				return err
-			}
-			items, err = orderItemsForGSI(items, t, *queryGSI, req.ExclusiveStartKey, scanForward)
-		} else if queryLSI != nil {
-			items, err = repos.Items().QueryByGSI(txCtx, t.Name, req.IndexName, pk, "", true, 0)
-			if err != nil {
-				return err
-			}
-			items, err = orderItemsForLSI(items, t, *queryLSI, req.ExclusiveStartKey, scanForward)
-		} else if skToken == nil {
-			if targetRangeKey == "" {
-				items, err = repos.Items().QueryByPKSK(txCtx, t.Name, pk, model.NoSortKey)
-			} else {
-				items, err = repos.Items().QueryByPK(txCtx, t.Name, pk, "", true, 0)
-				if err == nil {
-					items, err = orderItemsForTable(items, t, req.ExclusiveStartKey, scanForward)
-				}
-			}
-		} else {
-			skAttr, err := resolveNameStrict(skToken.attr, req.ExpressionAttributeNames)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-			if skAttr != targetRangeKey {
-				return awserr.Validation("sort key condition must target RANGE key")
-			}
-			items, err = repos.Items().QueryByPK(txCtx, t.Name, pk, "", true, 0)
-			if err == nil {
-				items, err = orderItemsForTable(items, t, req.ExclusiveStartKey, scanForward)
-			}
-		}
-		if err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
+	items, err := s.queryService.QueryItems(r.Context(), queryapp.QueryItemsInput{
+		Target:              target,
+		IndexName:           strings.TrimSpace(req.IndexName),
+		PK:                  pk,
+		ExclusiveStartKey:   req.ExclusiveStartKey,
+		ScanForward:         scanForward,
+		HasSortKeyCondition: skToken != nil,
+		OrderItemsForGSI:    orderItemsForGSI,
+		OrderItemsForLSI:    orderItemsForLSI,
+		OrderItemsForTable:  orderItemsForTable,
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	limit := parseLimit(req.Limit)
-	count := 0
-	scanned := 0
-	filtered := make([]map[string]any, 0)
-	var lastScanned map[string]any
-	totalRead := 0.0
-
-	for _, item := range items {
-		queryItem := item
-		if queryGSI != nil {
-			queryItem = projectItemForGSI(item, t, *queryGSI)
-		} else if queryLSI != nil {
-			queryItem = projectItemForLSI(item, t, *queryLSI)
-		}
-
-		if strings.TrimSpace(req.IndexName) != "" {
-			raw, ok := queryItem[targetHashKey]
-			if !ok {
-				continue
+	processed, err := s.queryService.ProcessQueryItems(queryapp.QueryProcessInput{
+		Table:             t,
+		Items:             items,
+		Limit:             limit,
+		SelectMode:        selectMode,
+		ConsistentRead:    req.ConsistentRead,
+		IndexName:         strings.TrimSpace(req.IndexName),
+		TargetHashKey:     targetHashKey,
+		PK:                pk,
+		QueryGSI:          queryGSI,
+		QueryLSI:          queryLSI,
+		ProjectItemForGSI: projectItemForGSI,
+		ProjectItemForLSI: projectItemForLSI,
+		SortConditionMatches: func(queryItem map[string]any) (bool, error) {
+			if skToken == nil {
+				return true, nil
 			}
-			itemPK, err := model.SerializeKeyValue(raw)
-			if err != nil || itemPK != pk {
-				continue
+			return sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, expressionValues, targetRangeType)
+		},
+		ApplyFilter: func(queryItem map[string]any) (bool, error) {
+			ok, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, expressionValues)
+			if err != nil {
+				return false, awserr.Validation(filterExpressionValidationMessage(err))
 			}
-		}
-
-		if skToken != nil {
-			ok, err := sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, expressionValues, targetRangeType)
+			return ok, nil
+		},
+		ApplyProjection: func(queryItem map[string]any) (map[string]any, error) {
+			projected, err := applyProjection(queryItem, projectionExpression, req.ExpressionAttributeNames)
 			if err != nil {
 				return nil, awserr.Validation(err.Error())
 			}
-			if !ok {
-				continue
-			}
-		}
-
-		scanned++
-		lastScanned = keyFromItem(t, item)
-		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(queryItem), req.ConsistentRead)
-
-		matches, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, expressionValues)
-		if err != nil {
-			return nil, awserr.Validation(filterExpressionValidationMessage(err))
-		}
-		if matches {
-			if selectMode != "COUNT" {
-				emit := queryItem
-				switch selectMode {
-				case "ALL_ATTRIBUTES":
-					emit = item
-				case "SPECIFIC_ATTRIBUTES":
-					projected, err := applyProjection(queryItem, projectionExpression, req.ExpressionAttributeNames)
-					if err != nil {
-						return nil, awserr.Validation(err.Error())
-					}
-					emit = projected
-				}
-				filtered = append(filtered, cloneItem(emit))
-			}
-			count++
-		}
-
-		if limit > 0 && scanned >= limit {
-			break
-		}
+			return projected, nil
+		},
+		CloneItem:   cloneItem,
+		KeyFromItem: keyFromItem,
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	resp := map[string]any{"Count": count, "ScannedCount": scanned}
+	resp := map[string]any{"Count": processed.Count, "ScannedCount": processed.Scanned}
 	if selectMode != "COUNT" {
-		resp["Items"] = filtered
+		resp["Items"] = processed.Items
 	}
-	if err := s.ensureReadCapacity(t, totalRead); err != nil {
+	if err := s.ensureReadCapacity(t, processed.TotalRead); err != nil {
 		return nil, err
 	}
 	indexType := ""
@@ -279,9 +219,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	if queryLSI != nil {
 		indexType = "LSI"
 	}
-	setSingleQueryConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, req.IndexName, indexType, totalRead)
-	if limit > 0 && scanned == limit && lastScanned != nil {
-		resp["LastEvaluatedKey"] = lastScanned
+	setSingleQueryConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, req.IndexName, indexType, processed.TotalRead)
+	if limit > 0 && processed.Scanned == limit && processed.LastScanned != nil {
+		resp["LastEvaluatedKey"] = processed.LastScanned
 	}
 	return resp, nil
 }
@@ -325,79 +265,60 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 		}
 	}
 
-	var t model.Table
-	var items []map[string]any
-	startPK := ""
-	startSK := ""
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		var err error
-		t, err = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
-		if err != nil {
-			return err
-		}
-		if len(req.ExclusiveStartKey) > 0 {
-			startPK, startSK, err = model.ExtractKey(t, req.ExclusiveStartKey)
-			if err != nil {
-				return awserr.Validation(err.Error())
+	t, items, err := s.queryService.ScanItems(r.Context(), queryapp.ScanItemsInput{
+		TableName: req.TableName,
+		ResolveStartKey: func(t model.Table) (string, string, error) {
+			if len(req.ExclusiveStartKey) == 0 {
+				return "", "", nil
 			}
-		}
-		items, err = repos.Items().Scan(txCtx, t.Name, startPK, startSK, 0)
-		return err
-	}); err != nil {
+			pk, sk, err := model.ExtractKey(t, req.ExclusiveStartKey)
+			if err != nil {
+				return "", "", awserr.Validation(err.Error())
+			}
+			return pk, sk, nil
+		},
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	limit := parseLimit(req.Limit)
-	filtered := make([]map[string]any, 0)
-	scanned := 0
-	var lastScanned map[string]any
-	totalRead := 0.0
-	for _, item := range items {
-		if segmentEnabled {
-			rawPK, ok := item[t.HashKey]
-			if !ok {
-				continue
-			}
-			serializedPK, err := model.SerializeKeyValue(rawPK)
+	processed, err := s.queryService.ProcessScanItems(queryapp.ScanProcessInput{
+		Table:          t,
+		Items:          items,
+		Limit:          limit,
+		SegmentEnabled: segmentEnabled,
+		Segment:        segment,
+		TotalSegments:  totalSegments,
+		ConsistentRead: req.ConsistentRead,
+		ApplyFilter: func(item map[string]any) (bool, error) {
+			ok, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
 			if err != nil {
-				continue
+				return false, awserr.Validation(filterExpressionValidationMessage(err))
 			}
-			if scanSegmentForPK(serializedPK, totalSegments) != segment {
-				continue
+			return ok, nil
+		},
+		ApplyProjection: func(item map[string]any) (map[string]any, error) {
+			projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
+			if err != nil {
+				return nil, awserr.Validation(err.Error())
 			}
-		}
-		scanned++
-		lastScanned = keyFromItem(t, item)
-		totalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), req.ConsistentRead)
-
-		matches, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-		if err != nil {
-			return nil, awserr.Validation(filterExpressionValidationMessage(err))
-		}
-		if !matches {
-			if limit > 0 && scanned >= limit {
-				break
-			}
-			continue
-		}
-		projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		filtered = append(filtered, projected)
-		if limit > 0 && scanned >= limit {
-			break
-		}
-
-	}
-
-	resp := map[string]any{"Items": filtered, "Count": len(filtered), "ScannedCount": scanned}
-	if err := s.ensureReadCapacity(t, totalRead); err != nil {
+			return projected, nil
+		},
+		ScanSegmentForPK: func(pk string) int { return scanSegmentForPK(pk, totalSegments) },
+		KeyFromItem:      keyFromItem,
+	})
+	if err != nil {
 		return nil, err
 	}
-	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, totalRead, 0)
-	if limit > 0 && scanned == limit && lastScanned != nil {
-		resp["LastEvaluatedKey"] = lastScanned
+
+	resp := map[string]any{"Items": processed.Items, "Count": len(processed.Items), "ScannedCount": processed.Scanned}
+	if err := s.ensureReadCapacity(t, processed.TotalRead); err != nil {
+		return nil, err
+	}
+	setSingleConsumedCapacity(resp, req.ReturnConsumedCapacity, t.Name, processed.TotalRead, 0)
+	if limit > 0 && processed.Scanned == limit && processed.LastScanned != nil {
+		resp["LastEvaluatedKey"] = processed.LastScanned
 	}
 	return resp, nil
 }
@@ -430,92 +351,58 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 		return nil, awserr.Validation("BatchGetItem supports at most 100 keys")
 	}
 
-	batchGetProcessLimit := processingLimitFromEnv("PINAX_BATCH_GET_PROCESS_LIMIT")
-	processed := 0
-	responses := map[string]any{}
-	unprocessed := map[string]any{}
-	readByTable := map[string]float64{}
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		for tableName, itemReq := range req.RequestItems {
-			projectionExpression, err := normalizeLegacyAttributesProjection(itemReq.AttributesToGet, itemReq.ProjectionExpression)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-			if _, err := applyProjection(map[string]any{}, projectionExpression, itemReq.ExpressionAttributeNames); err != nil {
-				return awserr.Validation(err.Error())
-			}
-			if len(itemReq.Keys) == 0 {
-				return awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
-			}
-			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
-			if err != nil {
-				return err
-			}
-			items := make([]map[string]any, 0, len(itemReq.Keys))
-			unprocessedKeys := make([]map[string]any, 0)
-			seenKeys := map[string]struct{}{}
-			for _, key := range itemReq.Keys {
-				pk, sk, err := model.ExtractKey(t, key)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				target := tableName + "|" + pk + "|" + sk
-				if _, exists := seenKeys[target]; exists {
-					return awserr.Validation("Provided list of item keys contains duplicates")
-				}
-				seenKeys[target] = struct{}{}
-				if batchGetProcessLimit > 0 && processed >= batchGetProcessLimit {
-					unprocessedKeys = append(unprocessedKeys, key)
-					continue
-				}
-				processed++
-
-				item, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				if err != nil {
-					if errors.Is(err, sql.ErrNoRows) {
-						units := model.CalculateReadCapacityUnits(1, itemReq.ConsistentRead)
-						if !s.reserveReadCapacity(t, units) {
-							unprocessedKeys = append(unprocessedKeys, key)
-							continue
-						}
-						readByTable[tableName] += units
-						continue
-					}
-					return err
-				}
-				units := model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), itemReq.ConsistentRead)
-				if !s.reserveReadCapacity(t, units) {
-					unprocessedKeys = append(unprocessedKeys, key)
-					continue
-				}
-				projected, err := applyProjection(item, projectionExpression, itemReq.ExpressionAttributeNames)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				items = append(items, projected)
-				readByTable[tableName] += units
-			}
-			responses[tableName] = items
-			if len(unprocessedKeys) > 0 {
-				entry := map[string]any{
-					"Keys":                     unprocessedKeys,
-					"ConsistentRead":           itemReq.ConsistentRead,
-					"ProjectionExpression":     itemReq.ProjectionExpression,
-					"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
-				}
-				if len(itemReq.AttributesToGet) > 0 {
-					entry["AttributesToGet"] = itemReq.AttributesToGet
-				}
-				unprocessed[tableName] = entry
-			}
+	input := itemopsapp.BatchGetInput{RequestItems: map[string]itemopsapp.BatchGetTableRequest{}, ProcessLimit: processingLimitFromEnv("PINAX_BATCH_GET_PROCESS_LIMIT"), ReserveRead: s.reserveReadCapacity}
+	for tableName, itemReq := range req.RequestItems {
+		projectionExpression, err := normalizeLegacyAttributesProjection(itemReq.AttributesToGet, itemReq.ProjectionExpression)
+		if err != nil {
+			return nil, awserr.Validation(err.Error())
 		}
-		return nil
-	}); err != nil {
+		if _, err := applyProjection(map[string]any{}, projectionExpression, itemReq.ExpressionAttributeNames); err != nil {
+			return nil, awserr.Validation(err.Error())
+		}
+		if len(itemReq.Keys) == 0 {
+			return nil, awserr.Validation("BatchGetItem request for table " + tableName + " must include at least one key")
+		}
+		names := itemReq.ExpressionAttributeNames
+		input.RequestItems[tableName] = itemopsapp.BatchGetTableRequest{
+			Keys:           itemReq.Keys,
+			ConsistentRead: itemReq.ConsistentRead,
+			Project: func(item map[string]any) (map[string]any, error) {
+				return applyProjection(item, projectionExpression, names)
+			},
+		}
+	}
+
+	result, err := s.itemOpsService.BatchGet(r.Context(), input)
+	if err != nil {
+		var validationErr itemopsapp.ValidationError
+		if errors.As(err, &validationErr) {
+			return nil, awserr.Validation(validationErr.Message)
+		}
 		return nil, err
 	}
 
+	responses := map[string]any{}
+	for tableName, items := range result.Responses {
+		responses[tableName] = items
+	}
+	unprocessed := map[string]any{}
+	for tableName, keys := range result.Unprocessed {
+		itemReq := req.RequestItems[tableName]
+		entry := map[string]any{
+			"Keys":                     keys,
+			"ConsistentRead":           itemReq.ConsistentRead,
+			"ProjectionExpression":     itemReq.ProjectionExpression,
+			"ExpressionAttributeNames": itemReq.ExpressionAttributeNames,
+		}
+		if len(itemReq.AttributesToGet) > 0 {
+			entry["AttributesToGet"] = itemReq.AttributesToGet
+		}
+		unprocessed[tableName] = entry
+	}
+
 	resp := map[string]any{"Responses": responses, "UnprocessedKeys": unprocessed}
-	for tableName, units := range readByTable {
+	for tableName, units := range result.ReadByTable {
 		mode := req.ReturnConsumedCapacity
 		if mode == "" {
 			mode = req.RequestItems[tableName].ReturnConsumedCapacity
@@ -562,171 +449,49 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, awserr.Validation("BatchWriteItem supports at most 25 operations")
 	}
 
-	tableNames := make([]string, 0, len(req.RequestItems))
-	for tableName := range req.RequestItems {
-		tableNames = append(tableNames, tableName)
+	input := itemopsapp.BatchWriteInput{
+		RequestItems:       map[string][]itemopsapp.BatchWriteOperation{},
+		ProcessLimit:       processingLimitFromEnv("PINAX_BATCH_WRITE_PROCESS_LIMIT"),
+		IncludeItemMetrics: itemCollectionMode == "SIZE",
+		ReserveWrite:       s.reserveWriteCapacity,
+		EmitMutation: func(ctx context.Context, repos uow.Repos, t model.Table, eventName string, key map[string]any, oldImage map[string]any, newImage map[string]any, changedAt int64) error {
+			return s.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromKey(t, key), oldImage, newImage, changedAt)
+		},
 	}
-	sort.Strings(tableNames)
-
-	batchWriteProcessLimit := processingLimitFromEnv("PINAX_BATCH_WRITE_PROCESS_LIMIT")
-	processed := 0
-	unprocessed := map[string]any{}
-	writeByTable := map[string]float64{}
-	itemCollectionMetrics := map[string][]map[string]any{}
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		for _, tableName := range tableNames {
-			ops := req.RequestItems[tableName]
-			if len(ops) == 0 {
-				return awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
-			}
-			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
-			if err != nil {
-				return err
-			}
-
-			seenKeys := map[string]struct{}{}
-			seenItemCollections := map[string]struct{}{}
-			for _, op := range ops {
-				if len(op.PutRequest.Item) == 0 && len(op.DeleteRequest.Key) == 0 {
-					return awserr.Validation("write request must contain either PutRequest or DeleteRequest")
-				}
-				if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
-					return awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
-				}
-				if batchWriteProcessLimit > 0 && processed >= batchWriteProcessLimit {
-					if unprocessed[tableName] == nil {
-						unprocessed[tableName] = make([]any, 0)
-					}
-					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
-					continue
-				}
-
-				if len(op.PutRequest.Item) > 0 {
-					if model.ItemTooLarge(op.PutRequest.Item) {
-						return awserr.Validation("Item size has exceeded the maximum allowed size")
-					}
-					pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
-					if err != nil {
-						return awserr.Validation(err.Error())
-					}
-					if err := model.ValidateSecondaryIndexKeyTypes(t, op.PutRequest.Item); err != nil {
-						return awserr.Validation(err.Error())
-					}
-					k := tableName + "|" + pk + "|" + sk
-					if _, exists := seenKeys[k]; exists {
-						return awserr.Validation("Provided list of item keys contains duplicates")
-					}
-					seenKeys[k] = struct{}{}
-					current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-					existed := true
-					if err != nil && !errors.Is(err, sql.ErrNoRows) {
-						return err
-					}
-					if errors.Is(err, sql.ErrNoRows) {
-						existed = false
-						current = map[string]any{}
-					}
-					writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
-					if !s.reserveWriteCapacity(t, writeUnits) {
-						if unprocessed[tableName] == nil {
-							unprocessed[tableName] = make([]any, 0)
-						}
-						unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
-						continue
-					}
-					if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, op.PutRequest.Item); err != nil {
-						return err
-					}
-					eventName := "INSERT"
-					streamOld := current
-					if existed {
-						eventName = "MODIFY"
-					} else {
-						streamOld = nil
-					}
-					if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
-						return err
-					}
-					writeByTable[tableName] += writeUnits
-					if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
-						hashValue := op.PutRequest.Item[t.HashKey]
-						if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
-							if _, exists := seenItemCollections[keyToken]; !exists {
-								seenItemCollections[keyToken] = struct{}{}
-								itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
-									"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
-									"SizeEstimateRangeGB": []float64{0, 1},
-								})
-							}
-						}
-					}
-					processed++
-				}
-				if len(op.DeleteRequest.Key) > 0 {
-					pk, sk, err := model.ExtractKey(t, op.DeleteRequest.Key)
-					if err != nil {
-						return awserr.Validation(err.Error())
-					}
-					k := tableName + "|" + pk + "|" + sk
-					if _, exists := seenKeys[k]; exists {
-						return awserr.Validation("Provided list of item keys contains duplicates")
-					}
-					seenKeys[k] = struct{}{}
-					current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-					existed := true
-					if err != nil && !errors.Is(err, sql.ErrNoRows) {
-						return err
-					}
-					if errors.Is(err, sql.ErrNoRows) {
-						existed = false
-						current = op.DeleteRequest.Key
-					}
-					writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-					if !s.reserveWriteCapacity(t, writeUnits) {
-						if unprocessed[tableName] == nil {
-							unprocessed[tableName] = make([]any, 0)
-						}
-						unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
-						continue
-					}
-					if err := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); err != nil {
-						return err
-					}
-					if existed {
-						if len(current) > 0 {
-							if err := s.emitMutationEventForWrite(txCtx, repos, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
-								return err
-							}
-						}
-					}
-					writeByTable[tableName] += writeUnits
-					if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
-						hashValue := op.DeleteRequest.Key[t.HashKey]
-						if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
-							if _, exists := seenItemCollections[keyToken]; !exists {
-								seenItemCollections[keyToken] = struct{}{}
-								itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
-									"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
-									"SizeEstimateRangeGB": []float64{0, 1},
-								})
-							}
-						}
-					}
-					processed++
-				}
-			}
+	for tableName, ops := range req.RequestItems {
+		if len(ops) == 0 {
+			return nil, awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
 		}
-		return nil
-	}); err != nil {
+		converted := make([]itemopsapp.BatchWriteOperation, 0, len(ops))
+		for _, op := range ops {
+			converted = append(converted, itemopsapp.BatchWriteOperation{
+				PutItem:    op.PutRequest.Item,
+				DeleteKey:  op.DeleteRequest.Key,
+				RawRequest: op,
+			})
+		}
+		input.RequestItems[tableName] = converted
+	}
+
+	result, err := s.itemOpsService.BatchWrite(r.Context(), input)
+	if err != nil {
+		var validationErr itemopsapp.ValidationError
+		if errors.As(err, &validationErr) {
+			return nil, awserr.Validation(validationErr.Message)
+		}
 		return nil, err
 	}
 
+	unprocessed := map[string]any{}
+	for tableName, ops := range result.Unprocessed {
+		unprocessed[tableName] = ops
+	}
 	resp := map[string]any{"UnprocessedItems": unprocessed}
-	for tableName, units := range writeByTable {
+	for tableName, units := range result.WriteByTable {
 		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
 	}
 	if itemCollectionMode == "SIZE" {
-		resp["ItemCollectionMetrics"] = itemCollectionMetrics
+		resp["ItemCollectionMetrics"] = result.ItemCollectionMetrics
 	}
 	return resp, nil
 }
@@ -755,54 +520,30 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 		return nil, awserr.Validation("TransactGetItems supports at most 25 items")
 	}
 
-	responses := make([]map[string]any, 0, len(req.TransactItems))
-	readByTable := map[string]float64{}
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		for _, txItem := range req.TransactItems {
-			g := txItem.Get
-			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), g.TableName)
-			if err != nil {
-				return err
-			}
-			pk, sk, err := model.ExtractKey(t, g.Key)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-			item, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					if _, err := applyProjection(map[string]any{}, g.ProjectionExpression, g.ExpressionAttributeNames); err != nil {
-						return awserr.Validation(err.Error())
-					}
-					readByTable[g.TableName] += model.CalculateReadCapacityUnits(1, true)
-					responses = append(responses, map[string]any{})
-					continue
-				}
-				return err
-			}
-			projected, err := applyProjection(item, g.ProjectionExpression, g.ExpressionAttributeNames)
-			if err != nil {
-				return awserr.Validation(err.Error())
-			}
-			readByTable[g.TableName] += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), true)
-			responses = append(responses, map[string]any{"Item": projected})
+	input := transactionapp.TransactGetInput{
+		Items:           make([]transactionapp.TransactGetItem, 0, len(req.TransactItems)),
+		ApplyProjection: applyProjection,
+		EnsureRead:      s.ensureReadCapacity,
+	}
+	for _, txItem := range req.TransactItems {
+		input.Items = append(input.Items, transactionapp.TransactGetItem{
+			TableName:            txItem.Get.TableName,
+			Key:                  txItem.Get.Key,
+			ProjectionExpression: txItem.Get.ProjectionExpression,
+			ExpressionNames:      txItem.Get.ExpressionAttributeNames,
+		})
+	}
+	result, err := s.transactionService.TransactGet(r.Context(), input)
+	if err != nil {
+		var validationErr transactionapp.ValidationError
+		if errors.As(err, &validationErr) {
+			return nil, awserr.Validation(validationErr.Message)
 		}
-		for tableName, units := range readByTable {
-			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
-			if err != nil {
-				return err
-			}
-			if err := s.ensureReadCapacity(t, units); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
 		return nil, err
 	}
 
-	resp := map[string]any{"Responses": responses}
-	for tableName, units := range readByTable {
+	resp := map[string]any{"Responses": result.Responses}
+	for tableName, units := range result.ReadByTable {
 		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, units, 0)
 	}
 	return resp, nil
@@ -862,328 +603,77 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	if len(req.TransactItems) > 25 {
 		return nil, awserr.Validation("TransactWriteItems supports at most 25 actions")
 	}
-	var response map[string]any
-	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		nowMillis := time.Now().UnixMilli()
-		if strings.TrimSpace(req.ClientRequestToken) != "" {
-			if err := repos.Items().DeleteExpiredTransactWriteIdempotency(txCtx, nowMillis); err != nil {
-				return err
-			}
-			rec, err := repos.Items().GetTransactWriteIdempotency(txCtx, req.ClientRequestToken, nowMillis)
-			if err == nil {
-				hash, err := transactWriteRequestHash(req)
-				if err != nil {
-					return err
-				}
-				if rec.RequestHash != hash {
-					return awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
-				}
-				response = rec.Response
-				return nil
-			}
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-		}
-
-		seenTargets := map[string]struct{}{}
-		writeByTable := map[string]float64{}
-
-		for i, txItem := range req.TransactItems {
-			actions := 0
-			if len(txItem.Put.Item) > 0 {
-				actions++
-			}
-			if len(txItem.Delete.Key) > 0 {
-				actions++
-			}
-			if len(txItem.Update.Key) > 0 {
-				actions++
-			}
-			if len(txItem.ConditionCheck.Key) > 0 {
-				actions++
-			}
-			if actions != 1 {
-				return awserr.Validation("TransactItems can only contain one of Check, Put, Update or Delete")
-			}
-
-			if len(txItem.Put.Item) > 0 {
-				if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
-					return awserr.Validation(err.Error())
-				}
-				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Put.TableName)
-				if err != nil {
-					return err
-				}
-				pk, sk, err := model.ExtractItemKeys(t, txItem.Put.Item)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				target := t.Name + "|" + pk + "|" + sk
-				if _, exists := seenTargets[target]; exists {
-					return awserr.Validation("Transaction request cannot include multiple operations on one item")
-				}
-				seenTargets[target] = struct{}{}
-
-				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				itemExisted := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					itemExisted = false
-					current = map[string]any{}
-				}
-				ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-				}
-				if !ok {
-					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-						Code:    "ConditionalCheckFailed",
-						Message: "The conditional request failed",
-						Item:    itemForConditionFailure(txItem.Put.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-					})
-					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-				}
-				if model.ItemTooLarge(txItem.Put.Item) {
-					return awserr.Validation("Item size has exceeded the maximum allowed size")
-				}
-				if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-				}
-				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, txItem.Put.Item); err != nil {
-					return err
-				}
-				eventName := "INSERT"
-				streamOld := current
-				if itemExisted {
-					eventName = "MODIFY"
-				} else {
-					streamOld = nil
-				}
-				if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
-					return err
-				}
-				writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
-				continue
-			}
-
-			if len(txItem.Delete.Key) > 0 {
-				if err := validateReturnValuesOnConditionCheckFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure); err != nil {
-					return awserr.Validation(err.Error())
-				}
-				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Delete.TableName)
-				if err != nil {
-					return err
-				}
-				pk, sk, err := model.ExtractKey(t, txItem.Delete.Key)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				target := t.Name + "|" + pk + "|" + sk
-				if _, exists := seenTargets[target]; exists {
-					return awserr.Validation("Transaction request cannot include multiple operations on one item")
-				}
-				seenTargets[target] = struct{}{}
-
-				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				itemExisted := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					itemExisted = false
-					current = map[string]any{}
-				}
-				ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-				}
-				if !ok {
-					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-						Code:    "ConditionalCheckFailed",
-						Message: "The conditional request failed",
-						Item:    itemForConditionFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-					})
-					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-				}
-				if err := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); err != nil {
-					return err
-				}
-				if itemExisted {
-					if err := s.emitMutationEventForWrite(txCtx, repos, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
-						return err
-					}
-				}
-				writeByTable[txItem.Delete.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-				continue
-			}
-
-			if len(txItem.Update.Key) > 0 {
-				if err := validateReturnValuesOnConditionCheckFailure(txItem.Update.ReturnValuesOnConditionCheckFailure); err != nil {
-					return awserr.Validation(err.Error())
-				}
-				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Update.TableName)
-				if err != nil {
-					return err
-				}
-				pk, sk, err := model.ExtractKey(t, txItem.Update.Key)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				target := t.Name + "|" + pk + "|" + sk
-				if _, exists := seenTargets[target]; exists {
-					return awserr.Validation("Transaction request cannot include multiple operations on one item")
-				}
-				seenTargets[target] = struct{}{}
-
-				existing, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				itemExisted := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					itemExisted = false
-					existing = map[string]any{}
-				}
-
-				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				if err != nil {
-					if errors.Is(err, sql.ErrNoRows) {
-						current = map[string]any{t.HashKey: txItem.Update.Key[t.HashKey]}
-						if t.RangeKey != "" {
-							current[t.RangeKey] = txItem.Update.Key[t.RangeKey]
-						}
-					} else {
-						return err
-					}
-				}
-				ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-				}
-				if !ok {
-					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-						Code:    "ConditionalCheckFailed",
-						Message: "The conditional request failed",
-						Item:    itemForConditionFailure(txItem.Update.ReturnValuesOnConditionCheckFailure, existing, itemExisted),
-					})
-					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-				}
-				plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-				}
-				updated, _, err := applyUpdatePlan(current, plan)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-				}
-				if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-				}
-				if model.ItemTooLarge(updated) {
-					return awserr.Validation("Item size has exceeded the maximum allowed size")
-				}
-				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, updated); err != nil {
-					return err
-				}
-				eventName := "INSERT"
-				streamOld := existing
-				if itemExisted {
-					eventName = "MODIFY"
-				} else {
-					streamOld = nil
-				}
-				if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
-					return err
-				}
-				writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
-				continue
-			}
-
-			if len(txItem.ConditionCheck.Key) > 0 {
-				if err := validateReturnValuesOnConditionCheckFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure); err != nil {
-					return awserr.Validation(err.Error())
-				}
-				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.ConditionCheck.TableName)
-				if err != nil {
-					return err
-				}
-				pk, sk, err := model.ExtractKey(t, txItem.ConditionCheck.Key)
-				if err != nil {
-					return awserr.Validation(err.Error())
-				}
-				target := t.Name + "|" + pk + "|" + sk
-				if _, exists := seenTargets[target]; exists {
-					return awserr.Validation("Transaction request cannot include multiple operations on one item")
-				}
-				seenTargets[target] = struct{}{}
-
-				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
-				itemExisted := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					itemExisted = false
-					current = map[string]any{}
-				}
-				ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
-				if err != nil {
-					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-				}
-				if !ok {
-					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-						Code:    "ConditionalCheckFailed",
-						Message: "The conditional request failed",
-						Item:    itemForConditionFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-					})
-					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-				}
-				continue
-			}
-
-			return awserr.Validation("each transact item must contain one operation")
-		}
-		for tableName, units := range writeByTable {
-			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
+	input := transactionapp.TransactWriteInput{
+		ClientRequestToken:   strings.TrimSpace(req.ClientRequestToken),
+		NowMillis:            time.Now().UnixMilli(),
+		IdempotencyTTLMillis: int64((10 * time.Minute) / time.Millisecond),
+		ValidateReturnOnFail: validateReturnValuesOnConditionCheckFailure,
+		EvaluateCondition:    expr.Evaluate,
+		ApplyUpdate: func(current map[string]any, updateExpression string, names map[string]string, values map[string]any) (map[string]any, error) {
+			plan, err := parseUpdateExpression(updateExpression, names, values)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			if err := s.ensureWriteCapacity(t, units); err != nil {
-				return err
+			updated, _, err := applyUpdatePlan(current, plan)
+			return updated, err
+		},
+		EmitMutation: func(ctx context.Context, repos uow.Repos, t model.Table, eventName string, key map[string]any, oldImage map[string]any, newImage map[string]any, changedAt int64) error {
+			return s.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromKey(t, key), oldImage, newImage, changedAt)
+		},
+		EnsureWrite: s.ensureWriteCapacity,
+		OnConditionEvalError: func(total int, failedIndex int, message string) error {
+			return transactionValidationCanceled(total, failedIndex, message)
+		},
+		OnConditionFailed: func(total int, failedIndex int, returnValues string, current map[string]any, existed bool) error {
+			reasons := buildTransactionCancellationReasons(total, failedIndex, awserr.CancellationReason{
+				Code:    "ConditionalCheckFailed",
+				Message: "The conditional request failed",
+				Item:    itemForConditionFailure(returnValues, current, existed),
+			})
+			return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+		},
+		BuildResponse: func(writeByTable map[string]float64) map[string]any {
+			resp := map[string]any{}
+			for tableName, units := range writeByTable {
+				addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
 			}
+			return resp
+		},
+		RequestHash: func() (string, error) { return transactWriteRequestHash(req) },
+		IdempotentMismatchErr: func() error {
+			return awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
+		},
+	}
+	input.Items = make([]transactionapp.TransactWriteItem, 0, len(req.TransactItems))
+	for _, txItem := range req.TransactItems {
+		item := transactionapp.TransactWriteItem{}
+		if len(txItem.Put.Item) > 0 {
+			item.Put = &transactionapp.PutAction{TableName: txItem.Put.TableName, Item: txItem.Put.Item, Condition: txItem.Put.ConditionExpression, ReturnOnFail: txItem.Put.ReturnValuesOnConditionCheckFailure, ExprNames: txItem.Put.ExpressionAttributeNames, ExprValues: txItem.Put.ExpressionAttributeValues}
 		}
+		if len(txItem.Delete.Key) > 0 {
+			item.Delete = &transactionapp.DeleteAction{TableName: txItem.Delete.TableName, Key: txItem.Delete.Key, Condition: txItem.Delete.ConditionExpression, ReturnOnFail: txItem.Delete.ReturnValuesOnConditionCheckFailure, ExprNames: txItem.Delete.ExpressionAttributeNames, ExprValues: txItem.Delete.ExpressionAttributeValues}
+		}
+		if len(txItem.Update.Key) > 0 {
+			item.Update = &transactionapp.UpdateAction{TableName: txItem.Update.TableName, Key: txItem.Update.Key, UpdateExpression: txItem.Update.UpdateExpression, Condition: txItem.Update.ConditionExpression, ReturnOnFail: txItem.Update.ReturnValuesOnConditionCheckFailure, ExprNames: txItem.Update.ExpressionAttributeNames, ExprValues: txItem.Update.ExpressionAttributeValues}
+		}
+		if len(txItem.ConditionCheck.Key) > 0 {
+			item.ConditionCheck = &transactionapp.ConditionCheckAction{TableName: txItem.ConditionCheck.TableName, Key: txItem.ConditionCheck.Key, Condition: txItem.ConditionCheck.ConditionExpression, ReturnOnFail: txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure, ExprNames: txItem.ConditionCheck.ExpressionAttributeNames, ExprValues: txItem.ConditionCheck.ExpressionAttributeValues}
+		}
+		input.Items = append(input.Items, item)
+	}
 
-		response = map[string]any{}
-		for tableName, units := range writeByTable {
-			addConsumedCapacity(response, req.ReturnConsumedCapacity, tableName, 0, units)
+	result, err := s.transactionService.TransactWrite(r.Context(), input)
+	if err != nil {
+		var validationErr transactionapp.ValidationError
+		if errors.As(err, &validationErr) {
+			return nil, awserr.Validation(validationErr.Message)
 		}
-		if strings.TrimSpace(req.ClientRequestToken) != "" {
-			hash, err := transactWriteRequestHash(req)
-			if err != nil {
-				return err
-			}
-			record := model.TransactWriteIdempotencyRecord{
-				Token:       req.ClientRequestToken,
-				RequestHash: hash,
-				Response:    response,
-				CreatedAt:   nowMillis,
-				ExpiresAt:   nowMillis + int64((10*time.Minute)/time.Millisecond),
-			}
-			if err := repos.Items().PutTransactWriteIdempotency(txCtx, record); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
 		return nil, err
 	}
-	if response == nil {
-		response = map[string]any{}
+	if result.Response == nil {
+		return map[string]any{}, nil
 	}
-	return response, nil
+	return result.Response, nil
 }
 
 func transactWriteRequestHash(req transactWriteRequest) (string, error) {
