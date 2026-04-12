@@ -29,6 +29,7 @@ type Event struct {
 type Repos interface {
 	Streams() uow.StreamRepo
 	PITR() uow.PITRRepo
+	TTL() uow.TTLRepo
 }
 
 type Hook interface {

@@ -6,14 +6,14 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
 )
 
 type Sweeper struct {
+	uow              uow.UnitOfWork
 	db               *sql.DB
-	txReposFactory   reposqlite.Factory
 	mutationExecutor *mutation.Executor
 	interval         time.Duration
 	stopCh           chan struct{}
@@ -24,13 +24,13 @@ const (
 	sweepBatchSize = 1000
 )
 
-func NewSweeper(db *sql.DB, txReposFactory reposqlite.Factory, interval time.Duration, mutationExecutor *mutation.Executor) *Sweeper {
+func NewSweeper(db *sql.DB, unitOfWork uow.UnitOfWork, interval time.Duration, mutationExecutor *mutation.Executor) *Sweeper {
 	if mutationExecutor == nil {
 		panic("ttl sweeper requires a mutation executor")
 	}
 	return &Sweeper{
+		uow:              unitOfWork,
 		db:               db,
-		txReposFactory:   txReposFactory,
 		mutationExecutor: mutationExecutor,
 		interval:         interval,
 		stopCh:           make(chan struct{}),
@@ -62,8 +62,12 @@ func (s *Sweeper) Stop() {
 func (s *Sweeper) RunOnce(ctx context.Context) {
 	start := ""
 	for {
-		tables, err := s.listTablesPage(ctx, start)
-		if err != nil {
+		var tables []string
+		if err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+			var err error
+			tables, err = repos.Tables().ListTables(txCtx, start, tablePageSize)
+			return err
+		}); err != nil {
 			slog.Error("failed to list tables for TTL sweep", "err", err)
 			return
 		}
@@ -82,27 +86,13 @@ func (s *Sweeper) RunOnce(ctx context.Context) {
 	}
 }
 
-func (s *Sweeper) listTablesPage(ctx context.Context, start string) ([]string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	tables, err := s.txReposFactory.Build(tx).Tables().ListTables(ctx, start, tablePageSize)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return tables, nil
-}
-
 func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
-	t, err := s.loadTable(ctx, tableName)
-	if err != nil {
+	var t model.Table
+	if err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		var err error
+		t, err = repos.Tables().GetTable(txCtx, tableName)
+		return err
+	}); err != nil {
 		slog.Error("failed to get table for TTL sweep", "table", tableName, "err", err)
 		return
 	}
@@ -138,51 +128,45 @@ func (s *Sweeper) sweepTable(ctx context.Context, tableName string) {
 }
 
 func (s *Sweeper) deleteExpiredBatch(ctx context.Context, t model.Table, before int64, limit int) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	expired, err := s.txReposFactory.TTL(tx).GetExpiredItems(ctx, t.Name, t.TimeToLive.AttrName, before, limit)
-	if err != nil {
-		return 0, err
-	}
-	deleted := int64(0)
-	for _, key := range expired {
-		oldItem, err := s.txReposFactory.Build(tx).Items().GetItem(ctx, t.Name, key.PK, key.SK)
+	var deleted int64
+	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		expired, err := repos.TTL().GetExpiredItems(txCtx, t.Name, t.TimeToLive.AttrName, before, limit)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				continue
+			return err
+		}
+		for _, key := range expired {
+			oldItem, err := repos.Items().GetItem(txCtx, t.Name, key.PK, key.SK)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					continue
+				}
+				return err
 			}
-			return 0, err
+			if err := repos.TTL().DeleteExpiredItem(txCtx, t.Name, key.PK, key.SK); err != nil {
+				return err
+			}
+			changedAt := time.Now().UnixMilli()
+			keys := map[string]any{t.HashKey: oldItem[t.HashKey]}
+			if t.RangeKey != "" {
+				keys[t.RangeKey] = oldItem[t.RangeKey]
+			}
+			if err := s.mutationExecutor.Emit(ctx, repos, mutation.Event{
+				Table:     t,
+				EventName: "REMOVE",
+				PK:        key.PK,
+				SK:        key.SK,
+				Keys:      keys,
+				OldImage:  oldItem,
+				NewImage:  nil,
+				ChangedAt: changedAt,
+			}); err != nil {
+				return err
+			}
+			deleted++
 		}
-		if err := s.txReposFactory.TTL(tx).DeleteExpiredItem(ctx, t.Name, key.PK, key.SK); err != nil {
-			return 0, err
-		}
-		changedAt := time.Now().UnixMilli()
-		keys := map[string]any{t.HashKey: oldItem[t.HashKey]}
-		if t.RangeKey != "" {
-			keys[t.RangeKey] = oldItem[t.RangeKey]
-		}
-		if err := s.mutationExecutor.Emit(ctx, s.txReposFactory.Build(tx), mutation.Event{
-			Table:     t,
-			EventName: "REMOVE",
-			PK:        key.PK,
-			SK:        key.SK,
-			Keys:      keys,
-			OldImage:  oldItem,
-			NewImage:  nil,
-			ChangedAt: changedAt,
-		}); err != nil {
-			return 0, err
-		}
-		deleted++
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return deleted, nil
+		return nil
+	})
+	return deleted, err
 }
 
 func (s *Sweeper) prunePITRHistory(ctx context.Context, t model.Table) error {
@@ -199,32 +183,8 @@ func (s *Sweeper) prunePITRHistory(ctx context.Context, t model.Table) error {
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
+	return s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		_, err := repos.PITR().CompactItemChangesBefore(txCtx, t.Name, cutoff)
 		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := s.txReposFactory.Build(tx).PITR().CompactItemChangesBefore(ctx, t.Name, cutoff); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Sweeper) loadTable(ctx context.Context, tableName string) (model.Table, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return model.Table{}, err
-	}
-	defer tx.Rollback()
-
-	table, err := s.txReposFactory.Build(tx).Tables().GetTable(ctx, tableName)
-	if err != nil {
-		return model.Table{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return model.Table{}, err
-	}
-	return table, nil
+	})
 }

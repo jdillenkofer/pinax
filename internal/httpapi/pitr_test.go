@@ -334,7 +334,7 @@ func TestRestoreTableToPointInTimeHonorsTTLDeletes(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewFactory(backend), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
+	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewUnitOfWork(backend.DB(), sqlite.NewFactory(backend)), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
 	sweeper.RunOnce(ctx)
 
 	restoreAfterExpiry := time.Now().UTC()

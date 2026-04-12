@@ -75,17 +75,15 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 	repos = NewRepos(s, tx)
 	defer tx.Rollback()
 
-	ttlRepo := NewFactory(s).TTL(tx)
-
-	deleted1, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	deleted1, err := repos.TTL().DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted2, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	deleted2, err := repos.TTL().DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted3, err := ttlRepo.DeleteExpiredItems(ctx, table.Name, 1000, 100)
+	deleted3, err := repos.TTL().DeleteExpiredItems(ctx, table.Name, 1000, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

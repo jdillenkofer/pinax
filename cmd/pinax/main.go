@@ -77,6 +77,7 @@ func main() {
 	}
 
 	txReposFactory := reposqlite.NewFactory(backend)
+	unitOfWork := reposqlite.NewUnitOfWork(db, txReposFactory)
 	srv := httpapi.NewServer(
 		db,
 		txReposFactory,
@@ -100,7 +101,7 @@ func main() {
 
 	var sweeper *ttl.Sweeper
 	if s.TTLSweeperEnabled() {
-		sweeper = ttl.NewSweeper(db, txReposFactory, s.TTLSweeperInterval(), mutation.NewExecutor(mutation.NewPITRHook()))
+		sweeper = ttl.NewSweeper(db, unitOfWork, s.TTLSweeperInterval(), mutation.NewExecutor(mutation.NewPITRHook()))
 		go sweeper.Start(context.Background())
 		slog.Info("TTL sweeper started", "interval", s.TTLSweeperInterval())
 	}

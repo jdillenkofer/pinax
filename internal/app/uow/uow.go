@@ -76,6 +76,16 @@ type Repos interface {
 	PITR() PITRRepo
 	Backups() BackupRepo
 	ResourcePolicies() ResourcePolicyRepo
+	TTL() TTLRepo
+}
+
+type TTLRepo interface {
+	GetExpiredItems(ctx context.Context, tableKey string, ttlAttr string, before int64, limit int) ([]struct {
+		PK string
+		SK string
+	}, error)
+	DeleteExpiredItem(ctx context.Context, tableKey, pk, sk string) error
+	DeleteExpiredItems(ctx context.Context, tableKey string, before int64, limit int) (int64, error)
 }
 
 type UnitOfWork interface {

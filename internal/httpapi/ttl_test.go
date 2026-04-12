@@ -192,7 +192,7 @@ func TestTTLSweeper(t *testing.T) {
 	}
 
 	// Manual sweep
-	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewFactory(backend), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
+	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewUnitOfWork(backend.DB(), sqlite.NewFactory(backend)), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
 	sweeper.RunOnce(ctx)
 
 	// Verify

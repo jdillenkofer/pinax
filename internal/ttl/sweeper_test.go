@@ -76,7 +76,8 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewSweeper(backend.DB(), sqlite.NewFactory(backend), 0, mutation.NewExecutor()).RunOnce(ctx)
+	unitOfWork := sqlite.NewUnitOfWork(db, sqlite.NewFactory(backend))
+	NewSweeper(db, unitOfWork, 0, mutation.NewExecutor()).RunOnce(ctx)
 
 	tx, err = backend.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -145,7 +146,8 @@ func TestSweeperPrunesPITRHistoryWithoutTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewSweeper(backend.DB(), sqlite.NewFactory(backend), 0, mutation.NewExecutor()).RunOnce(ctx)
+	unitOfWork := sqlite.NewUnitOfWork(db, sqlite.NewFactory(backend))
+	NewSweeper(db, unitOfWork, 0, mutation.NewExecutor()).RunOnce(ctx)
 
 	tx, err = backend.DB().BeginTx(ctx, nil)
 	if err != nil {
