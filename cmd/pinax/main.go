@@ -130,14 +130,14 @@ func main() {
 		}
 		go func() {
 			slog.Info("monitoring listening", "addr", monitoringAddr)
-			if err := monitoringServer.ListenAndServe(); err != nil {
+			if err := monitoringServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("monitoring server failed", "err", err)
 			}
 		}()
 	}
 
 	slog.Info("listening", "addr", addr, "dbPath", dbPath)
-	if err := httpServer.ListenAndServe(); err != nil {
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}

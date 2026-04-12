@@ -11,7 +11,6 @@ import (
 	"hash/crc32"
 	"hash/fnv"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"sort"
@@ -32,6 +31,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
+	"github.com/jdillenkofer/pinax/internal/httpapi/logctx"
 	"github.com/jdillenkofer/pinax/internal/identity"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
@@ -207,7 +207,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operation = op
-	slog.InfoContext(r.Context(), "DynamoDB operation", "operation", op)
+	logctx.Logger(r.Context()).InfoContext(r.Context(), "DynamoDB operation", "operation", op)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -217,14 +217,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.authorizeRequest(r, op, body); err != nil {
-		slog.WarnContext(r.Context(), "request authorization failed", "operation", op, "table", tableNameFromBody(body), "err", err)
+		logctx.Logger(r.Context()).WarnContext(r.Context(), "request authorization failed", "operation", op, "table", tableNameFromBody(body), "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
 	}
 	resp, err := s.dispatch(r, op, body)
 	if err != nil {
-		slog.WarnContext(r.Context(), "operation failed", "operation", op, "table", tableNameFromBody(body), "err", err)
+		logctx.Logger(r.Context()).WarnContext(r.Context(), "operation failed", "operation", op, "table", tableNameFromBody(body), "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
@@ -232,7 +232,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	encoded, err := json.Marshal(resp)
 	if err != nil {
-		slog.Error("encode response", "operation", op, "err", err)
+		logctx.Logger(r.Context()).ErrorContext(r.Context(), "encode response", "operation", op, "err", err)
 		errCode = "InternalServerError"
 		awserr.Write(iw, awserr.Internal("failed to encode response"))
 		return
@@ -240,7 +240,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	iw.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(encoded)), 10))
 	_, _ = iw.Write(encoded)
-	slog.InfoContext(r.Context(), "operation succeeded", "operation", op, "table", tableNameFromBody(body))
+	logctx.Logger(r.Context()).InfoContext(r.Context(), "operation succeeded", "operation", op, "table", tableNameFromBody(body))
 }
 
 func tableNameFromBody(body []byte) string {

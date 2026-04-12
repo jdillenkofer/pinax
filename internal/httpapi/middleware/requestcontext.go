@@ -2,12 +2,12 @@ package middleware
 
 import (
 	"context"
-	"log/slog"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
+	"github.com/jdillenkofer/pinax/internal/httpapi/logctx"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -43,15 +43,7 @@ func MakeRequestContextMiddleware(next http.Handler) http.Handler {
 		wrappedWriter := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(wrappedWriter, r.WithContext(ctx))
 
-		slog.InfoContext(
-			ctx,
-			"Request completed",
-			"method", r.Method,
-			"host", r.Host,
-			"path", r.URL.Path,
-			"status", wrappedWriter.statusCode,
-			"durationMs", time.Since(start).Milliseconds(),
-		)
+		logctx.Logger(ctx).InfoContext(ctx, "Request completed", "method", r.Method, "host", r.Host, "path", r.URL.Path, "status", wrappedWriter.statusCode, "durationMs", time.Since(start).Milliseconds())
 	})
 }
 
