@@ -13,11 +13,18 @@ type TableRepo interface {
 	GetTable(ctx context.Context, tableKey string) (model.Table, error)
 	ListTables(ctx context.Context, start string, limit int) ([]string, error)
 	DeleteTable(ctx context.Context, tableKey string) error
+	BackfillGSIEntries(ctx context.Context, tableKey string, gsi model.GlobalSecondaryIndex) error
 	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
 	UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
 	UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error
 	UpdateTimeToLive(ctx context.Context, tableKey string, ttl model.TimeToLive) error
 	UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error
+}
+
+type StreamRepo interface {
+	ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error)
+	GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error)
+	GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error)
 }
 
 type ItemRepo interface {
@@ -61,6 +68,7 @@ type ResourcePolicyRepo interface {
 type Repos interface {
 	Tables() TableRepo
 	Items() ItemRepo
+	Streams() StreamRepo
 	PITR() PITRRepo
 	Backups() BackupRepo
 	ResourcePolicies() ResourcePolicyRepo
@@ -113,7 +121,10 @@ type txRepos struct {
 
 func (r txRepos) Tables() TableRepo { return r.txs }
 func (r txRepos) Items() ItemRepo   { return r.txs }
-func (r txRepos) PITR() PITRRepo    { return r.txs }
+func (r txRepos) Streams() StreamRepo {
+	return r.txs
+}
+func (r txRepos) PITR() PITRRepo { return r.txs }
 func (r txRepos) Backups() BackupRepo {
 	return r.txs
 }
@@ -135,6 +146,9 @@ func (t *txStore) ListTables(ctx context.Context, start string, limit int) ([]st
 }
 func (t *txStore) DeleteTable(ctx context.Context, tableKey string) error {
 	return t.store.DeleteTable(ctx, t.tx, tableKey)
+}
+func (t *txStore) BackfillGSIEntries(ctx context.Context, tableKey string, gsi model.GlobalSecondaryIndex) error {
+	return t.store.BackfillGSIEntries(ctx, t.tx, tableKey, gsi)
 }
 func (t *txStore) CountItems(ctx context.Context, tableKey string) (int64, error) {
 	return t.store.CountItems(ctx, t.tx, tableKey)
@@ -204,6 +218,15 @@ func (t *txStore) CreatePITRCheckpointFromCurrentState(ctx context.Context, tabl
 }
 func (t *txStore) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
 	return t.store.CompactItemChangesBefore(ctx, t.tx, tableKey, before)
+}
+func (t *txStore) ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error) {
+	return t.store.ListStreamRecordsAfterSequence(ctx, t.tx, streamARN, sequence, limit)
+}
+func (t *txStore) GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error) {
+	return t.store.GetStreamSequenceBounds(ctx, t.tx, streamARN)
+}
+func (t *txStore) GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error) {
+	return t.store.GetStreamRecordChangedAt(ctx, t.tx, streamARN, sequence)
 }
 func (t *txStore) CreateBackup(ctx context.Context, backup model.Backup) error {
 	return t.store.CreateBackup(ctx, t.tx, backup)

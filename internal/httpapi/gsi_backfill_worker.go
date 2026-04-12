@@ -65,11 +65,6 @@ func (s *Server) listTablesPageForBackfill(ctx context.Context, start string) ([
 
 func (s *Server) backfillTableGSIs(ctx context.Context, tableName string) {
 	if err := s.unitOfWork.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return errors.New("missing transaction in unit of work context")
-		}
-
 		t, err := repos.Tables().GetTable(txCtx, tableName)
 		if err != nil {
 			if !errors.Is(err, sql.ErrNoRows) {
@@ -83,7 +78,7 @@ func (s *Server) backfillTableGSIs(ctx context.Context, tableName string) {
 			if t.GSIs[i].Status != model.IndexStatusCreating {
 				continue
 			}
-			if err := s.store.BackfillGSIEntries(txCtx, tx, t.Name, t.GSIs[i]); err != nil {
+			if err := repos.Tables().BackfillGSIEntries(txCtx, t.Name, t.GSIs[i]); err != nil {
 				slog.Error("gsi backfill worker failed to backfill index", "table", tableName, "index", t.GSIs[i].IndexName, "err", err)
 				return nil
 			}

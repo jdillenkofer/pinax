@@ -2160,16 +2160,12 @@ func (s *Server) describeStream(r *http.Request, body []byte) (map[string]any, e
 		found    bool
 	)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		var txErr error
-		t, txErr = s.getTableByStreamARN(txCtx, tx, req.StreamARN)
+		t, txErr = s.getTableByStreamARNFromRepo(txCtx, repos.Tables(), req.StreamARN)
 		if txErr != nil {
 			return txErr
 		}
-		firstSeq, _, found, txErr = s.store.GetStreamSequenceBounds(txCtx, tx, req.StreamARN)
+		firstSeq, _, found, txErr = repos.Streams().GetStreamSequenceBounds(txCtx, req.StreamARN)
 		if txErr != nil {
 			return txErr
 		}
@@ -2231,14 +2227,10 @@ func (s *Server) getShardIterator(r *http.Request, body []byte) (map[string]any,
 
 	last := int64(0)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
-		if _, err := s.getTableByStreamARN(txCtx, tx, req.StreamARN); err != nil {
+		if _, err := s.getTableByStreamARNFromRepo(txCtx, repos.Tables(), req.StreamARN); err != nil {
 			return err
 		}
-		_, seqLast, found, err := s.store.GetStreamSequenceBounds(txCtx, tx, req.StreamARN)
+		_, seqLast, found, err := repos.Streams().GetStreamSequenceBounds(txCtx, req.StreamARN)
 		if err != nil {
 			return err
 		}
@@ -2318,19 +2310,15 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 		latestChangedAt int64
 	)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
-		if _, err := s.getTableByStreamARN(txCtx, tx, token.StreamARN); err != nil {
+		if _, err := s.getTableByStreamARNFromRepo(txCtx, repos.Tables(), token.StreamARN); err != nil {
 			return err
 		}
 		var err error
-		records, err = s.store.ListStreamRecordsAfterSequence(txCtx, tx, token.StreamARN, token.Sequence, limit)
+		records, err = repos.Streams().ListStreamRecordsAfterSequence(txCtx, token.StreamARN, token.Sequence, limit)
 		if err != nil {
 			return err
 		}
-		_, last, found, err := s.store.GetStreamSequenceBounds(txCtx, tx, token.StreamARN)
+		_, last, found, err := repos.Streams().GetStreamSequenceBounds(txCtx, token.StreamARN)
 		if err != nil {
 			return err
 		}
@@ -2338,7 +2326,7 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 			last = token.Sequence
 		}
 		if found {
-			latestChangedAt, _, err = s.store.GetStreamRecordChangedAt(txCtx, tx, token.StreamARN, last)
+			latestChangedAt, _, err = repos.Streams().GetStreamRecordChangedAt(txCtx, token.StreamARN, last)
 			if err != nil {
 				return err
 			}
@@ -2363,11 +2351,7 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 	behind := int64(0)
 	if latestChangedAt > 0 {
 		if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-			tx, ok := uow.TxFromContext(txCtx)
-			if !ok {
-				return fmt.Errorf("missing transaction in unit of work context")
-			}
-			cursorChangedAt, cursorFound, err := s.store.GetStreamRecordChangedAt(txCtx, tx, token.StreamARN, nextSeq)
+			cursorChangedAt, cursorFound, err := repos.Streams().GetStreamRecordChangedAt(txCtx, token.StreamARN, nextSeq)
 			if err != nil {
 				return err
 			}
@@ -2491,12 +2475,12 @@ func streamViewTypeForRecord(record model.StreamRecord) string {
 	return "KEYS_ONLY"
 }
 
-func (s *Server) getTableByStreamARN(ctx context.Context, tx *sql.Tx, streamARN string) (model.Table, error) {
+func (s *Server) getTableByStreamARNFromRepo(ctx context.Context, tables uow.TableRepo, streamARN string) (model.Table, error) {
 	name, err := tableNameFromStreamARN(streamARN)
 	if err != nil {
 		return model.Table{}, awserr.ResourceNotFound("Requested resource not found")
 	}
-	t, err := s.getTableWithLifecycle(ctx, tx, name)
+	t, err := s.getTableWithLifecycleFromRepo(ctx, tables, name)
 	if err != nil {
 		return model.Table{}, awserr.ResourceNotFound("Requested resource not found")
 	}
@@ -2549,7 +2533,11 @@ func keyAttributesFromKey(t model.Table, key map[string]any) map[string]any {
 	return keys
 }
 
-func (s *Server) emitMutationEventForWrite(ctx context.Context, tx *sql.Tx, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
+func (s *Server) emitMutationEventForWrite(ctx context.Context, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
+	tx, ok := uow.TxFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("missing transaction in unit of work context")
+	}
 	pk, sk, err := primaryKeyStringsFromMutationKeys(t, keys)
 	if err != nil {
 		return err
@@ -2618,10 +2606,6 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		writeUnits float64
 	)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		var txErr error
 		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
 		if txErr != nil {
@@ -2667,7 +2651,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		} else {
 			streamOld = nil
 		}
-		return s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt)
+		return s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt)
 	}); err != nil {
 		return nil, err
 	}
@@ -2781,10 +2765,6 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 		writeUnits float64
 	)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		var txErr error
 		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
 		if txErr != nil {
@@ -2820,7 +2800,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 			return txErr
 		}
 		if existed {
-			return s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt)
+			return s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt)
 		}
 		return nil
 	}); err != nil {
@@ -2868,10 +2848,6 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		writeUnits  float64
 	)
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		var txErr error
 		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
 		if txErr != nil {
@@ -2936,7 +2912,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		} else {
 			streamOld = nil
 		}
-		return s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt)
+		return s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt)
 	}); err != nil {
 		return nil, err
 	}
@@ -3183,6 +3159,9 @@ func (r sqlTxTableRepo) ListTables(ctx context.Context, start string, limit int)
 }
 func (r sqlTxTableRepo) DeleteTable(ctx context.Context, tableKey string) error {
 	return r.store.DeleteTable(ctx, r.tx, tableKey)
+}
+func (r sqlTxTableRepo) BackfillGSIEntries(ctx context.Context, tableKey string, gsi model.GlobalSecondaryIndex) error {
+	return r.store.BackfillGSIEntries(ctx, r.tx, tableKey, gsi)
 }
 func (r sqlTxTableRepo) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	return r.store.UpdateTableIndexes(ctx, r.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
@@ -3974,10 +3953,6 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	writeByTable := map[string]float64{}
 	itemCollectionMetrics := map[string][]map[string]any{}
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		for _, tableName := range tableNames {
 			ops := req.RequestItems[tableName]
 			if len(ops) == 0 {
@@ -4048,7 +4023,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					} else {
 						streamOld = nil
 					}
-					if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
+					if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
 						return err
 					}
 					writeByTable[tableName] += writeUnits
@@ -4098,7 +4073,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					}
 					if existed {
 						if len(current) > 0 {
-							if err := s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
+							if err := s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
 								return err
 							}
 						}
@@ -4268,10 +4243,6 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	}
 	var response map[string]any
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		nowMillis := time.Now().UnixMilli()
 		if strings.TrimSpace(req.ClientRequestToken) != "" {
 			if err := repos.Items().DeleteExpiredTransactWriteIdempotency(txCtx, nowMillis); err != nil {
@@ -4370,7 +4341,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				} else {
 					streamOld = nil
 				}
-				if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
@@ -4420,7 +4391,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 					return err
 				}
 				if itemExisted {
-					if err := s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
+					if err := s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
 						return err
 					}
 				}
@@ -4503,7 +4474,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				} else {
 					streamOld = nil
 				}
-				if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))

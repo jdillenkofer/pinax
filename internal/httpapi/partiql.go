@@ -121,12 +121,8 @@ func (s *Server) executeStatement(r *http.Request, body []byte) (map[string]any,
 
 	var res partiqlResult
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		var err error
-		res, err = s.runPartiQLStatement(txCtx, tx, req.Statement, req.Parameters, req.ConsistentRead, req.Limit, req.NextToken, req.ReturnValuesOnConditionCheckFailure)
+		res, err = s.runPartiQLStatement(txCtx, repos, req.Statement, req.Parameters, req.ConsistentRead, req.Limit, req.NextToken, req.ReturnValuesOnConditionCheckFailure)
 		return err
 	}); err != nil {
 		return nil, err
@@ -159,10 +155,6 @@ func (s *Server) batchExecuteStatement(r *http.Request, body []byte) (map[string
 	readByTable := map[string]float64{}
 	writeByTable := map[string]float64{}
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		for _, stmt := range req.Statements {
 			if strings.TrimSpace(stmt.Statement) == "" {
 				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "Statement is required"}})
@@ -181,7 +173,7 @@ func (s *Server) batchExecuteStatement(r *http.Request, body []byte) (map[string
 				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "ConsistentRead is only supported for SELECT statements"}, "TableName": parseTableNameFromStatement(stmt.Statement)})
 				continue
 			}
-			res, err := s.runPartiQLStatement(txCtx, tx, stmt.Statement, stmt.Parameters, stmt.ConsistentRead, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
+			res, err := s.runPartiQLStatement(txCtx, repos, stmt.Statement, stmt.Parameters, stmt.ConsistentRead, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
 			if err != nil {
 				responses = append(responses, batchStatementErrorResponse(stmt.Statement, err))
 				continue
@@ -246,10 +238,6 @@ func (s *Server) executeTransaction(r *http.Request, body []byte) (map[string]an
 	writeByTable := map[string]float64{}
 	nowMillis := time.Now().UnixMilli()
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
-		tx, ok := uow.TxFromContext(txCtx)
-		if !ok {
-			return fmt.Errorf("missing transaction in unit of work context")
-		}
 		for idx, stmt := range req.TransactStatements {
 			if err := validateReturnValuesOnConditionCheckFailure(stmt.ReturnValuesOnConditionCheckFailure); err != nil {
 				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation(err.Error()))
@@ -260,7 +248,7 @@ func (s *Server) executeTransaction(r *http.Request, body []byte) (map[string]an
 				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation("Unsupported PartiQL statement"))
 				return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
 			}
-			res, err := s.runPartiQLStatement(txCtx, tx, stmt.Statement, stmt.Parameters, false, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
+			res, err := s.runPartiQLStatement(txCtx, repos, stmt.Statement, stmt.Parameters, false, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
 			if err != nil {
 				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, err)
 				return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
@@ -297,29 +285,29 @@ func (s *Server) executeTransaction(r *http.Request, body []byte) (map[string]an
 	return resp, nil
 }
 
-func (s *Server) runPartiQLStatement(ctx context.Context, tx *sql.Tx, statement string, parameters []any, consistentRead bool, limit int, nextToken string, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
+func (s *Server) runPartiQLStatement(ctx context.Context, repos uow.Repos, statement string, parameters []any, consistentRead bool, limit int, nextToken string, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
 	statement = strings.TrimSpace(statement)
 	if statement == "" {
 		return partiqlResult{}, awserr.Validation("Statement is required")
 	}
 
 	if m := selectStatementPattern.FindStringSubmatch(statement); len(m) == 4 {
-		return s.runPartiQLSelect(ctx, tx, strings.TrimSpace(m[1]), parseTableIdentifier(m[2]), strings.TrimSpace(m[3]), parameters, consistentRead, limit, nextToken)
+		return s.runPartiQLSelect(ctx, repos, strings.TrimSpace(m[1]), parseTableIdentifier(m[2]), strings.TrimSpace(m[3]), parameters, consistentRead, limit, nextToken)
 	}
 	if m := insertStatementPattern.FindStringSubmatch(statement); len(m) == 3 {
-		return s.runPartiQLInsert(ctx, tx, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), parameters)
+		return s.runPartiQLInsert(ctx, repos, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), parameters)
 	}
 	if m := updateStatementPattern.FindStringSubmatch(statement); len(m) == 4 {
-		return s.runPartiQLUpdate(ctx, tx, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), strings.TrimSpace(m[3]), parameters, returnValuesOnConditionCheckFailure)
+		return s.runPartiQLUpdate(ctx, repos, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), strings.TrimSpace(m[3]), parameters, returnValuesOnConditionCheckFailure)
 	}
 	if m := deleteStatementPattern.FindStringSubmatch(statement); len(m) == 3 {
-		return s.runPartiQLDelete(ctx, tx, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), parameters, returnValuesOnConditionCheckFailure)
+		return s.runPartiQLDelete(ctx, repos, parseTableIdentifier(m[1]), strings.TrimSpace(m[2]), parameters, returnValuesOnConditionCheckFailure)
 	}
 	return partiqlResult{}, awserr.Validation("Unsupported PartiQL statement")
 }
 
-func (s *Server) runPartiQLSelect(ctx context.Context, tx *sql.Tx, projection string, tableName string, where string, parameters []any, consistentRead bool, limit int, nextToken string) (partiqlResult, error) {
-	t, err := s.getActiveTable(ctx, tx, tableName)
+func (s *Server) runPartiQLSelect(ctx context.Context, repos uow.Repos, projection string, tableName string, where string, parameters []any, consistentRead bool, limit int, nextToken string) (partiqlResult, error) {
+	t, err := s.getActiveTableFromRepo(ctx, repos.Tables(), tableName)
 	if err != nil {
 		return partiqlResult{}, err
 	}
@@ -363,7 +351,7 @@ func (s *Server) runPartiQLSelect(ctx context.Context, tx *sql.Tx, projection st
 		if err != nil {
 			return partiqlResult{}, awserr.Validation("Invalid sort key value")
 		}
-		item, err := s.store.GetItem(ctx, tx, t.Name, hashKey, rangeKey)
+		item, err := repos.Items().GetItem(ctx, t.Name, hashKey, rangeKey)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return partiqlResult{Items: []map[string]any{}, TableName: t.Name}, nil
@@ -399,7 +387,7 @@ func (s *Server) runPartiQLSelect(ctx context.Context, tx *sql.Tx, projection st
 		startSK = startRange
 	}
 
-	items, err := s.store.QueryByPK(ctx, tx, t.Name, hashKey, startSK, true, 0)
+	items, err := repos.Items().QueryByPK(ctx, t.Name, hashKey, startSK, true, 0)
 	if err != nil {
 		return partiqlResult{}, err
 	}
@@ -435,8 +423,8 @@ func (s *Server) runPartiQLSelect(ctx context.Context, tx *sql.Tx, projection st
 	return res, nil
 }
 
-func (s *Server) runPartiQLInsert(ctx context.Context, tx *sql.Tx, tableName string, valueExpr string, parameters []any) (partiqlResult, error) {
-	t, err := s.getActiveTable(ctx, tx, tableName)
+func (s *Server) runPartiQLInsert(ctx context.Context, repos uow.Repos, tableName string, valueExpr string, parameters []any) (partiqlResult, error) {
+	t, err := s.getActiveTableFromRepo(ctx, repos.Tables(), tableName)
 	if err != nil {
 		return partiqlResult{}, err
 	}
@@ -457,7 +445,7 @@ func (s *Server) runPartiQLInsert(ctx context.Context, tx *sql.Tx, tableName str
 	if err := model.ValidateSecondaryIndexKeyTypes(t, item); err != nil {
 		return partiqlResult{}, awserr.Validation(err.Error())
 	}
-	current, err := s.store.GetItem(ctx, tx, t.Name, pk, sk)
+	current, err := repos.Items().GetItem(ctx, t.Name, pk, sk)
 	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return partiqlResult{}, err
@@ -470,21 +458,21 @@ func (s *Server) runPartiQLInsert(ctx context.Context, tx *sql.Tx, tableName str
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return partiqlResult{}, err
 	}
-	if err := s.store.PutItem(ctx, tx, t.Name, pk, sk, item); err != nil {
+	if err := repos.Items().PutItem(ctx, t.Name, pk, sk, item); err != nil {
 		return partiqlResult{}, err
 	}
 	eventName := "INSERT"
 	if existed {
 		eventName = "MODIFY"
 	}
-	if err := s.emitMutationEventForWrite(ctx, tx, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
 }
 
-func (s *Server) runPartiQLUpdate(ctx context.Context, tx *sql.Tx, tableName string, setExpr string, where string, parameters []any, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
-	t, err := s.getActiveTable(ctx, tx, tableName)
+func (s *Server) runPartiQLUpdate(ctx context.Context, repos uow.Repos, tableName string, setExpr string, where string, parameters []any, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
+	t, err := s.getActiveTableFromRepo(ctx, repos.Tables(), tableName)
 	if err != nil {
 		return partiqlResult{}, err
 	}
@@ -527,7 +515,7 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, tx *sql.Tx, tableName str
 			return partiqlResult{}, awserr.Validation("Invalid sort key value")
 		}
 	}
-	current, err := s.store.GetItem(ctx, tx, t.Name, hashKey, rangeKey)
+	current, err := repos.Items().GetItem(ctx, t.Name, hashKey, rangeKey)
 	itemExisted := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return partiqlResult{}, err
@@ -556,7 +544,7 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, tx *sql.Tx, tableName str
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return partiqlResult{}, err
 	}
-	if err := s.store.PutItem(ctx, tx, t.Name, hashKey, rangeKey, updated); err != nil {
+	if err := repos.Items().PutItem(ctx, t.Name, hashKey, rangeKey, updated); err != nil {
 		return partiqlResult{}, err
 	}
 	eventName := "INSERT"
@@ -569,14 +557,14 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, tx *sql.Tx, tableName str
 	if t.RangeKey != "" {
 		streamKey[t.RangeKey] = rangeValue
 	}
-	if err := s.emitMutationEventForWrite(ctx, tx, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
 }
 
-func (s *Server) runPartiQLDelete(ctx context.Context, tx *sql.Tx, tableName string, where string, parameters []any, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
-	t, err := s.getActiveTable(ctx, tx, tableName)
+func (s *Server) runPartiQLDelete(ctx context.Context, repos uow.Repos, tableName string, where string, parameters []any, returnValuesOnConditionCheckFailure string) (partiqlResult, error) {
+	t, err := s.getActiveTableFromRepo(ctx, repos.Tables(), tableName)
 	if err != nil {
 		return partiqlResult{}, err
 	}
@@ -615,7 +603,7 @@ func (s *Server) runPartiQLDelete(ctx context.Context, tx *sql.Tx, tableName str
 			return partiqlResult{}, awserr.Validation("Invalid sort key value")
 		}
 	}
-	current, err := s.store.GetItem(ctx, tx, t.Name, hashKey, rangeKey)
+	current, err := repos.Items().GetItem(ctx, t.Name, hashKey, rangeKey)
 	existed := true
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return partiqlResult{}, err
@@ -634,7 +622,7 @@ func (s *Server) runPartiQLDelete(ctx context.Context, tx *sql.Tx, tableName str
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return partiqlResult{}, err
 	}
-	if err := s.store.DeleteItem(ctx, tx, t.Name, hashKey, rangeKey); err != nil {
+	if err := repos.Items().DeleteItem(ctx, t.Name, hashKey, rangeKey); err != nil {
 		return partiqlResult{}, err
 	}
 	if existed {
@@ -642,7 +630,7 @@ func (s *Server) runPartiQLDelete(ctx context.Context, tx *sql.Tx, tableName str
 		if t.RangeKey != "" {
 			streamKey[t.RangeKey] = rangeValue
 		}
-		if err := s.emitMutationEventForWrite(ctx, tx, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
+		if err := s.emitMutationEventForWrite(ctx, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
 			return partiqlResult{}, err
 		}
 	}
