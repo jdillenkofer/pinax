@@ -18,7 +18,7 @@ var (
 	ErrTargetTableInUse               = errors.New("target table in use")
 )
 
-type TableLoader func(ctx context.Context, txs uow.TxStore, tableName string) (model.Table, error)
+type TableLoader func(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error)
 
 type RestoreTableBuilder func(source model.Table) (model.Table, error)
 
@@ -61,9 +61,9 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 	}
 
 	var t model.Table
-	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
+	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
 		var err error
-		t, err = tableLoader(ctx, txs, input.TableName)
+		t, err = tableLoader(txCtx, repos.Tables(), input.TableName)
 		if err != nil {
 			return err
 		}
@@ -80,7 +80,7 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 		if input.Enable {
 			if !t.PITR.Enabled || enabledAt == 0 {
 				enabledAt = nowMs
-				items, err := txs.Scan(ctx, t.Name, "", "", 0)
+				items, err := repos.Items().Scan(txCtx, t.Name, "", "", 0)
 				if err != nil {
 					return err
 				}
@@ -89,11 +89,11 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 					if err != nil {
 						return err
 					}
-					if err := txs.AppendItemChange(ctx, t.Name, pk, sk, "PUT", item, enabledAt); err != nil {
+					if err := repos.PITR().AppendItemChange(txCtx, t.Name, pk, sk, "PUT", item, enabledAt); err != nil {
 						return err
 					}
 				}
-				if err := txs.CreatePITRCheckpointFromCurrentState(ctx, t.Name, enabledAt); err != nil {
+				if err := repos.PITR().CreatePITRCheckpointFromCurrentState(txCtx, t.Name, enabledAt); err != nil {
 					return err
 				}
 			}
@@ -102,7 +102,7 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 		}
 
 		next := model.PointInTimeRecovery{Enabled: input.Enable, RecoveryPeriodInDays: recoveryDays, EnabledAt: enabledAt}
-		if err := txs.UpdatePointInTimeRecovery(ctx, t.Name, next); err != nil {
+		if err := repos.Tables().UpdatePointInTimeRecovery(txCtx, t.Name, next); err != nil {
 			return err
 		}
 		t.PITR = next
@@ -110,7 +110,7 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 		if next.Enabled {
 			cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
 			if cutoff > 0 {
-				if _, err := txs.CompactItemChangesBefore(ctx, t.Name, cutoff); err != nil {
+				if _, err := repos.PITR().CompactItemChangesBefore(txCtx, t.Name, cutoff); err != nil {
 					return err
 				}
 			}
@@ -130,9 +130,9 @@ func (s *Service) DescribeContinuousBackups(ctx context.Context, tableName strin
 	}
 
 	var t model.Table
-	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
+	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
 		var err error
-		t, err = tableLoader(ctx, txs, tableName)
+		t, err = tableLoader(txCtx, repos.Tables(), tableName)
 		return err
 	})
 
@@ -154,8 +154,8 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 
 	var tableToCreate model.Table
 	count := int64(0)
-	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
-		source, err := tableLoader(ctx, txs, input.SourceName)
+	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		source, err := tableLoader(txCtx, repos.Tables(), input.SourceName)
 		if err != nil {
 			return err
 		}
@@ -172,7 +172,7 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 			return ErrInvalidRestoreTime
 		}
 
-		if existing, err := txs.GetTable(ctx, input.TargetScopedTableKey); err == nil {
+		if existing, err := repos.Tables().GetTable(txCtx, input.TargetScopedTableKey); err == nil {
 			if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
 				return ErrTargetTableInUse
 			}
@@ -185,30 +185,30 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 		if err != nil {
 			return err
 		}
-		if err := txs.CreateTable(ctx, tableToCreate); err != nil {
+		if err := repos.Tables().CreateTable(txCtx, tableToCreate); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") {
 				return ErrTargetTableExists
 			}
 			return err
 		}
 
-		cursor, err := txs.ResolveItemChangeCursorAtOrBefore(ctx, source.Name, restoreAt)
+		cursor, err := repos.PITR().ResolveItemChangeCursorAtOrBefore(txCtx, source.Name, restoreAt)
 		if err != nil {
 			return err
 		}
 
-		checkpoint, err := txs.GetLatestPITRCheckpointAtOrBeforeCursor(ctx, source.Name, cursor)
+		checkpoint, err := repos.PITR().GetLatestPITRCheckpointAtOrBeforeCursor(txCtx, source.Name, cursor)
 		if err != nil {
 			return err
 		}
 		if !checkpoint.Found {
-			checkpoint, err = txs.GetLatestPITRCheckpointAtOrBefore(ctx, source.Name, restoreAt)
+			checkpoint, err = repos.PITR().GetLatestPITRCheckpointAtOrBefore(txCtx, source.Name, restoreAt)
 		}
 		if err != nil {
 			return err
 		}
 
-		changes, err := txs.ListItemChangesAfterCursorUpToCursor(ctx, source.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, cursor)
+		changes, err := repos.PITR().ListItemChangesAfterCursorUpToCursor(txCtx, source.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, cursor)
 		if err != nil {
 			return err
 		}
@@ -235,7 +235,7 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 			if err != nil {
 				return err
 			}
-			if err := txs.PutItem(ctx, tableToCreate.Name, pk, sk, item); err != nil {
+			if err := repos.Items().PutItem(txCtx, tableToCreate.Name, pk, sk, item); err != nil {
 				return err
 			}
 			count++

@@ -8,15 +8,21 @@ import (
 	"github.com/jdillenkofer/pinax/internal/store"
 )
 
-type TxStore interface {
+type TableRepo interface {
 	CreateTable(ctx context.Context, table model.Table) error
 	GetTable(ctx context.Context, tableKey string) (model.Table, error)
 	DeleteTable(ctx context.Context, tableKey string) error
+	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
+	UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error
+}
+
+type ItemRepo interface {
 	CountItems(ctx context.Context, tableKey string) (int64, error)
 	PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error
 	Scan(ctx context.Context, tableKey, startPK, startSK string, limit int) ([]map[string]any, error)
-	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
-	UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error
+}
+
+type PITRRepo interface {
 	AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error
 	ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.ItemChangeCursor, error)
 	ListItemChangesAfterCursorUpToCursor(ctx context.Context, tableKey string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error)
@@ -24,6 +30,9 @@ type TxStore interface {
 	GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.PITRCheckpoint, error)
 	CreatePITRCheckpointFromCurrentState(ctx context.Context, tableKey string, changedAt int64) error
 	CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error)
+}
+
+type BackupRepo interface {
 	CreateBackup(ctx context.Context, backup model.Backup) error
 	GetBackup(ctx context.Context, backupARN string) (model.Backup, error)
 	GetBackupByName(ctx context.Context, backupName string) (model.Backup, error)
@@ -31,19 +40,32 @@ type TxStore interface {
 	DeleteBackup(ctx context.Context, backupARN string) error
 }
 
+type Repos interface {
+	Tables() TableRepo
+	Items() ItemRepo
+	PITR() PITRRepo
+	Backups() BackupRepo
+}
+
 type UnitOfWork interface {
-	Do(ctx context.Context, fn func(txs TxStore) error) error
+	Do(ctx context.Context, fn func(ctx context.Context, repos Repos) error) error
 }
 
 type storeUnitOfWork struct {
 	store store.Store
 }
 
+type txStoreContextKey struct{}
+
 func NewStoreUnitOfWork(s store.Store) UnitOfWork {
 	return &storeUnitOfWork{store: s}
 }
 
-func (u *storeUnitOfWork) Do(ctx context.Context, fn func(txs TxStore) error) error {
+func (u *storeUnitOfWork) Do(ctx context.Context, fn func(ctx context.Context, repos Repos) error) error {
+	if ambient, ok := ctx.Value(txStoreContextKey{}).(*txStore); ok && ambient != nil {
+		return fn(ctx, txRepos{txs: ambient})
+	}
+
 	tx, err := u.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -51,10 +73,22 @@ func (u *storeUnitOfWork) Do(ctx context.Context, fn func(txs TxStore) error) er
 	defer tx.Rollback()
 
 	txs := &txStore{store: u.store, tx: tx}
-	if err := fn(txs); err != nil {
+	txCtx := context.WithValue(ctx, txStoreContextKey{}, txs)
+	if err := fn(txCtx, txRepos{txs: txs}); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+type txRepos struct {
+	txs *txStore
+}
+
+func (r txRepos) Tables() TableRepo { return r.txs }
+func (r txRepos) Items() ItemRepo   { return r.txs }
+func (r txRepos) PITR() PITRRepo    { return r.txs }
+func (r txRepos) Backups() BackupRepo {
+	return r.txs
 }
 
 type txStore struct {

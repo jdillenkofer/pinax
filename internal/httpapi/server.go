@@ -3239,10 +3239,10 @@ func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableNam
 	return t, nil
 }
 
-func (s *Server) refreshTableLifecycleTxStore(ctx context.Context, txs uow.TxStore, t *model.Table) error {
+func (s *Server) refreshTableLifecycleTxStore(ctx context.Context, tables uow.TableRepo, t *model.Table) error {
 	now := lifecycleNow()
 	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
-		if err := txs.DeleteTable(ctx, t.Name); err != nil {
+		if err := tables.DeleteTable(ctx, t.Name); err != nil {
 			return err
 		}
 		return sql.ErrNoRows
@@ -3254,22 +3254,22 @@ func (s *Server) refreshTableLifecycleTxStore(ctx context.Context, txs uow.TxSto
 	if !advanceTableLifecycle(t, now) {
 		return nil
 	}
-	return txs.UpdateTableIndexes(ctx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
+	return tables.UpdateTableIndexes(ctx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
 }
 
-func (s *Server) getTableWithLifecycleTxStore(ctx context.Context, txs uow.TxStore, tableName string) (model.Table, error) {
+func (s *Server) getTableWithLifecycleTxStore(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error) {
 	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
 	if err != nil {
 		return model.Table{}, err
 	}
-	t, err := txs.GetTable(ctx, scopedTableName)
+	t, err := tables.GetTable(ctx, scopedTableName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
 		return model.Table{}, err
 	}
-	if err := s.refreshTableLifecycleTxStore(ctx, txs, &t); err != nil {
+	if err := s.refreshTableLifecycleTxStore(ctx, tables, &t); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
