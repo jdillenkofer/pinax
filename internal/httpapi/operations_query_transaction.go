@@ -48,6 +48,62 @@ type queryRequest struct {
 	ReturnConsumedCapacity    string            `json:"ReturnConsumedCapacity"`
 }
 
+type queryHTTPAdapter struct {
+	skToken              *sortKeyCondition
+	expressionNames      map[string]string
+	expressionValues     map[string]any
+	targetRangeType      string
+	filterExpression     string
+	projectionExpression string
+}
+
+func (a queryHTTPAdapter) OrderItemsForGSI(items []map[string]any, t model.Table, gsi model.GlobalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	return orderItemsForGSI(items, t, gsi, exclusiveStartKey, scanForward)
+}
+
+func (a queryHTTPAdapter) OrderItemsForLSI(items []map[string]any, t model.Table, lsi model.LocalSecondaryIndex, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	return orderItemsForLSI(items, t, lsi, exclusiveStartKey, scanForward)
+}
+
+func (a queryHTTPAdapter) OrderItemsForTable(items []map[string]any, t model.Table, exclusiveStartKey map[string]any, scanForward bool) ([]map[string]any, error) {
+	return orderItemsForTable(items, t, exclusiveStartKey, scanForward)
+}
+
+func (a queryHTTPAdapter) ProjectItemForGSI(item map[string]any, t model.Table, gsi model.GlobalSecondaryIndex) map[string]any {
+	return projectItemForGSI(item, t, gsi)
+}
+
+func (a queryHTTPAdapter) ProjectItemForLSI(item map[string]any, t model.Table, lsi model.LocalSecondaryIndex) map[string]any {
+	return projectItemForLSI(item, t, lsi)
+}
+
+func (a queryHTTPAdapter) SortConditionMatches(item map[string]any) (bool, error) {
+	if a.skToken == nil {
+		return true, nil
+	}
+	return sortConditionMatches(item, a.skToken, a.expressionNames, a.expressionValues, a.targetRangeType)
+}
+
+func (a queryHTTPAdapter) ApplyFilter(item map[string]any) (bool, error) {
+	return applyFilter(item, a.filterExpression, a.expressionNames, a.expressionValues)
+}
+
+func (a queryHTTPAdapter) ApplyProjection(item map[string]any) (map[string]any, error) {
+	return applyProjection(item, a.projectionExpression, a.expressionNames)
+}
+
+func (a queryHTTPAdapter) CloneItem(item map[string]any) map[string]any {
+	return cloneItem(item)
+}
+
+func (a queryHTTPAdapter) KeyFromItem(t model.Table, item map[string]any) map[string]any {
+	return keyFromItem(t, item)
+}
+
+func (a queryHTTPAdapter) SegmentForPK(serializedPK string, totalSegments int) int {
+	return scanSegmentForPK(serializedPK, totalSegments)
+}
+
 func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 	var req queryRequest
 	if err := decode(body, &req); err != nil {
@@ -148,6 +204,14 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 			return nil, awserr.Validation("sort key condition must target RANGE key")
 		}
 	}
+	queryAdapter := queryHTTPAdapter{
+		skToken:              skToken,
+		expressionNames:      req.ExpressionAttributeNames,
+		expressionValues:     expressionValues,
+		targetRangeType:      targetRangeType,
+		filterExpression:     req.FilterExpression,
+		projectionExpression: projectionExpression,
+	}
 
 	items, err := s.queryService.QueryItems(r.Context(), queryapp.QueryItemsInput{
 		Target:              target,
@@ -156,9 +220,7 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		ExclusiveStartKey:   req.ExclusiveStartKey,
 		ScanForward:         scanForward,
 		HasSortKeyCondition: skToken != nil,
-		OrderItemsForGSI:    orderItemsForGSI,
-		OrderItemsForLSI:    orderItemsForLSI,
-		OrderItemsForTable:  orderItemsForTable,
+		Orderer:             queryAdapter,
 	})
 	if err != nil {
 		return nil, err
@@ -166,43 +228,20 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 
 	limit := parseLimit(req.Limit)
 	processed, err := s.queryService.ProcessQueryItems(queryapp.QueryProcessInput{
-		Table:             t,
-		Items:             items,
-		Limit:             limit,
-		SelectMode:        selectMode,
-		ConsistentRead:    req.ConsistentRead,
-		IndexName:         strings.TrimSpace(req.IndexName),
-		TargetHashKey:     targetHashKey,
-		PK:                pk,
-		QueryGSI:          queryGSI,
-		QueryLSI:          queryLSI,
-		ProjectItemForGSI: projectItemForGSI,
-		ProjectItemForLSI: projectItemForLSI,
-		SortConditionMatches: func(queryItem map[string]any) (bool, error) {
-			if skToken == nil {
-				return true, nil
-			}
-			return sortConditionMatches(queryItem, skToken, req.ExpressionAttributeNames, expressionValues, targetRangeType)
-		},
-		ApplyFilter: func(queryItem map[string]any) (bool, error) {
-			ok, err := applyFilter(queryItem, req.FilterExpression, req.ExpressionAttributeNames, expressionValues)
-			if err != nil {
-				return false, awserr.Validation(filterExpressionValidationMessage(err))
-			}
-			return ok, nil
-		},
-		ApplyProjection: func(queryItem map[string]any) (map[string]any, error) {
-			projected, err := applyProjection(queryItem, projectionExpression, req.ExpressionAttributeNames)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			return projected, nil
-		},
-		CloneItem:   cloneItem,
-		KeyFromItem: keyFromItem,
+		Table:          t,
+		Items:          items,
+		Limit:          limit,
+		SelectMode:     selectMode,
+		ConsistentRead: req.ConsistentRead,
+		IndexName:      strings.TrimSpace(req.IndexName),
+		TargetHashKey:  targetHashKey,
+		PK:             pk,
+		QueryGSI:       queryGSI,
+		QueryLSI:       queryLSI,
+		Processor:      queryAdapter,
 	})
 	if err != nil {
-		return nil, err
+		return nil, awserr.Validation(filterExpressionValidationMessage(err))
 	}
 
 	resp := map[string]any{"Count": processed.Count, "ScannedCount": processed.Scanned}
@@ -281,6 +320,12 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	scanAdapter := queryHTTPAdapter{
+		expressionNames:      req.ExpressionAttributeNames,
+		expressionValues:     req.ExpressionAttributeValues,
+		filterExpression:     req.FilterExpression,
+		projectionExpression: req.ProjectionExpression,
+	}
 
 	limit := parseLimit(req.Limit)
 	processed, err := s.queryService.ProcessScanItems(queryapp.ScanProcessInput{
@@ -291,25 +336,10 @@ func (s *Server) scan(r *http.Request, body []byte) (map[string]any, error) {
 		Segment:        segment,
 		TotalSegments:  totalSegments,
 		ConsistentRead: req.ConsistentRead,
-		ApplyFilter: func(item map[string]any) (bool, error) {
-			ok, err := applyFilter(item, req.FilterExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-			if err != nil {
-				return false, awserr.Validation(filterExpressionValidationMessage(err))
-			}
-			return ok, nil
-		},
-		ApplyProjection: func(item map[string]any) (map[string]any, error) {
-			projected, err := applyProjection(item, req.ProjectionExpression, req.ExpressionAttributeNames)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			return projected, nil
-		},
-		ScanSegmentForPK: func(pk string) int { return scanSegmentForPK(pk, totalSegments) },
-		KeyFromItem:      keyFromItem,
+		Processor:      scanAdapter,
 	})
 	if err != nil {
-		return nil, err
+		return nil, awserr.Validation(filterExpressionValidationMessage(err))
 	}
 
 	resp := map[string]any{"Items": processed.Items, "Count": len(processed.Items), "ScannedCount": processed.Scanned}
@@ -508,6 +538,18 @@ type transactGetRequest struct {
 	} `json:"TransactItems"`
 }
 
+type transactGetHTTPAdapter struct {
+	server *Server
+}
+
+func (a transactGetHTTPAdapter) ApplyProjection(item map[string]any, projection string, names map[string]string) (map[string]any, error) {
+	return applyProjection(item, projection, names)
+}
+
+func (a transactGetHTTPAdapter) EnsureRead(t model.Table, units float64) error {
+	return a.server.ensureReadCapacity(t, units)
+}
+
 func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any, error) {
 	var req transactGetRequest
 	if err := decode(body, &req); err != nil {
@@ -521,9 +563,8 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 	}
 
 	input := transactionapp.TransactGetInput{
-		Items:           make([]transactionapp.TransactGetItem, 0, len(req.TransactItems)),
-		ApplyProjection: applyProjection,
-		EnsureRead:      s.ensureReadCapacity,
+		Items:   make([]transactionapp.TransactGetItem, 0, len(req.TransactItems)),
+		Adapter: transactGetHTTPAdapter{server: s},
 	}
 	for _, txItem := range req.TransactItems {
 		input.Items = append(input.Items, transactionapp.TransactGetItem{
@@ -589,6 +630,65 @@ type transactWriteRequest struct {
 	} `json:"TransactItems"`
 }
 
+type transactWriteHTTPAdapter struct {
+	server *Server
+	req    transactWriteRequest
+}
+
+func (a transactWriteHTTPAdapter) ValidateReturnOnFail(v string) error {
+	return validateReturnValuesOnConditionCheckFailure(v)
+}
+
+func (a transactWriteHTTPAdapter) EvaluateCondition(expression string, item map[string]any, names map[string]string, values map[string]any) (bool, error) {
+	return expr.Evaluate(expression, item, names, values)
+}
+
+func (a transactWriteHTTPAdapter) ApplyUpdate(current map[string]any, updateExpression string, names map[string]string, values map[string]any) (map[string]any, error) {
+	plan, err := parseUpdateExpression(updateExpression, names, values)
+	if err != nil {
+		return nil, err
+	}
+	updated, _, err := applyUpdatePlan(current, plan)
+	return updated, err
+}
+
+func (a transactWriteHTTPAdapter) EmitMutation(ctx context.Context, repos uow.Repos, t model.Table, eventName string, key map[string]any, oldImage map[string]any, newImage map[string]any, changedAt int64) error {
+	return a.server.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromKey(t, key), oldImage, newImage, changedAt)
+}
+
+func (a transactWriteHTTPAdapter) EnsureWrite(t model.Table, units float64) error {
+	return a.server.ensureWriteCapacity(t, units)
+}
+
+func (a transactWriteHTTPAdapter) OnConditionEvalError(total int, failedIndex int, message string) error {
+	return transactionValidationCanceled(total, failedIndex, message)
+}
+
+func (a transactWriteHTTPAdapter) OnConditionFailed(total int, failedIndex int, returnValues string, current map[string]any, existed bool) error {
+	reasons := buildTransactionCancellationReasons(total, failedIndex, awserr.CancellationReason{
+		Code:    "ConditionalCheckFailed",
+		Message: "The conditional request failed",
+		Item:    itemForConditionFailure(returnValues, current, existed),
+	})
+	return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+}
+
+func (a transactWriteHTTPAdapter) BuildResponse(writeByTable map[string]float64) map[string]any {
+	resp := map[string]any{}
+	for tableName, units := range writeByTable {
+		addConsumedCapacity(resp, a.req.ReturnConsumedCapacity, tableName, 0, units)
+	}
+	return resp
+}
+
+func (a transactWriteHTTPAdapter) RequestHash() (string, error) {
+	return transactWriteRequestHash(a.req)
+}
+
+func (a transactWriteHTTPAdapter) IdempotentMismatchErr() error {
+	return awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
+}
+
 func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]any, error) {
 	var req transactWriteRequest
 	if err := decode(body, &req); err != nil {
@@ -607,42 +707,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 		ClientRequestToken:   strings.TrimSpace(req.ClientRequestToken),
 		NowMillis:            time.Now().UnixMilli(),
 		IdempotencyTTLMillis: int64((10 * time.Minute) / time.Millisecond),
-		ValidateReturnOnFail: validateReturnValuesOnConditionCheckFailure,
-		EvaluateCondition:    expr.Evaluate,
-		ApplyUpdate: func(current map[string]any, updateExpression string, names map[string]string, values map[string]any) (map[string]any, error) {
-			plan, err := parseUpdateExpression(updateExpression, names, values)
-			if err != nil {
-				return nil, err
-			}
-			updated, _, err := applyUpdatePlan(current, plan)
-			return updated, err
-		},
-		EmitMutation: func(ctx context.Context, repos uow.Repos, t model.Table, eventName string, key map[string]any, oldImage map[string]any, newImage map[string]any, changedAt int64) error {
-			return s.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromKey(t, key), oldImage, newImage, changedAt)
-		},
-		EnsureWrite: s.ensureWriteCapacity,
-		OnConditionEvalError: func(total int, failedIndex int, message string) error {
-			return transactionValidationCanceled(total, failedIndex, message)
-		},
-		OnConditionFailed: func(total int, failedIndex int, returnValues string, current map[string]any, existed bool) error {
-			reasons := buildTransactionCancellationReasons(total, failedIndex, awserr.CancellationReason{
-				Code:    "ConditionalCheckFailed",
-				Message: "The conditional request failed",
-				Item:    itemForConditionFailure(returnValues, current, existed),
-			})
-			return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-		},
-		BuildResponse: func(writeByTable map[string]float64) map[string]any {
-			resp := map[string]any{}
-			for tableName, units := range writeByTable {
-				addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
-			}
-			return resp
-		},
-		RequestHash: func() (string, error) { return transactWriteRequestHash(req) },
-		IdempotentMismatchErr: func() error {
-			return awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
-		},
+		Adapter:              transactWriteHTTPAdapter{server: s, req: req},
 	}
 	input.Items = make([]transactionapp.TransactWriteItem, 0, len(req.TransactItems))
 	for _, txItem := range req.TransactItems {

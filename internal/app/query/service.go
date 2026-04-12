@@ -110,9 +110,13 @@ type QueryItemsInput struct {
 	ExclusiveStartKey   map[string]any
 	ScanForward         bool
 	HasSortKeyCondition bool
-	OrderItemsForGSI    func([]map[string]any, model.Table, model.GlobalSecondaryIndex, map[string]any, bool) ([]map[string]any, error)
-	OrderItemsForLSI    func([]map[string]any, model.Table, model.LocalSecondaryIndex, map[string]any, bool) ([]map[string]any, error)
-	OrderItemsForTable  func([]map[string]any, model.Table, map[string]any, bool) ([]map[string]any, error)
+	Orderer             QueryOrderer
+}
+
+type QueryOrderer interface {
+	OrderItemsForGSI([]map[string]any, model.Table, model.GlobalSecondaryIndex, map[string]any, bool) ([]map[string]any, error)
+	OrderItemsForLSI([]map[string]any, model.Table, model.LocalSecondaryIndex, map[string]any, bool) ([]map[string]any, error)
+	OrderItemsForTable([]map[string]any, model.Table, map[string]any, bool) ([]map[string]any, error)
 }
 
 func (s *Service) QueryItems(ctx context.Context, input QueryItemsInput) ([]map[string]any, error) {
@@ -125,7 +129,7 @@ func (s *Service) QueryItems(ctx context.Context, input QueryItemsInput) ([]map[
 			if err != nil {
 				return err
 			}
-			items, err = input.OrderItemsForGSI(items, t, *input.Target.QueryGSI, input.ExclusiveStartKey, input.ScanForward)
+			items, err = input.Orderer.OrderItemsForGSI(items, t, *input.Target.QueryGSI, input.ExclusiveStartKey, input.ScanForward)
 			return err
 		}
 		if input.Target.QueryLSI != nil {
@@ -133,7 +137,7 @@ func (s *Service) QueryItems(ctx context.Context, input QueryItemsInput) ([]map[
 			if err != nil {
 				return err
 			}
-			items, err = input.OrderItemsForLSI(items, t, *input.Target.QueryLSI, input.ExclusiveStartKey, input.ScanForward)
+			items, err = input.Orderer.OrderItemsForLSI(items, t, *input.Target.QueryLSI, input.ExclusiveStartKey, input.ScanForward)
 			return err
 		}
 		if !input.HasSortKeyCondition {
@@ -145,7 +149,7 @@ func (s *Service) QueryItems(ctx context.Context, input QueryItemsInput) ([]map[
 			if err != nil {
 				return err
 			}
-			items, err = input.OrderItemsForTable(items, t, input.ExclusiveStartKey, input.ScanForward)
+			items, err = input.Orderer.OrderItemsForTable(items, t, input.ExclusiveStartKey, input.ScanForward)
 			return err
 		}
 
@@ -153,7 +157,7 @@ func (s *Service) QueryItems(ctx context.Context, input QueryItemsInput) ([]map[
 		if err != nil {
 			return err
 		}
-		items, err = input.OrderItemsForTable(items, t, input.ExclusiveStartKey, input.ScanForward)
+		items, err = input.Orderer.OrderItemsForTable(items, t, input.ExclusiveStartKey, input.ScanForward)
 		return err
 	})
 	return items, err
@@ -189,23 +193,28 @@ func (s *Service) ScanItems(ctx context.Context, input ScanItemsInput) (model.Ta
 }
 
 type QueryProcessInput struct {
-	Table                model.Table
-	Items                []map[string]any
-	Limit                int
-	SelectMode           string
-	ConsistentRead       bool
-	IndexName            string
-	TargetHashKey        string
-	PK                   string
-	QueryGSI             *model.GlobalSecondaryIndex
-	QueryLSI             *model.LocalSecondaryIndex
-	ProjectItemForGSI    func(map[string]any, model.Table, model.GlobalSecondaryIndex) map[string]any
-	ProjectItemForLSI    func(map[string]any, model.Table, model.LocalSecondaryIndex) map[string]any
-	SortConditionMatches func(map[string]any) (bool, error)
-	ApplyFilter          func(map[string]any) (bool, error)
-	ApplyProjection      func(map[string]any) (map[string]any, error)
-	CloneItem            func(map[string]any) map[string]any
-	KeyFromItem          func(model.Table, map[string]any) map[string]any
+	Table          model.Table
+	Items          []map[string]any
+	Limit          int
+	SelectMode     string
+	ConsistentRead bool
+	IndexName      string
+	TargetHashKey  string
+	PK             string
+	QueryGSI       *model.GlobalSecondaryIndex
+	QueryLSI       *model.LocalSecondaryIndex
+	Processor      QueryProcessor
+}
+
+type QueryProcessor interface {
+	ProjectItemForGSI(map[string]any, model.Table, model.GlobalSecondaryIndex) map[string]any
+	ProjectItemForLSI(map[string]any, model.Table, model.LocalSecondaryIndex) map[string]any
+	SortConditionMatches(map[string]any) (bool, error)
+	ApplyFilter(map[string]any) (bool, error)
+	ApplyProjection(map[string]any) (map[string]any, error)
+	CloneItem(map[string]any) map[string]any
+	KeyFromItem(model.Table, map[string]any) map[string]any
+	SegmentForPK(string, int) int
 }
 
 type QueryProcessResult struct {
@@ -221,9 +230,9 @@ func (s *Service) ProcessQueryItems(input QueryProcessInput) (QueryProcessResult
 	for _, item := range input.Items {
 		queryItem := item
 		if input.QueryGSI != nil {
-			queryItem = input.ProjectItemForGSI(item, input.Table, *input.QueryGSI)
+			queryItem = input.Processor.ProjectItemForGSI(item, input.Table, *input.QueryGSI)
 		} else if input.QueryLSI != nil {
-			queryItem = input.ProjectItemForLSI(item, input.Table, *input.QueryLSI)
+			queryItem = input.Processor.ProjectItemForLSI(item, input.Table, *input.QueryLSI)
 		}
 
 		if input.IndexName != "" {
@@ -237,8 +246,8 @@ func (s *Service) ProcessQueryItems(input QueryProcessInput) (QueryProcessResult
 			}
 		}
 
-		if input.SortConditionMatches != nil {
-			ok, err := input.SortConditionMatches(queryItem)
+		if input.Processor != nil {
+			ok, err := input.Processor.SortConditionMatches(queryItem)
 			if err != nil {
 				return QueryProcessResult{}, err
 			}
@@ -248,10 +257,10 @@ func (s *Service) ProcessQueryItems(input QueryProcessInput) (QueryProcessResult
 		}
 
 		res.Scanned++
-		res.LastScanned = input.KeyFromItem(input.Table, item)
+		res.LastScanned = input.Processor.KeyFromItem(input.Table, item)
 		res.TotalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(queryItem), input.ConsistentRead)
 
-		matches, err := input.ApplyFilter(queryItem)
+		matches, err := input.Processor.ApplyFilter(queryItem)
 		if err != nil {
 			return QueryProcessResult{}, err
 		}
@@ -262,13 +271,13 @@ func (s *Service) ProcessQueryItems(input QueryProcessInput) (QueryProcessResult
 				case "ALL_ATTRIBUTES":
 					emit = item
 				case "SPECIFIC_ATTRIBUTES":
-					projected, err := input.ApplyProjection(queryItem)
+					projected, err := input.Processor.ApplyProjection(queryItem)
 					if err != nil {
 						return QueryProcessResult{}, err
 					}
 					emit = projected
 				}
-				res.Items = append(res.Items, input.CloneItem(emit))
+				res.Items = append(res.Items, input.Processor.CloneItem(emit))
 			}
 			res.Count++
 		}
@@ -281,17 +290,14 @@ func (s *Service) ProcessQueryItems(input QueryProcessInput) (QueryProcessResult
 }
 
 type ScanProcessInput struct {
-	Table            model.Table
-	Items            []map[string]any
-	Limit            int
-	SegmentEnabled   bool
-	Segment          int
-	TotalSegments    int
-	ConsistentRead   bool
-	ApplyFilter      func(map[string]any) (bool, error)
-	ApplyProjection  func(map[string]any) (map[string]any, error)
-	ScanSegmentForPK func(string) int
-	KeyFromItem      func(model.Table, map[string]any) map[string]any
+	Table          model.Table
+	Items          []map[string]any
+	Limit          int
+	SegmentEnabled bool
+	Segment        int
+	TotalSegments  int
+	ConsistentRead bool
+	Processor      QueryProcessor
 }
 
 type ScanProcessResult struct {
@@ -313,16 +319,16 @@ func (s *Service) ProcessScanItems(input ScanProcessInput) (ScanProcessResult, e
 			if err != nil {
 				continue
 			}
-			if input.ScanSegmentForPK(serializedPK) != input.Segment {
+			if input.Processor.SegmentForPK(serializedPK, input.TotalSegments) != input.Segment {
 				continue
 			}
 		}
 
 		res.Scanned++
-		res.LastScanned = input.KeyFromItem(input.Table, item)
+		res.LastScanned = input.Processor.KeyFromItem(input.Table, item)
 		res.TotalRead += model.CalculateReadCapacityUnits(model.CalculateItemSizeBytes(item), input.ConsistentRead)
 
-		matches, err := input.ApplyFilter(item)
+		matches, err := input.Processor.ApplyFilter(item)
 		if err != nil {
 			return ScanProcessResult{}, err
 		}
@@ -332,7 +338,7 @@ func (s *Service) ProcessScanItems(input ScanProcessInput) (ScanProcessResult, e
 			}
 			continue
 		}
-		projected, err := input.ApplyProjection(item)
+		projected, err := input.Processor.ApplyProjection(item)
 		if err != nil {
 			return ScanProcessResult{}, err
 		}

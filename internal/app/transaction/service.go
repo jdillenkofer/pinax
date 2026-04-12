@@ -35,9 +35,13 @@ type TransactGetItem struct {
 }
 
 type TransactGetInput struct {
-	Items           []TransactGetItem
-	ApplyProjection func(item map[string]any, projection string, names map[string]string) (map[string]any, error)
-	EnsureRead      func(model.Table, float64) error
+	Items   []TransactGetItem
+	Adapter TransactGetAdapter
+}
+
+type TransactGetAdapter interface {
+	ApplyProjection(item map[string]any, projection string, names map[string]string) (map[string]any, error)
+	EnsureRead(model.Table, float64) error
 }
 
 type TransactGetResult struct {
@@ -60,7 +64,7 @@ func (s *Service) TransactGet(ctx context.Context, input TransactGetInput) (Tran
 			item, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					if _, err := input.ApplyProjection(map[string]any{}, get.ProjectionExpression, get.ExpressionNames); err != nil {
+					if _, err := input.Adapter.ApplyProjection(map[string]any{}, get.ProjectionExpression, get.ExpressionNames); err != nil {
 						return invalid(err.Error())
 					}
 					result.ReadByTable[get.TableName] += model.CalculateReadCapacityUnits(1, true)
@@ -69,7 +73,7 @@ func (s *Service) TransactGet(ctx context.Context, input TransactGetInput) (Tran
 				}
 				return err
 			}
-			projected, err := input.ApplyProjection(item, get.ProjectionExpression, get.ExpressionNames)
+			projected, err := input.Adapter.ApplyProjection(item, get.ProjectionExpression, get.ExpressionNames)
 			if err != nil {
 				return invalid(err.Error())
 			}
@@ -81,7 +85,7 @@ func (s *Service) TransactGet(ctx context.Context, input TransactGetInput) (Tran
 			if err != nil {
 				return err
 			}
-			if err := input.EnsureRead(t, units); err != nil {
+			if err := input.Adapter.EnsureRead(t, units); err != nil {
 				return err
 			}
 		}
@@ -140,17 +144,20 @@ type TransactWriteInput struct {
 	NowMillis            int64
 	IdempotencyTTLMillis int64
 
-	ValidateReturnOnFail func(string) error
-	EvaluateCondition    func(expression string, item map[string]any, names map[string]string, values map[string]any) (bool, error)
-	ApplyUpdate          func(current map[string]any, updateExpression string, names map[string]string, values map[string]any) (map[string]any, error)
-	EmitMutation         func(context.Context, uow.Repos, model.Table, string, map[string]any, map[string]any, map[string]any, int64) error
-	EnsureWrite          func(model.Table, float64) error
+	Adapter TransactWriteAdapter
+}
 
-	OnConditionEvalError  func(total int, failedIndex int, message string) error
-	OnConditionFailed     func(total int, failedIndex int, returnValues string, current map[string]any, existed bool) error
-	BuildResponse         func(writeByTable map[string]float64) map[string]any
-	RequestHash           func() (string, error)
-	IdempotentMismatchErr func() error
+type TransactWriteAdapter interface {
+	ValidateReturnOnFail(string) error
+	EvaluateCondition(expression string, item map[string]any, names map[string]string, values map[string]any) (bool, error)
+	ApplyUpdate(current map[string]any, updateExpression string, names map[string]string, values map[string]any) (map[string]any, error)
+	EmitMutation(context.Context, uow.Repos, model.Table, string, map[string]any, map[string]any, map[string]any, int64) error
+	EnsureWrite(model.Table, float64) error
+	OnConditionEvalError(total int, failedIndex int, message string) error
+	OnConditionFailed(total int, failedIndex int, returnValues string, current map[string]any, existed bool) error
+	BuildResponse(writeByTable map[string]float64) map[string]any
+	RequestHash() (string, error)
+	IdempotentMismatchErr() error
 }
 
 type TransactWriteResult struct {
@@ -170,12 +177,12 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 			}
 			rec, err := repos.Items().GetTransactWriteIdempotency(txCtx, input.ClientRequestToken, now)
 			if err == nil {
-				hash, err := input.RequestHash()
+				hash, err := input.Adapter.RequestHash()
 				if err != nil {
 					return err
 				}
 				if rec.RequestHash != hash {
-					return input.IdempotentMismatchErr()
+					return input.Adapter.IdempotentMismatchErr()
 				}
 				result.Response = rec.Response
 				return nil
@@ -208,7 +215,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 
 			if item.Put != nil {
 				put := item.Put
-				if err := input.ValidateReturnOnFail(put.ReturnOnFail); err != nil {
+				if err := input.Adapter.ValidateReturnOnFail(put.ReturnOnFail); err != nil {
 					return invalid(err.Error())
 				}
 				t, err := s.getActiveTable(txCtx, repos.Tables(), put.TableName)
@@ -235,18 +242,18 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 					current = map[string]any{}
 				}
 
-				ok, err := input.EvaluateCondition(put.Condition, current, put.ExprNames, put.ExprValues)
+				ok, err := input.Adapter.EvaluateCondition(put.Condition, current, put.ExprNames, put.ExprValues)
 				if err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if !ok {
-					return input.OnConditionFailed(len(input.Items), i, put.ReturnOnFail, current, existed)
+					return input.Adapter.OnConditionFailed(len(input.Items), i, put.ReturnOnFail, current, existed)
 				}
 				if model.ItemTooLarge(put.Item) {
 					return invalid("Item size has exceeded the maximum allowed size")
 				}
 				if err := model.ValidateSecondaryIndexKeyTypes(t, put.Item); err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, put.Item); err != nil {
 					return err
@@ -263,7 +270,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 				if t.RangeKey != "" {
 					key[t.RangeKey] = put.Item[t.RangeKey]
 				}
-				if err := input.EmitMutation(txCtx, repos, t, eventName, key, oldImage, put.Item, time.Now().UnixMilli()); err != nil {
+				if err := input.Adapter.EmitMutation(txCtx, repos, t, eventName, key, oldImage, put.Item, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(put.Item))
@@ -272,7 +279,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 
 			if item.Delete != nil {
 				del := item.Delete
-				if err := input.ValidateReturnOnFail(del.ReturnOnFail); err != nil {
+				if err := input.Adapter.ValidateReturnOnFail(del.ReturnOnFail); err != nil {
 					return invalid(err.Error())
 				}
 				t, err := s.getActiveTable(txCtx, repos.Tables(), del.TableName)
@@ -299,18 +306,18 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 					current = map[string]any{}
 				}
 
-				ok, err := input.EvaluateCondition(del.Condition, current, del.ExprNames, del.ExprValues)
+				ok, err := input.Adapter.EvaluateCondition(del.Condition, current, del.ExprNames, del.ExprValues)
 				if err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if !ok {
-					return input.OnConditionFailed(len(input.Items), i, del.ReturnOnFail, current, existed)
+					return input.Adapter.OnConditionFailed(len(input.Items), i, del.ReturnOnFail, current, existed)
 				}
 				if err := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); err != nil {
 					return err
 				}
 				if existed {
-					if err := input.EmitMutation(txCtx, repos, t, "REMOVE", del.Key, current, nil, time.Now().UnixMilli()); err != nil {
+					if err := input.Adapter.EmitMutation(txCtx, repos, t, "REMOVE", del.Key, current, nil, time.Now().UnixMilli()); err != nil {
 						return err
 					}
 				}
@@ -320,7 +327,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 
 			if item.Update != nil {
 				upd := item.Update
-				if err := input.ValidateReturnOnFail(upd.ReturnOnFail); err != nil {
+				if err := input.Adapter.ValidateReturnOnFail(upd.ReturnOnFail); err != nil {
 					return invalid(err.Error())
 				}
 				t, err := s.getActiveTable(txCtx, repos.Tables(), upd.TableName)
@@ -359,20 +366,20 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 					}
 				}
 
-				ok, err := input.EvaluateCondition(upd.Condition, current, upd.ExprNames, upd.ExprValues)
+				ok, err := input.Adapter.EvaluateCondition(upd.Condition, current, upd.ExprNames, upd.ExprValues)
 				if err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if !ok {
-					return input.OnConditionFailed(len(input.Items), i, upd.ReturnOnFail, existing, existed)
+					return input.Adapter.OnConditionFailed(len(input.Items), i, upd.ReturnOnFail, existing, existed)
 				}
 
-				updated, err := input.ApplyUpdate(current, upd.UpdateExpression, upd.ExprNames, upd.ExprValues)
+				updated, err := input.Adapter.ApplyUpdate(current, upd.UpdateExpression, upd.ExprNames, upd.ExprValues)
 				if err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if model.ItemTooLarge(updated) {
 					return invalid("Item size has exceeded the maximum allowed size")
@@ -388,7 +395,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 				} else {
 					oldImage = nil
 				}
-				if err := input.EmitMutation(txCtx, repos, t, eventName, upd.Key, oldImage, updated, time.Now().UnixMilli()); err != nil {
+				if err := input.Adapter.EmitMutation(txCtx, repos, t, eventName, upd.Key, oldImage, updated, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[upd.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
@@ -397,7 +404,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 
 			if item.ConditionCheck != nil {
 				cc := item.ConditionCheck
-				if err := input.ValidateReturnOnFail(cc.ReturnOnFail); err != nil {
+				if err := input.Adapter.ValidateReturnOnFail(cc.ReturnOnFail); err != nil {
 					return invalid(err.Error())
 				}
 				t, err := s.getActiveTable(txCtx, repos.Tables(), cc.TableName)
@@ -424,12 +431,12 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 					current = map[string]any{}
 				}
 
-				ok, err := input.EvaluateCondition(cc.Condition, current, cc.ExprNames, cc.ExprValues)
+				ok, err := input.Adapter.EvaluateCondition(cc.Condition, current, cc.ExprNames, cc.ExprValues)
 				if err != nil {
-					return input.OnConditionEvalError(len(input.Items), i, err.Error())
+					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
 				if !ok {
-					return input.OnConditionFailed(len(input.Items), i, cc.ReturnOnFail, current, existed)
+					return input.Adapter.OnConditionFailed(len(input.Items), i, cc.ReturnOnFail, current, existed)
 				}
 				continue
 			}
@@ -442,14 +449,14 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 			if err != nil {
 				return err
 			}
-			if err := input.EnsureWrite(t, units); err != nil {
+			if err := input.Adapter.EnsureWrite(t, units); err != nil {
 				return err
 			}
 		}
 
-		response := input.BuildResponse(writeByTable)
+		response := input.Adapter.BuildResponse(writeByTable)
 		if input.ClientRequestToken != "" {
-			hash, err := input.RequestHash()
+			hash, err := input.Adapter.RequestHash()
 			if err != nil {
 				return err
 			}
