@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"github.com/jdillenkofer/pinax/internal/model"
 	"strings"
+
+	"github.com/jdillenkofer/pinax/internal/identity"
+	"github.com/jdillenkofer/pinax/internal/model"
 )
 
 func (r sqlTxRepo) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
@@ -126,27 +128,12 @@ func (r sqlTxRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN stri
 }
 
 func streamTableNameFromARN(streamARN string) string {
-	accountID := "000000000000"
-	parts := strings.SplitN(strings.TrimSpace(streamARN), ":", 6)
-	if len(parts) >= 5 && strings.TrimSpace(parts[4]) != "" {
-		accountID = strings.TrimSpace(parts[4])
-	}
-	marker := "/table/"
-	start := strings.Index(streamARN, marker)
-	if start < 0 {
-		marker = ":table/"
-		start = strings.Index(streamARN, marker)
-	}
-	if start < 0 {
+	tableName, accountID, isARN, err := identity.ParseTableARN(streamARN)
+	if err != nil || !isARN || strings.TrimSpace(tableName) == "" {
 		return ""
 	}
-	remainder := streamARN[start+len(marker):]
-	if slash := strings.Index(remainder, "/"); slash >= 0 {
-		remainder = remainder[:slash]
+	if strings.TrimSpace(accountID) == "" {
+		accountID = identity.DefaultLocalAccountID
 	}
-	remainder = strings.TrimSpace(remainder)
-	if remainder == "" {
-		return ""
-	}
-	return accountID + "#" + remainder
+	return identity.ScopedTableKey(accountID, tableName)
 }

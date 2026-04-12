@@ -28,6 +28,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
+	"github.com/jdillenkofer/pinax/internal/identity"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
 	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
@@ -54,8 +55,6 @@ const (
 	streamResponseMaxBytes                    = 1024 * 1024
 	streamDefaultShardID                      = "shardId-000000000000"
 	maxResourcePolicyBytes                    = 20 * 1024
-	defaultLocalAccountID                     = "000000000000"
-	scopedTableKeySeparator                   = "#"
 )
 
 const policyNotFoundMessage = "The operation tried to access a nonexistent resource-based policy."
@@ -695,7 +694,7 @@ func removeTags(existing []model.Tag, keys []string) []model.Tag {
 }
 
 func taggableTableNameFromResourceARN(resourceARN string) (string, string, error) {
-	tableName, accountID, isARN, err := parseTableARN(resourceARN)
+	tableName, accountID, isARN, err := identity.ParseTableARN(resourceARN)
 	if err != nil {
 		return "", "", err
 	}
@@ -821,91 +820,23 @@ func accountIDFromContext(ctx context.Context) string {
 			return trimmed
 		}
 	}
-	return defaultLocalAccountID
+	return identity.DefaultLocalAccountID
 }
 
 func scopedTableKeyFromAccountAndName(accountID string, tableName string) string {
-	return strings.TrimSpace(accountID) + scopedTableKeySeparator + strings.TrimSpace(tableName)
+	return identity.ScopedTableKey(accountID, tableName)
 }
 
 func splitScopedTableKey(v string) (string, string) {
-	v = strings.TrimSpace(v)
-	parts := strings.SplitN(v, scopedTableKeySeparator, 2)
-	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
-		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-	}
-	return defaultLocalAccountID, v
-}
-
-func normalizeTableNameIdentifier(v string) string {
-	name, _, _, err := parseTableARN(v)
-	if err == nil {
-		return name
-	}
-	return strings.TrimSpace(v)
+	return identity.SplitScopedTableKey(v)
 }
 
 func parseTableARN(v string) (tableName string, accountID string, isARN bool, err error) {
-	v = strings.TrimSpace(v)
-	if !strings.HasPrefix(v, "arn:") {
-		return strings.TrimSpace(v), "", false, nil
-	}
-	parts := strings.SplitN(v, ":", 6)
-	if len(parts) < 6 {
-		return "", "", true, fmt.Errorf("ResourceArn must be a valid ARN")
-	}
-	accountID = strings.TrimSpace(parts[4])
-	resource := strings.TrimSpace(parts[5])
-	if !strings.HasPrefix(resource, "table/") {
-		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	remainder := strings.TrimPrefix(resource, "table/")
-	if remainder == "" {
-		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	tableName = remainder
-	if slash := strings.Index(tableName, "/"); slash >= 0 {
-		tableName = tableName[:slash]
-	}
-	tableName = strings.TrimSpace(tableName)
-	if tableName == "" {
-		return "", "", true, fmt.Errorf("ResourceArn must identify a DynamoDB table")
-	}
-	return tableName, accountID, true, nil
-}
-
-func scopedTableNameFromIdentifier(ctx context.Context, tableIdentifier string) (string, error) {
-	tableName, arnAccountID, isARN, err := parseTableARN(tableIdentifier)
-	if err != nil {
-		return "", awserr.Validation(err.Error())
-	}
-	accountID := accountIDFromContext(ctx)
-	if isARN && arnAccountID != "" && arnAccountID != accountID {
-		return "", &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
-	}
-	if strings.TrimSpace(tableName) == "" {
-		return "", awserr.Validation("TableName is required")
-	}
-	return scopedTableKeyFromAccountAndName(accountID, tableName), nil
-}
-
-func validateTableARNAccountForRequest(ctx context.Context, resourceARN string) (string, error) {
-	tableName, arnAccountID, isARN, err := parseTableARN(resourceARN)
-	if err != nil {
-		return "", awserr.Validation(err.Error())
-	}
-	if !isARN {
-		return "", awserr.Validation("ResourceArn must be a valid ARN")
-	}
-	if arnAccountID != "" && arnAccountID != accountIDFromContext(ctx) {
-		return "", &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
-	}
-	return tableName, nil
+	return identity.ParseTableARN(v)
 }
 
 func logicalTableNameFromKey(v string) string {
-	_, tableName := splitScopedTableKey(v)
-	return tableName
+	return identity.LogicalTableNameFromKey(v)
 }
 
 func localBackupARN(tableName string, backupName string, createdAt int64) string {

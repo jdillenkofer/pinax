@@ -15,6 +15,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
+	"github.com/jdillenkofer/pinax/internal/identity"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
 )
@@ -912,9 +913,9 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	if strings.TrimSpace(req.TableName) == "" {
 		return nil, awserr.Validation("TableName is required")
 	}
-	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
+	tableKey, err := identity.ScopedTableKeyFromIdentifier(req.TableName, accountIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, mapIdentityRequestError(err)
 	}
 
 	if len(req.ReplicaUpdates) > 0 {
@@ -975,9 +976,9 @@ func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model
 }
 
 func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
-	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
+	scopedTableName, err := identity.ScopedTableKeyFromIdentifier(tableName, accountIDFromContext(ctx))
 	if err != nil {
-		return model.Table{}, err
+		return model.Table{}, mapIdentityRequestError(err)
 	}
 	return s.getTableWithLifecycleByKey(ctx, s.txReposFactory.Build(tx).Tables(), scopedTableName)
 }
@@ -994,9 +995,9 @@ func (s *Server) getTableWithLifecycleByKey(ctx context.Context, tables uow.Tabl
 }
 
 func (s *Server) getTableWithLifecycleFromRepo(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error) {
-	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
+	scopedTableName, err := identity.ScopedTableKeyFromIdentifier(tableName, accountIDFromContext(ctx))
 	if err != nil {
-		return model.Table{}, err
+		return model.Table{}, mapIdentityRequestError(err)
 	}
 	return s.getTableWithLifecycleByKey(ctx, tables, scopedTableName)
 }

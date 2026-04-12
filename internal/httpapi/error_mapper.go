@@ -7,6 +7,7 @@ import (
 
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/awserr"
+	"github.com/jdillenkofer/pinax/internal/identity"
 )
 
 type errorMapping struct {
@@ -58,6 +59,25 @@ func containsAny(s string, parts ...string) bool {
 		}
 	}
 	return false
+}
+
+func mapIdentityRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, identity.ErrAccessDenied) {
+		return badRequestAPIError("AccessDeniedException", "Access denied")
+	}
+	if errors.Is(err, identity.ErrTableNameRequired) {
+		return awserr.Validation("TableName is required")
+	}
+	if errors.Is(err, identity.ErrResourceNotARN) {
+		return awserr.Validation("ResourceArn must be a valid ARN")
+	}
+	if errors.Is(err, identity.ErrResourceARN) {
+		return awserr.Validation(strings.TrimSpace(strings.TrimPrefix(err.Error(), identity.ErrResourceARN.Error()+":")))
+	}
+	return err
 }
 
 func mapPartiQLError(err error) (code string, message string, item map[string]any) {

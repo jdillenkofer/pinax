@@ -13,6 +13,7 @@ import (
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/awserr"
+	"github.com/jdillenkofer/pinax/internal/identity"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
 
@@ -156,9 +157,9 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
+	tableKey, err := identity.ScopedTableKeyFromIdentifier(req.TableName, accountIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, mapIdentityRequestError(err)
 	}
 
 	backup, err := s.backupService.CreateBackup(
@@ -204,8 +205,8 @@ func (s *Server) describeBackup(r *http.Request, body []byte) (map[string]any, e
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
 	}
-	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
-		return nil, err
+	if _, err := identity.ValidateTableARNForAccount(req.BackupArn, accountIDFromContext(r.Context())); err != nil {
+		return nil, mapIdentityRequestError(err)
 	}
 
 	backup, err := s.backupService.DescribeBackup(r.Context(), req.BackupArn)
@@ -225,8 +226,8 @@ func (s *Server) deleteBackup(r *http.Request, body []byte) (map[string]any, err
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
 	}
-	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
-		return nil, err
+	if _, err := identity.ValidateTableARNForAccount(req.BackupArn, accountIDFromContext(r.Context())); err != nil {
+		return nil, mapIdentityRequestError(err)
 	}
 
 	deleted, err := s.backupService.DeleteBackup(r.Context(), req.BackupArn)
@@ -265,13 +266,13 @@ func (s *Server) listBackups(r *http.Request, body []byte) (map[string]any, erro
 	}
 
 	currentAccountID := accountIDFromContext(r.Context())
-	tableNameFilter := normalizeTableNameIdentifier(req.TableName)
+	tableNameFilter := identity.NormalizeTableNameIdentifier(req.TableName)
 	tableARNFilter := strings.TrimSpace(req.TableName)
 	if strings.HasPrefix(tableARNFilter, "arn:") {
 		var err error
-		tableNameFilter, err = validateTableARNAccountForRequest(r.Context(), tableARNFilter)
+		tableNameFilter, err = identity.ValidateTableARNForAccount(tableARNFilter, currentAccountID)
 		if err != nil {
-			return nil, err
+			return nil, mapIdentityRequestError(err)
 		}
 	}
 	filtered := make([]model.Backup, 0, len(backups))
@@ -351,8 +352,8 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 	if strings.TrimSpace(req.BackupArn) == "" {
 		return nil, awserr.Validation("BackupArn is required")
 	}
-	if _, err := validateTableARNAccountForRequest(r.Context(), req.BackupArn); err != nil {
-		return nil, err
+	if _, err := identity.ValidateTableARNForAccount(req.BackupArn, accountIDFromContext(r.Context())); err != nil {
+		return nil, mapIdentityRequestError(err)
 	}
 	if strings.TrimSpace(req.TargetTableName) == "" {
 		return nil, awserr.Validation("TargetTableName is required")
@@ -445,9 +446,9 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 			return nil, awserr.Validation("RecoveryPeriodInDays must be between 1 and 35")
 		}
 	}
-	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
+	tableKey, err := identity.ScopedTableKeyFromIdentifier(req.TableName, accountIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, mapIdentityRequestError(err)
 	}
 	t, nowMs, err := s.pitrService.UpdateContinuousBackups(r.Context(), pitrapp.UpdateContinuousBackupsInput{
 		TableKey:              tableKey,
@@ -472,9 +473,9 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 	if strings.TrimSpace(req.TableName) == "" {
 		return nil, awserr.Validation("TableName is required")
 	}
-	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
+	tableKey, err := identity.ScopedTableKeyFromIdentifier(req.TableName, accountIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, mapIdentityRequestError(err)
 	}
 
 	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), tableKey, time.Now().UnixMilli())
@@ -511,9 +512,9 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 	}
 
 	sourceName := firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn))
-	sourceTableKey, err := scopedTableNameFromIdentifier(r.Context(), sourceName)
+	sourceTableKey, err := identity.ScopedTableKeyFromIdentifier(sourceName, accountIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, mapIdentityRequestError(err)
 	}
 	restoreAtMillis := int64(0)
 	if req.RestoreDateTime != nil {
