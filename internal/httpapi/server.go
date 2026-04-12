@@ -29,6 +29,7 @@ import (
 	"time"
 
 	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
+	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
@@ -103,6 +104,7 @@ var (
 type Server struct {
 	store                         store.Store
 	backupService                 *backupapp.Service
+	pitrService                   *pitrapp.Service
 	requestAuthorizer             authorization.RequestAuthorizer
 	mutationExecutor              *mutation.Executor
 	capMu                         sync.Mutex
@@ -158,6 +160,7 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 	s := &Server{
 		store:                         store,
 		backupService:                 backupapp.NewService(store),
+		pitrService:                   pitrapp.NewService(store),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -1372,14 +1375,13 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 			return nil, awserr.Validation("RecoveryPeriodInDays must be between 1 and 35")
 		}
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
+	t, nowMs, err := s.pitrService.UpdateContinuousBackups(r.Context(), pitrapp.UpdateContinuousBackupsInput{
+		TableName:             req.TableName,
+		Enable:                *req.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled,
+		RecoveryPeriodInDays:  req.PointInTimeRecoverySpecification.RecoveryPeriodInDays,
+		NowMillis:             time.Now().UnixMilli(),
+		DefaultRecoveryWindow: 35,
+	}, s.getTableWithLifecycle)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1387,59 +1389,7 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 		}
 		return nil, err
 	}
-
-	nowMs := time.Now().UnixMilli()
-	enable := *req.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled
-	recoveryDays := t.PITR.RecoveryPeriodInDays
-	if recoveryDays <= 0 {
-		recoveryDays = 35
-	}
-	if req.PointInTimeRecoverySpecification.RecoveryPeriodInDays != 0 {
-		recoveryDays = req.PointInTimeRecoverySpecification.RecoveryPeriodInDays
-	}
-	enabledAt := t.PITR.EnabledAt
-	if enable {
-		if !t.PITR.Enabled || enabledAt == 0 {
-			enabledAt = nowMs
-			items, err := s.store.Scan(r.Context(), tx, t.Name, "", "", 0)
-			if err != nil {
-				return nil, err
-			}
-			for _, item := range items {
-				pk, sk, err := model.ExtractItemKeys(t, item)
-				if err != nil {
-					return nil, awserr.Validation(err.Error())
-				}
-				if err := s.store.AppendItemChange(r.Context(), tx, t.Name, pk, sk, "PUT", item, enabledAt); err != nil {
-					return nil, err
-				}
-			}
-			if err := s.store.CreatePITRCheckpointFromCurrentState(r.Context(), tx, t.Name, enabledAt); err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		enabledAt = 0
-	}
-
-	next := model.PointInTimeRecovery{Enabled: enable, RecoveryPeriodInDays: recoveryDays, EnabledAt: enabledAt}
-	if err := s.store.UpdatePointInTimeRecovery(r.Context(), tx, t.Name, next); err != nil {
-		return nil, err
-	}
-	t.PITR = next
-	if next.Enabled {
-		cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
-		if cutoff > 0 {
-			if _, err := s.store.CompactItemChangesBefore(r.Context(), tx, t.Name, cutoff); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ContinuousBackupsDescription": s.continuousBackupsDescription(t, nowMs)}, nil
+	return map[string]any{"ContinuousBackupsDescription": pitrapp.ContinuousBackupsDescription(t, nowMs, s.pitrLatestRestorableLagMillis)}, nil
 }
 
 func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[string]any, error) {
@@ -1451,13 +1401,7 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
+	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), req.TableName, time.Now().UnixMilli(), s.getTableWithLifecycle)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1465,12 +1409,7 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 		}
 		return nil, err
 	}
-
-	nowMs := time.Now().UnixMilli()
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ContinuousBackupsDescription": s.continuousBackupsDescription(t, nowMs)}, nil
+	return map[string]any{"ContinuousBackupsDescription": pitrapp.ContinuousBackupsDescription(t, nowMs, s.pitrLatestRestorableLagMillis)}, nil
 }
 
 func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[string]any, error) {
@@ -1497,158 +1436,99 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return nil, awserr.Validation("RestoreDateTime is required unless UseLatestRestorableTime is true")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	sourceName := firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn))
-	source, err := s.getTableWithLifecycle(r.Context(), tx, sourceName)
+	restoreAtMillis := int64(0)
+	if req.RestoreDateTime != nil {
+		restoreAtMillis = int64(math.Round(*req.RestoreDateTime * 1000))
+	}
+
+	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
+	tableToCreate, count, err := s.pitrService.RestoreTableToPointInTime(r.Context(), pitrapp.RestoreTableToPointInTimeInput{
+		SourceName:                sourceName,
+		TargetScopedTableKey:      targetScopedTableKey,
+		UseLatestRestorableTime:   req.UseLatestRestorableTime,
+		RestoreDateTimeMillis:     restoreAtMillis,
+		PITRLatestRestorableLagMs: s.pitrLatestRestorableLagMillis,
+		NowMillis:                 time.Now().UnixMilli(),
+	}, s.getTableWithLifecycle, func(source model.Table) (model.Table, error) {
+		table := source
+		table.Name = targetScopedTableKey
+		table.Status = model.TableStatusCreating
+		table.StatusAt = lifecycleNow() + lifecycleDelayMillis()
+		table.CreatedAt = time.Now().Unix()
+		table.Tags = nil
+		table.Stream = model.StreamSpecification{}
+		table.TimeToLive = model.TimeToLive{Enabled: false, Status: model.TTLStatusDisabled}
+		table.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: source.PITR.RecoveryPeriodInDays}
+
+		billingMode := table.BillingMode
+		readCapacity := table.ReadCapacityUnits
+		writeCapacity := table.WriteCapacityUnits
+		if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
+			var err error
+			billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
+			if err != nil {
+				return model.Table{}, awserr.Validation(err.Error())
+			}
+		}
+		table.BillingMode = billingMode
+		table.ReadCapacityUnits = readCapacity
+		table.WriteCapacityUnits = writeCapacity
+
+		if req.SSESpecificationOverride != nil {
+			normalizedSSE, err := normalizeSSESpecCreate(&struct {
+				Enabled        bool   `json:"Enabled"`
+				SSEType        string `json:"SSEType"`
+				KMSMasterKeyID string `json:"KMSMasterKeyId"`
+			}{
+				Enabled:        req.SSESpecificationOverride.Enabled,
+				SSEType:        req.SSESpecificationOverride.SSEType,
+				KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
+			})
+			if err != nil {
+				return model.Table{}, awserr.Validation(err.Error())
+			}
+			table.SSE = normalizedSSE
+		}
+		if req.OnDemandThroughputOverride != nil {
+			if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
+				return model.Table{}, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
+			}
+		}
+
+		updatedGSIs, err := applyRestoreGSIOverride(table.GSIs, req.GlobalSecondaryIndexOverride, table.BillingMode)
+		if err != nil {
+			return model.Table{}, awserr.Validation(err.Error())
+		}
+		table.GSIs = updatedGSIs
+		updatedLSIs, err := applyRestoreLSIOverride(table.LSIs, req.LocalSecondaryIndexOverride)
+		if err != nil {
+			return model.Table{}, awserr.Validation(err.Error())
+		}
+		table.LSIs = updatedLSIs
+
+		return table, nil
+	})
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
-		return nil, err
-	}
-	if !source.PITR.Enabled {
-		return nil, &awserr.APIError{Code: "PointInTimeRecoveryUnavailableException", Message: "Point in time recovery has not yet been enabled for this source table.", Status: http.StatusBadRequest}
-	}
-
-	nowMs := time.Now().UnixMilli()
-	earliest, latest := s.pitrRestoreWindow(source, nowMs)
-	restoreAt := latest
-	if req.RestoreDateTime != nil {
-		restoreAt = int64(math.Round(*req.RestoreDateTime * 1000))
-	}
-	if restoreAt < earliest || restoreAt > latest {
-		return nil, &awserr.APIError{Code: "InvalidRestoreTimeException", Message: "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.", Status: http.StatusBadRequest}
-	}
-
-	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
-	if existing, err := s.store.GetTable(r.Context(), tx, targetScopedTableKey); err == nil {
-		if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
+		if errors.Is(err, pitrapp.ErrPointInTimeRecoveryUnavailable) {
+			return nil, &awserr.APIError{Code: "PointInTimeRecoveryUnavailableException", Message: "Point in time recovery has not yet been enabled for this source table.", Status: http.StatusBadRequest}
+		}
+		if errors.Is(err, pitrapp.ErrInvalidRestoreTime) {
+			return nil, &awserr.APIError{Code: "InvalidRestoreTimeException", Message: "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.", Status: http.StatusBadRequest}
+		}
+		if errors.Is(err, pitrapp.ErrTargetTableInUse) {
 			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
 		}
-		return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	tableToCreate := source
-	tableToCreate.Name = targetScopedTableKey
-	tableToCreate.Status = model.TableStatusCreating
-	tableToCreate.StatusAt = lifecycleNow() + lifecycleDelayMillis()
-	tableToCreate.CreatedAt = time.Now().Unix()
-	tableToCreate.Tags = nil
-	tableToCreate.Stream = model.StreamSpecification{}
-	tableToCreate.TimeToLive = model.TimeToLive{Enabled: false, Status: model.TTLStatusDisabled}
-	tableToCreate.PITR = model.PointInTimeRecovery{Enabled: false, RecoveryPeriodInDays: source.PITR.RecoveryPeriodInDays}
-
-	billingMode := tableToCreate.BillingMode
-	readCapacity := tableToCreate.ReadCapacityUnits
-	writeCapacity := tableToCreate.WriteCapacityUnits
-	if strings.TrimSpace(req.BillingModeOverride) != "" || req.ProvisionedThroughputOverride != nil {
-		billingMode, readCapacity, writeCapacity, err = normalizeBillingConfig(req.BillingModeOverride, req.ProvisionedThroughputOverride)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-	}
-	tableToCreate.BillingMode = billingMode
-	tableToCreate.ReadCapacityUnits = readCapacity
-	tableToCreate.WriteCapacityUnits = writeCapacity
-
-	if req.SSESpecificationOverride != nil {
-		normalizedSSE, err := normalizeSSESpecCreate(&struct {
-			Enabled        bool   `json:"Enabled"`
-			SSEType        string `json:"SSEType"`
-			KMSMasterKeyID string `json:"KMSMasterKeyId"`
-		}{
-			Enabled:        req.SSESpecificationOverride.Enabled,
-			SSEType:        req.SSESpecificationOverride.SSEType,
-			KMSMasterKeyID: req.SSESpecificationOverride.KMSMasterKeyID,
-		})
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		tableToCreate.SSE = normalizedSSE
-	}
-	if req.OnDemandThroughputOverride != nil {
-		if req.OnDemandThroughputOverride.MaxReadRequestUnits < 0 || req.OnDemandThroughputOverride.MaxWriteRequestUnits < 0 {
-			return nil, awserr.Validation("OnDemandThroughputOverride values must be greater than or equal to 0")
-		}
-	}
-
-	updatedGSIs, err := applyRestoreGSIOverride(tableToCreate.GSIs, req.GlobalSecondaryIndexOverride, tableToCreate.BillingMode)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	tableToCreate.GSIs = updatedGSIs
-	updatedLSIs, err := applyRestoreLSIOverride(tableToCreate.LSIs, req.LocalSecondaryIndexOverride)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	tableToCreate.LSIs = updatedLSIs
-
-	if err := s.store.CreateTable(r.Context(), tx, tableToCreate); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if errors.Is(err, pitrapp.ErrTargetTableExists) {
 			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
 		}
 		return nil, err
 	}
 
-	cursor, err := s.store.ResolveItemChangeCursorAtOrBefore(r.Context(), tx, source.Name, restoreAt)
-	if err != nil {
-		return nil, err
-	}
-
-	checkpoint, err := s.store.GetLatestPITRCheckpointAtOrBeforeCursor(r.Context(), tx, source.Name, cursor)
-	if err != nil {
-		return nil, err
-	}
-	if !checkpoint.Found {
-		checkpoint, err = s.store.GetLatestPITRCheckpointAtOrBefore(r.Context(), tx, source.Name, restoreAt)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	changes, err := s.store.ListItemChangesAfterCursorUpToCursor(r.Context(), tx, source.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, cursor)
-	if err != nil {
-		return nil, err
-	}
-	state := map[string]map[string]any{}
-	if checkpoint.Found {
-		for _, item := range checkpoint.Items {
-			state[item.PK+"\x00"+item.SK] = item.Item
-		}
-	}
-	for _, change := range changes {
-		key := change.PK + "\x00" + change.SK
-		if strings.EqualFold(change.ChangeType, "DELETE") {
-			delete(state, key)
-			continue
-		}
-		if change.Item != nil {
-			state[key] = change.Item
-		}
-	}
-	count := int64(0)
-	for _, item := range state {
-		pk, sk, err := model.ExtractItemKeys(tableToCreate, item)
-		if err != nil {
-			return nil, awserr.Validation(err.Error())
-		}
-		if err := s.store.PutItem(r.Context(), tx, tableToCreate.Name, pk, sk, item); err != nil {
-			return nil, err
-		}
-		count++
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return map[string]any{"TableDescription": tableToCreate.Description(count)}, nil
 }
 
@@ -5424,46 +5304,6 @@ func validateTableARNAccountForRequest(ctx context.Context, resourceARN string) 
 func logicalTableNameFromKey(v string) string {
 	_, tableName := splitScopedTableKey(v)
 	return tableName
-}
-
-func (s *Server) pitrRestoreWindow(t model.Table, nowMs int64) (int64, int64) {
-	recoveryDays := t.PITR.RecoveryPeriodInDays
-	if recoveryDays <= 0 {
-		recoveryDays = 35
-	}
-	earliest := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
-	if t.PITR.EnabledAt > 0 && t.PITR.EnabledAt > earliest {
-		earliest = t.PITR.EnabledAt
-	}
-	lagMs := s.pitrLatestRestorableLagMillis
-	latest := nowMs - lagMs
-	if latest < earliest {
-		latest = earliest
-	}
-	return earliest, latest
-}
-
-func (s *Server) continuousBackupsDescription(t model.Table, nowMs int64) map[string]any {
-	pitrStatus := model.PointInTimeRecoveryStatusDisabled
-	recoveryDays := t.PITR.RecoveryPeriodInDays
-	if recoveryDays <= 0 {
-		recoveryDays = 35
-	}
-	pitrDesc := map[string]any{
-		"PointInTimeRecoveryStatus": pitrStatus,
-		"RecoveryPeriodInDays":      recoveryDays,
-	}
-	if t.PITR.Enabled {
-		pitrStatus = model.PointInTimeRecoveryStatusEnabled
-		earliest, latest := s.pitrRestoreWindow(t, nowMs)
-		pitrDesc["PointInTimeRecoveryStatus"] = pitrStatus
-		pitrDesc["EarliestRestorableDateTime"] = float64(earliest) / 1000.0
-		pitrDesc["LatestRestorableDateTime"] = float64(latest) / 1000.0
-	}
-	return map[string]any{
-		"ContinuousBackupsStatus":        model.ContinuousBackupsStatusEnabled,
-		"PointInTimeRecoveryDescription": pitrDesc,
-	}
 }
 
 func localBackupARN(tableName string, backupName string, createdAt int64) string {
