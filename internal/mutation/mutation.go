@@ -26,14 +26,8 @@ type Event struct {
 	ChangedAt int64
 }
 
-type Repos interface {
-	Streams() uow.StreamRepo
-	PITR() uow.PITRRepo
-	TTL() uow.TTLRepo
-}
-
 type Hook interface {
-	HandleMutation(ctx context.Context, repos Repos, event Event) error
+	HandleMutation(ctx context.Context, repos uow.Repos, event Event) error
 }
 
 type Executor struct {
@@ -45,7 +39,7 @@ func NewExecutor(hooks ...Hook) *Executor {
 	return &Executor{hooks: hooksCopy}
 }
 
-func (e *Executor) Emit(ctx context.Context, repos Repos, event Event) error {
+func (e *Executor) Emit(ctx context.Context, repos uow.Repos, event Event) error {
 	if e == nil {
 		return nil
 	}
@@ -70,7 +64,7 @@ func NewStreamHook() Hook {
 	return &streamHook{}
 }
 
-func (h *streamHook) HandleMutation(ctx context.Context, repos Repos, event Event) error {
+func (h *streamHook) HandleMutation(ctx context.Context, repos uow.Repos, event Event) error {
 	if !event.Table.Stream.Enabled || strings.TrimSpace(event.Table.Stream.ARN) == "" {
 		return nil
 	}
@@ -96,7 +90,7 @@ func NewPITRHook() Hook {
 	return &pitrHook{}
 }
 
-func (h *pitrHook) HandleMutation(ctx context.Context, repos Repos, event Event) error {
+func (h *pitrHook) HandleMutation(ctx context.Context, repos uow.Repos, event Event) error {
 	if !event.Table.PITR.Enabled {
 		return nil
 	}
