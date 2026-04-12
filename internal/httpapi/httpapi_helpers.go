@@ -26,16 +26,6 @@ func decode(body []byte, out any) error {
 	return nil
 }
 
-func resolveName(v string, names map[string]string) string {
-	v = strings.TrimSpace(v)
-	if strings.HasPrefix(v, "#") {
-		if out, ok := names[v]; ok {
-			return out
-		}
-	}
-	return v
-}
-
 func resolveNameStrict(v string, names map[string]string) (string, error) {
 	v = strings.TrimSpace(v)
 	if strings.HasPrefix(v, "#") {

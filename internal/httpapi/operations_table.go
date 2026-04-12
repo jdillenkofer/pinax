@@ -1015,34 +1015,6 @@ func validateUpdateTablePayload(body []byte) error {
 	return nil
 }
 
-type gsiUpdateRequest struct {
-	Create struct {
-		IndexName             string
-		ProvisionedThroughput *struct {
-			ReadCapacityUnits  int64
-			WriteCapacityUnits int64
-		}
-		KeySchema []struct {
-			AttributeName string
-			KeyType       string
-		}
-		Projection struct {
-			ProjectionType   string
-			NonKeyAttributes []string
-		}
-	}
-	Delete struct {
-		IndexName string
-	}
-	Update struct {
-		IndexName             string
-		ProvisionedThroughput *struct {
-			ReadCapacityUnits  int64
-			WriteCapacityUnits int64
-		}
-	}
-}
-
 func applyGSIUpdates(table model.Table, updates []struct {
 	Create struct {
 		IndexName             string `json:"IndexName"`

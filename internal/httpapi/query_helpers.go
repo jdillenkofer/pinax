@@ -135,22 +135,6 @@ func keyFromItem(table model.Table, item map[string]any) map[string]any {
 	return key
 }
 
-func compareSKForDirection(a, b string, scanForward bool) int {
-	if a == b {
-		return 0
-	}
-	if scanForward {
-		if a < b {
-			return -1
-		}
-		return 1
-	}
-	if a > b {
-		return -1
-	}
-	return 1
-}
-
 func numberFromN(v any) (float64, bool) {
 	m, ok := v.(map[string]any)
 	if !ok {

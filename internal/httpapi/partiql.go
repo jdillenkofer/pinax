@@ -26,7 +26,6 @@ var (
 	insertStatementPattern = regexp.MustCompile(`(?is)^\s*INSERT\s+INTO\s+([^\s]+)\s+VALUE\s+(.+?)\s*$`)
 	updateStatementPattern = regexp.MustCompile(`(?is)^\s*UPDATE\s+([^\s]+)\s+SET\s+(.+?)\s+WHERE\s+(.+?)\s*$`)
 	deleteStatementPattern = regexp.MustCompile(`(?is)^\s*DELETE\s+FROM\s+([^\s]+)\s+WHERE\s+(.+?)\s*$`)
-	keyConditionPattern    = regexp.MustCompile(`(?is)^\s*([A-Za-z0-9_]+)\s*=\s*\?\s*$`)
 	comparisonPattern      = regexp.MustCompile(`(?is)^\s*([A-Za-z0-9_]+)\s*(=|<>|<=|<|>=|>)\s*\?\s*$`)
 	betweenPattern         = regexp.MustCompile(`(?is)^\s*([A-Za-z0-9_]+)\s+BETWEEN\s+\?\s+AND\s+\?\s*$`)
 	inPattern              = regexp.MustCompile(`(?is)^\s*([A-Za-z0-9_]+)\s+IN\s*\((.+)\)\s*$`)

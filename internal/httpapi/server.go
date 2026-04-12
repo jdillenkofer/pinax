@@ -578,41 +578,6 @@ func normalizeTagKeys(keys []string) ([]string, error) {
 	return out, nil
 }
 
-func mergeTags(existing []model.Tag, updates []model.Tag) []model.Tag {
-	merged := append([]model.Tag(nil), existing...)
-	positions := make(map[string]int, len(merged))
-	for i, tag := range merged {
-		positions[tag.Key] = i
-	}
-	for _, tag := range updates {
-		if idx, ok := positions[tag.Key]; ok {
-			merged[idx].Value = tag.Value
-			continue
-		}
-		positions[tag.Key] = len(merged)
-		merged = append(merged, tag)
-	}
-	return merged
-}
-
-func removeTags(existing []model.Tag, keys []string) []model.Tag {
-	if len(existing) == 0 || len(keys) == 0 {
-		return existing
-	}
-	remove := map[string]struct{}{}
-	for _, key := range keys {
-		remove[key] = struct{}{}
-	}
-	out := make([]model.Tag, 0, len(existing))
-	for _, tag := range existing {
-		if _, ok := remove[tag.Key]; ok {
-			continue
-		}
-		out = append(out, tag)
-	}
-	return out
-}
-
 func taggableTableNameFromResourceARN(resourceARN string) (string, string, error) {
 	tableName, accountID, isARN, err := identity.ParseTableARN(resourceARN)
 	if err != nil {
@@ -749,10 +714,6 @@ func scopedTableKeyFromAccountAndName(accountID string, tableName string) string
 
 func splitScopedTableKey(v string) (string, string) {
 	return identity.SplitScopedTableKey(v)
-}
-
-func parseTableARN(v string) (tableName string, accountID string, isARN bool, err error) {
-	return identity.ParseTableARN(v)
 }
 
 func logicalTableNameFromKey(v string) string {

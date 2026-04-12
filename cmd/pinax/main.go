@@ -17,7 +17,6 @@ import (
 	authorizationLua "github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	"github.com/jdillenkofer/pinax/internal/settings"
 	"github.com/jdillenkofer/pinax/internal/ttl"
@@ -64,7 +63,7 @@ func main() {
 	}
 	defer db.Close()
 
-	backend, err := sqlite.New(db)
+	backend, err := reposqlite.New(db)
 	if err != nil {
 		slog.Error("could not initialize storage", "err", err)
 		os.Exit(1)
