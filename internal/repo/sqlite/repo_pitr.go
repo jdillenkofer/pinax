@@ -437,22 +437,6 @@ func (r pitrRepo) insertPITRCheckpoint(ctx context.Context, tableName string, ch
 	return nil
 }
 
-func (r pitrRepo) pruneItemHistoryByRetention(ctx context.Context, table model.Table, nowMs int64) error {
-	if !table.PITR.Enabled {
-		return nil
-	}
-	recoveryDays := table.PITR.RecoveryPeriodInDays
-	if recoveryDays <= 0 {
-		recoveryDays = 35
-	}
-	cutoff := nowMs - (recoveryDays * 24 * 60 * 60 * 1000)
-	if cutoff <= 0 {
-		return nil
-	}
-	_, err := r.CompactItemChangesBefore(ctx, table.Name, cutoff)
-	return err
-}
-
 func (r pitrRepo) AppendItemChange(ctx context.Context, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
 	return r.appendItemHistory(ctx, tableName, pk, sk, changeType, item, changedAt)
 }
