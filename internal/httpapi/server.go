@@ -2082,47 +2082,46 @@ func (s *Server) listStreams(r *http.Request, body []byte) (map[string]any, erro
 		limit = defaultListStreamsLimit
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	streams := make([]map[string]any, 0)
 	start := ""
-	for {
-		names, err := s.store.ListTables(r.Context(), tx, start, defaultListStreamsLimit)
-		if err != nil {
-			return nil, err
-		}
-		if len(names) == 0 {
-			break
-		}
-		for _, name := range names {
-			storedAccountID, storedTableName := splitScopedTableKey(name)
-			if storedAccountID != accountIDFromContext(r.Context()) {
-				continue
-			}
-			if strings.TrimSpace(req.TableName) != "" && storedTableName != req.TableName {
-				continue
-			}
-			t, err := s.getTableWithLifecycle(r.Context(), tx, storedTableName)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		for {
+			names, err := repos.Tables().ListTables(txCtx, start, defaultListStreamsLimit)
 			if err != nil {
-				continue
+				return err
 			}
-			if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" {
-				continue
+			if len(names) == 0 {
+				break
 			}
-			if strings.TrimSpace(req.ExclusiveStartStreamARN) != "" && t.Stream.ARN <= req.ExclusiveStartStreamARN {
-				continue
+			for _, name := range names {
+				storedAccountID, storedTableName := splitScopedTableKey(name)
+				if storedAccountID != accountIDFromContext(txCtx) {
+					continue
+				}
+				if strings.TrimSpace(req.TableName) != "" && storedTableName != req.TableName {
+					continue
+				}
+				t, err := s.getTableWithLifecycleByKey(txCtx, repos.Tables(), name)
+				if err != nil {
+					continue
+				}
+				if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" {
+					continue
+				}
+				if strings.TrimSpace(req.ExclusiveStartStreamARN) != "" && t.Stream.ARN <= req.ExclusiveStartStreamARN {
+					continue
+				}
+				streams = append(streams, map[string]any{
+					"StreamArn":   t.Stream.ARN,
+					"TableName":   logicalTableNameFromKey(t.Name),
+					"StreamLabel": t.Stream.Label,
+				})
 			}
-			streams = append(streams, map[string]any{
-				"StreamArn":   t.Stream.ARN,
-				"TableName":   logicalTableNameFromKey(t.Name),
-				"StreamLabel": t.Stream.Label,
-			})
+			start = names[len(names)-1]
 		}
-		start = names[len(names)-1]
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	sort.Slice(streams, func(i, j int) bool {
 		return streams[i]["StreamArn"].(string) < streams[j]["StreamArn"].(string)
@@ -2136,9 +2135,6 @@ func (s *Server) listStreams(r *http.Request, body []byte) (map[string]any, erro
 		resp["LastEvaluatedStreamArn"] = truncated[len(truncated)-1]["StreamArn"]
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return resp, nil
 }
 
@@ -2158,18 +2154,27 @@ func (s *Server) describeStream(r *http.Request, body []byte) (map[string]any, e
 		limit = defaultDescribeStreamLimit
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableByStreamARN(r.Context(), tx, req.StreamARN)
-	if err != nil {
-		return nil, err
-	}
-	firstSeq, _, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, req.StreamARN)
-	if err != nil {
+	var (
+		t        model.Table
+		firstSeq int64
+		found    bool
+	)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
+		}
+		var txErr error
+		t, txErr = s.getTableByStreamARN(txCtx, tx, req.StreamARN)
+		if txErr != nil {
+			return txErr
+		}
+		firstSeq, _, found, txErr = s.store.GetStreamSequenceBounds(txCtx, tx, req.StreamARN)
+		if txErr != nil {
+			return txErr
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	starting := "0"
@@ -2199,9 +2204,6 @@ func (s *Server) describeStream(r *http.Request, body []byte) (map[string]any, e
 			"Shards":                  shards,
 		},
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return resp, nil
 }
 
@@ -2227,20 +2229,25 @@ func (s *Server) getShardIterator(r *http.Request, body []byte) (map[string]any,
 		return nil, awserr.Validation("SequenceNumber is not valid for this ShardIteratorType")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
+	last := int64(0)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
+		}
+		if _, err := s.getTableByStreamARN(txCtx, tx, req.StreamARN); err != nil {
+			return err
+		}
+		_, seqLast, found, err := s.store.GetStreamSequenceBounds(txCtx, tx, req.StreamARN)
+		if err != nil {
+			return err
+		}
+		if found {
+			last = seqLast
+		}
+		return nil
+	}); err != nil {
 		return nil, err
-	}
-	defer tx.Rollback()
-	if _, err := s.getTableByStreamARN(r.Context(), tx, req.StreamARN); err != nil {
-		return nil, err
-	}
-	_, last, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, req.StreamARN)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		last = 0
 	}
 
 	sequence := int64(0)
@@ -2268,7 +2275,7 @@ func (s *Server) getShardIterator(r *http.Request, body []byte) (map[string]any,
 	if sequence < 0 {
 		sequence = 0
 	}
-	token, err := s.encodeStreamIterator(streamIteratorToken{
+	iter, err := s.encodeStreamIterator(streamIteratorToken{
 		StreamARN: req.StreamARN,
 		ShardID:   req.ShardID,
 		Sequence:  sequence,
@@ -2277,10 +2284,7 @@ func (s *Server) getShardIterator(r *http.Request, body []byte) (map[string]any,
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ShardIterator": token}, nil
+	return map[string]any{"ShardIterator": iter}, nil
 }
 
 func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error) {
@@ -2309,31 +2313,39 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.ExpiredIterator("Shard iterator has expired")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if _, err := s.getTableByStreamARN(r.Context(), tx, token.StreamARN); err != nil {
-		return nil, err
-	}
-	records, err := s.store.ListStreamRecordsAfterSequence(r.Context(), tx, token.StreamARN, token.Sequence, limit)
-	if err != nil {
-		return nil, err
-	}
-	_, last, found, err := s.store.GetStreamSequenceBounds(r.Context(), tx, token.StreamARN)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		last = token.Sequence
-	}
-	latestChangedAt := int64(0)
-	if found {
-		latestChangedAt, _, err = s.store.GetStreamRecordChangedAt(r.Context(), tx, token.StreamARN, last)
-		if err != nil {
-			return nil, err
+	var (
+		records         []model.StreamRecord
+		latestChangedAt int64
+	)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
+		if _, err := s.getTableByStreamARN(txCtx, tx, token.StreamARN); err != nil {
+			return err
+		}
+		var err error
+		records, err = s.store.ListStreamRecordsAfterSequence(txCtx, tx, token.StreamARN, token.Sequence, limit)
+		if err != nil {
+			return err
+		}
+		_, last, found, err := s.store.GetStreamSequenceBounds(txCtx, tx, token.StreamARN)
+		if err != nil {
+			return err
+		}
+		if !found {
+			last = token.Sequence
+		}
+		if found {
+			latestChangedAt, _, err = s.store.GetStreamRecordChangedAt(txCtx, tx, token.StreamARN, last)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	outRecords := make([]map[string]any, 0, len(records))
@@ -2348,6 +2360,28 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 		nextSeq = record.Sequence
 		bytesUsed += recordSize
 	}
+	behind := int64(0)
+	if latestChangedAt > 0 {
+		if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+			tx, ok := uow.TxFromContext(txCtx)
+			if !ok {
+				return fmt.Errorf("missing transaction in unit of work context")
+			}
+			cursorChangedAt, cursorFound, err := s.store.GetStreamRecordChangedAt(txCtx, tx, token.StreamARN, nextSeq)
+			if err != nil {
+				return err
+			}
+			if !cursorFound {
+				cursorChangedAt = time.Now().UnixMilli()
+			}
+			if latestChangedAt > cursorChangedAt {
+				behind = latestChangedAt - cursorChangedAt
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
 	nextIterator, err := s.encodeStreamIterator(streamIteratorToken{
 		StreamARN: token.StreamARN,
 		ShardID:   token.ShardID,
@@ -2355,23 +2389,6 @@ func (s *Server) getRecords(r *http.Request, body []byte) (map[string]any, error
 		ExpiresAt: time.Now().Add(s.streamIteratorTTL).UnixMilli(),
 	})
 	if err != nil {
-		return nil, err
-	}
-	behind := int64(0)
-	if latestChangedAt > 0 {
-		cursorChangedAt, cursorFound, err := s.store.GetStreamRecordChangedAt(r.Context(), tx, token.StreamARN, nextSeq)
-		if err != nil {
-			return nil, err
-		}
-		if !cursorFound {
-			cursorChangedAt = time.Now().UnixMilli()
-		}
-		if latestChangedAt > cursorChangedAt {
-			behind = latestChangedAt - cursorChangedAt
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{
