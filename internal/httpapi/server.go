@@ -207,7 +207,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operation = op
-	logctx.Logger(r.Context()).InfoContext(r.Context(), "DynamoDB operation", "operation", op)
+	logctx.Logger(r.Context()).DebugContext(r.Context(), "DynamoDB operation", "operation", op)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -215,16 +215,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		awserr.Write(iw, err)
 		return
 	}
+	tableName := tableNameFromBody(body)
 
 	if err := s.authorizeRequest(r, op, body); err != nil {
-		logctx.Logger(r.Context()).WarnContext(r.Context(), "request authorization failed", "operation", op, "table", tableNameFromBody(body), "err", err)
+		logctx.Logger(r.Context()).WarnContext(r.Context(), "request authorization failed", "operation", op, "table", tableName, "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
 	}
 	resp, err := s.dispatch(r, op, body)
 	if err != nil {
-		logctx.Logger(r.Context()).WarnContext(r.Context(), "operation failed", "operation", op, "table", tableNameFromBody(body), "err", err)
+		logctx.Logger(r.Context()).WarnContext(r.Context(), "operation failed", "operation", op, "table", tableName, "err", err)
 		errCode = apiErrorCodeForMetrics(err)
 		awserr.Write(iw, err)
 		return
@@ -240,7 +241,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	iw.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	iw.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(encoded)), 10))
 	_, _ = iw.Write(encoded)
-	logctx.Logger(r.Context()).InfoContext(r.Context(), "operation succeeded", "operation", op, "table", tableNameFromBody(body))
+	logctx.Logger(r.Context()).DebugContext(r.Context(), "operation succeeded", "operation", op, "table", tableName)
 }
 
 func tableNameFromBody(body []byte) string {
