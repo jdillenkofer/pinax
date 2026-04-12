@@ -2538,7 +2538,7 @@ func (s *Server) emitMutationEventForWrite(ctx context.Context, repos uow.Repos,
 	if err != nil {
 		return err
 	}
-	return s.mutationExecutor.Emit(ctx, mutationReposAdapter{repos: repos}, mutation.Event{
+	return s.mutationExecutor.Emit(ctx, repos, mutation.Event{
 		Table:     t,
 		EventName: eventName,
 		PK:        pk,
@@ -2548,42 +2548,6 @@ func (s *Server) emitMutationEventForWrite(ctx context.Context, repos uow.Repos,
 		NewImage:  newImage,
 		ChangedAt: changedAt,
 	})
-}
-
-type mutationReposAdapter struct {
-	repos uow.Repos
-}
-
-type mutationStreamRepoAdapter struct {
-	streams uow.StreamRepo
-}
-
-type mutationPITRRepoAdapter struct {
-	pitr uow.PITRRepo
-}
-
-func (a mutationReposAdapter) Streams() mutation.StreamRepo {
-	return mutationStreamRepoAdapter{streams: a.repos.Streams()}
-}
-
-func (a mutationReposAdapter) PITR() mutation.PITRRepo {
-	return mutationPITRRepoAdapter{pitr: a.repos.PITR()}
-}
-
-func (a mutationStreamRepoAdapter) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
-	return a.streams.AppendStreamRecord(ctx, record)
-}
-
-func (a mutationStreamRepoAdapter) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
-	return a.streams.DeleteStreamRecordsBefore(ctx, streamARN, before)
-}
-
-func (a mutationPITRRepoAdapter) AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error {
-	return a.pitr.AppendItemChange(ctx, tableKey, pk, sk, changeType, item, changedAt)
-}
-
-func (a mutationPITRRepoAdapter) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
-	return a.pitr.CompactItemChangesBefore(ctx, tableKey, before)
 }
 
 func primaryKeyStringsFromMutationKeys(t model.Table, keys map[string]any) (string, string, error) {

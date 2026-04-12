@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/store"
 )
@@ -27,19 +28,9 @@ type Event struct {
 	ChangedAt int64
 }
 
-type StreamRepo interface {
-	AppendStreamRecord(ctx context.Context, record model.StreamRecord) error
-	DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error)
-}
-
-type PITRRepo interface {
-	AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error
-	CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error)
-}
-
 type Repos interface {
-	Streams() StreamRepo
-	PITR() PITRRepo
+	Streams() uow.StreamRepo
+	PITR() uow.PITRRepo
 }
 
 type Hook interface {
@@ -170,16 +161,28 @@ func NewTxRepos(s store.Store, tx *sql.Tx) Repos {
 	return txRepos{store: s, tx: tx}
 }
 
-func (r txRepos) Streams() StreamRepo {
+func (r txRepos) Streams() uow.StreamRepo {
 	return txStreamRepo{store: r.store, tx: r.tx}
 }
 
-func (r txRepos) PITR() PITRRepo {
+func (r txRepos) PITR() uow.PITRRepo {
 	return txPITRRepo{store: r.store, tx: r.tx}
 }
 
 func (r txStreamRepo) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
 	return r.store.AppendStreamRecord(ctx, r.tx, record)
+}
+
+func (r txStreamRepo) ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error) {
+	return r.store.ListStreamRecordsAfterSequence(ctx, r.tx, streamARN, sequence, limit)
+}
+
+func (r txStreamRepo) GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error) {
+	return r.store.GetStreamSequenceBounds(ctx, r.tx, streamARN)
+}
+
+func (r txStreamRepo) GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error) {
+	return r.store.GetStreamRecordChangedAt(ctx, r.tx, streamARN, sequence)
 }
 
 func (r txStreamRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
@@ -188,6 +191,26 @@ func (r txStreamRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN s
 
 func (r txPITRRepo) AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error {
 	return r.store.AppendItemChange(ctx, r.tx, tableKey, pk, sk, changeType, item, changedAt)
+}
+
+func (r txPITRRepo) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.ItemChangeCursor, error) {
+	return r.store.ResolveItemChangeCursorAtOrBefore(ctx, r.tx, tableKey, upTo)
+}
+
+func (r txPITRRepo) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tableKey string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error) {
+	return r.store.ListItemChangesAfterCursorUpToCursor(ctx, r.tx, tableKey, after, upTo)
+}
+
+func (r txPITRRepo) GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableKey string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
+	return r.store.GetLatestPITRCheckpointAtOrBeforeCursor(ctx, r.tx, tableKey, cursor)
+}
+
+func (r txPITRRepo) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableKey string, upTo int64) (model.PITRCheckpoint, error) {
+	return r.store.GetLatestPITRCheckpointAtOrBefore(ctx, r.tx, tableKey, upTo)
+}
+
+func (r txPITRRepo) CreatePITRCheckpointFromCurrentState(ctx context.Context, tableKey string, changedAt int64) error {
+	return r.store.CreatePITRCheckpointFromCurrentState(ctx, r.tx, tableKey, changedAt)
 }
 
 func (r txPITRRepo) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
