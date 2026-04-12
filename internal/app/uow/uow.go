@@ -11,16 +11,22 @@ import (
 type TableRepo interface {
 	CreateTable(ctx context.Context, table model.Table) error
 	GetTable(ctx context.Context, tableKey string) (model.Table, error)
+	ListTables(ctx context.Context, start string, limit int) ([]string, error)
 	DeleteTable(ctx context.Context, tableKey string) error
 	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
 	UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
 	UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error
+	UpdateTimeToLive(ctx context.Context, tableKey string, ttl model.TimeToLive) error
 	UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error
 }
 
 type ItemRepo interface {
 	CountItems(ctx context.Context, tableKey string) (int64, error)
+	GetItem(ctx context.Context, tableKey, pk, sk string) (map[string]any, error)
 	PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error
+	QueryByPK(ctx context.Context, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
+	QueryByGSI(ctx context.Context, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
+	QueryByPKSK(ctx context.Context, tableKey, pk, sk string) ([]map[string]any, error)
 	Scan(ctx context.Context, tableKey, startPK, startSK string, limit int) ([]map[string]any, error)
 }
 
@@ -112,14 +118,29 @@ func (t *txStore) CreateTable(ctx context.Context, table model.Table) error {
 func (t *txStore) GetTable(ctx context.Context, tableKey string) (model.Table, error) {
 	return t.store.GetTable(ctx, t.tx, tableKey)
 }
+func (t *txStore) ListTables(ctx context.Context, start string, limit int) ([]string, error) {
+	return t.store.ListTables(ctx, t.tx, start, limit)
+}
 func (t *txStore) DeleteTable(ctx context.Context, tableKey string) error {
 	return t.store.DeleteTable(ctx, t.tx, tableKey)
 }
 func (t *txStore) CountItems(ctx context.Context, tableKey string) (int64, error) {
 	return t.store.CountItems(ctx, t.tx, tableKey)
 }
+func (t *txStore) GetItem(ctx context.Context, tableKey, pk, sk string) (map[string]any, error) {
+	return t.store.GetItem(ctx, t.tx, tableKey, pk, sk)
+}
 func (t *txStore) PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error {
 	return t.store.PutItem(ctx, t.tx, tableKey, pk, sk, item)
+}
+func (t *txStore) QueryByPK(ctx context.Context, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+	return t.store.QueryByPK(ctx, t.tx, tableKey, pk, startSK, scanForward, limit)
+}
+func (t *txStore) QueryByGSI(ctx context.Context, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+	return t.store.QueryByGSI(ctx, t.tx, tableKey, indexName, pk, startSK, scanForward, limit)
+}
+func (t *txStore) QueryByPKSK(ctx context.Context, tableKey, pk, sk string) ([]map[string]any, error) {
+	return t.store.QueryByPKSK(ctx, t.tx, tableKey, pk, sk)
 }
 func (t *txStore) Scan(ctx context.Context, tableKey, startPK, startSK string, limit int) ([]map[string]any, error) {
 	return t.store.Scan(ctx, t.tx, tableKey, startPK, startSK, limit)
@@ -132,6 +153,9 @@ func (t *txStore) UpdateTableBilling(ctx context.Context, tableKey string, billi
 }
 func (t *txStore) UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
 	return t.store.UpdateTableOptions(ctx, t.tx, tableKey, tableClass, deletionProtection, stream, sse, tags)
+}
+func (t *txStore) UpdateTimeToLive(ctx context.Context, tableKey string, ttl model.TimeToLive) error {
+	return t.store.UpdateTimeToLive(ctx, t.tx, tableKey, ttl)
 }
 func (t *txStore) UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error {
 	return t.store.UpdatePointInTimeRecovery(ctx, t.tx, tableKey, pitr)
