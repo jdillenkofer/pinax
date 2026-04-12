@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 
+	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
@@ -16,31 +17,30 @@ var (
 	ErrTargetTableInUse  = errors.New("target table in use")
 )
 
-type TableLoader func(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error)
-
 type BackupBuilder func(table model.Table, itemCount int64, items []map[string]any) (model.Backup, error)
 
 type RestoreTableBuilder func(backup model.Backup) (model.Table, error)
 
 type Service struct {
-	uow uow.UnitOfWork
+	uow       uow.UnitOfWork
+	lifecycle *tableapp.LifecycleService
 }
 
-func NewService(unitOfWork uow.UnitOfWork) *Service {
-	return &Service{uow: unitOfWork}
+func NewService(unitOfWork uow.UnitOfWork, lifecycle *tableapp.LifecycleService) *Service {
+	return &Service{uow: unitOfWork, lifecycle: lifecycle}
 }
 
-func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string, loadTable TableLoader, buildBackup BackupBuilder) (model.Backup, error) {
-	if loadTable == nil {
-		return model.Backup{}, errors.New("loadTable callback is required")
-	}
+func (s *Service) CreateBackup(ctx context.Context, tableKey, backupName string, nowMs int64, buildBackup BackupBuilder) (model.Backup, error) {
 	if buildBackup == nil {
 		return model.Backup{}, errors.New("buildBackup callback is required")
+	}
+	if s.lifecycle == nil {
+		return model.Backup{}, errors.New("lifecycle service is required")
 	}
 
 	var backup model.Backup
 	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
-		t, err := loadTable(txCtx, repos.Tables(), tableName)
+		t, err := s.lifecycle.GetWithLifecycle(txCtx, repos.Tables(), tableKey, nowMs)
 		if err != nil {
 			return err
 		}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
@@ -18,12 +19,10 @@ var (
 	ErrTargetTableInUse               = errors.New("target table in use")
 )
 
-type TableLoader func(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error)
-
 type RestoreTableBuilder func(source model.Table) (model.Table, error)
 
 type UpdateContinuousBackupsInput struct {
-	TableName             string
+	TableKey              string
 	Enable                bool
 	RecoveryPeriodInDays  int64
 	NowMillis             int64
@@ -31,7 +30,7 @@ type UpdateContinuousBackupsInput struct {
 }
 
 type RestoreTableToPointInTimeInput struct {
-	SourceName                string
+	SourceTableKey            string
 	TargetScopedTableKey      string
 	UseLatestRestorableTime   bool
 	RestoreDateTimeMillis     int64
@@ -40,16 +39,17 @@ type RestoreTableToPointInTimeInput struct {
 }
 
 type Service struct {
-	uow uow.UnitOfWork
+	uow       uow.UnitOfWork
+	lifecycle *tableapp.LifecycleService
 }
 
-func NewService(unitOfWork uow.UnitOfWork) *Service {
-	return &Service{uow: unitOfWork}
+func NewService(unitOfWork uow.UnitOfWork, lifecycle *tableapp.LifecycleService) *Service {
+	return &Service{uow: unitOfWork, lifecycle: lifecycle}
 }
 
-func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateContinuousBackupsInput, tableLoader TableLoader) (model.Table, int64, error) {
-	if tableLoader == nil {
-		return model.Table{}, 0, errors.New("loadTable callback is required")
+func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateContinuousBackupsInput) (model.Table, int64, error) {
+	if s.lifecycle == nil {
+		return model.Table{}, 0, errors.New("lifecycle service is required")
 	}
 	nowMs := input.NowMillis
 	if nowMs <= 0 {
@@ -63,7 +63,7 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 	var t model.Table
 	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
 		var err error
-		t, err = tableLoader(txCtx, repos.Tables(), input.TableName)
+		t, err = s.lifecycle.GetWithLifecycle(txCtx, repos.Tables(), input.TableKey, nowMs)
 		if err != nil {
 			return err
 		}
@@ -121,9 +121,9 @@ func (s *Service) UpdateContinuousBackups(ctx context.Context, input UpdateConti
 	return t, nowMs, err
 }
 
-func (s *Service) DescribeContinuousBackups(ctx context.Context, tableName string, nowMs int64, tableLoader TableLoader) (model.Table, int64, error) {
-	if tableLoader == nil {
-		return model.Table{}, 0, errors.New("loadTable callback is required")
+func (s *Service) DescribeContinuousBackups(ctx context.Context, tableName string, nowMs int64) (model.Table, int64, error) {
+	if s.lifecycle == nil {
+		return model.Table{}, 0, errors.New("lifecycle service is required")
 	}
 	if nowMs <= 0 {
 		nowMs = time.Now().UnixMilli()
@@ -132,16 +132,16 @@ func (s *Service) DescribeContinuousBackups(ctx context.Context, tableName strin
 	var t model.Table
 	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
 		var err error
-		t, err = tableLoader(txCtx, repos.Tables(), tableName)
+		t, err = s.lifecycle.GetWithLifecycle(txCtx, repos.Tables(), tableName, nowMs)
 		return err
 	})
 
 	return t, nowMs, err
 }
 
-func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTableToPointInTimeInput, tableLoader TableLoader, restoreTableBuilder RestoreTableBuilder) (model.Table, int64, error) {
-	if tableLoader == nil {
-		return model.Table{}, 0, errors.New("loadTable callback is required")
+func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTableToPointInTimeInput, restoreTableBuilder RestoreTableBuilder) (model.Table, int64, error) {
+	if s.lifecycle == nil {
+		return model.Table{}, 0, errors.New("lifecycle service is required")
 	}
 	if restoreTableBuilder == nil {
 		return model.Table{}, 0, errors.New("buildTable callback is required")
@@ -155,7 +155,7 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 	var tableToCreate model.Table
 	count := int64(0)
 	err := s.uow.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
-		source, err := tableLoader(txCtx, repos.Tables(), input.SourceName)
+		source, err := s.lifecycle.GetWithLifecycle(txCtx, repos.Tables(), input.SourceTableKey, nowMs)
 		if err != nil {
 			return err
 		}

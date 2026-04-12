@@ -30,6 +30,7 @@ import (
 
 	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
+	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
@@ -104,6 +105,7 @@ var (
 
 type Server struct {
 	store                         store.Store
+	tableLifecycle                *tableapp.LifecycleService
 	backupService                 *backupapp.Service
 	pitrService                   *pitrapp.Service
 	requestAuthorizer             authorization.RequestAuthorizer
@@ -158,10 +160,13 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 }
 
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
+	tableLifecycle := tableapp.NewLifecycleService()
+	unitOfWork := uow.NewStoreUnitOfWork(store)
 	s := &Server{
 		store:                         store,
-		backupService:                 backupapp.NewService(uow.NewStoreUnitOfWork(store)),
-		pitrService:                   pitrapp.NewService(uow.NewStoreUnitOfWork(store)),
+		tableLifecycle:                tableLifecycle,
+		backupService:                 backupapp.NewService(unitOfWork, tableLifecycle),
+		pitrService:                   pitrapp.NewService(unitOfWork, tableLifecycle),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -996,16 +1001,16 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	tableName, _, _, err := parseTableARN(req.TableName)
+	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
 	if err != nil {
-		return nil, awserr.Validation(err.Error())
+		return nil, err
 	}
 
 	backup, err := s.backupService.CreateBackup(
 		r.Context(),
-		tableName,
+		tableKey,
 		req.BackupName,
-		s.getTableWithLifecycleTxStore,
+		time.Now().UnixMilli(),
 		func(t model.Table, count int64, items []map[string]any) (model.Backup, error) {
 			tableDesc := t.Description(count)
 			now := time.Now().Unix()
@@ -1027,8 +1032,7 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		},
 	)
 	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
 		if errors.Is(err, backupapp.ErrTargetTableInUse) {
@@ -1376,16 +1380,19 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 			return nil, awserr.Validation("RecoveryPeriodInDays must be between 1 and 35")
 		}
 	}
+	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
+	if err != nil {
+		return nil, err
+	}
 	t, nowMs, err := s.pitrService.UpdateContinuousBackups(r.Context(), pitrapp.UpdateContinuousBackupsInput{
-		TableName:             req.TableName,
+		TableKey:              tableKey,
 		Enable:                *req.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled,
 		RecoveryPeriodInDays:  req.PointInTimeRecoverySpecification.RecoveryPeriodInDays,
 		NowMillis:             time.Now().UnixMilli(),
 		DefaultRecoveryWindow: 35,
-	}, s.getTableWithLifecycleTxStore)
+	})
 	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
 		return nil, err
@@ -1401,11 +1408,14 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 	if strings.TrimSpace(req.TableName) == "" {
 		return nil, awserr.Validation("TableName is required")
 	}
-
-	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), req.TableName, time.Now().UnixMilli(), s.getTableWithLifecycleTxStore)
+	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
 	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+		return nil, err
+	}
+
+	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), tableKey, time.Now().UnixMilli())
+	if err != nil {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
 		return nil, err
@@ -1438,6 +1448,10 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 	}
 
 	sourceName := firstNonEmpty(strings.TrimSpace(req.SourceTableName), strings.TrimSpace(req.SourceTableArn))
+	sourceTableKey, err := scopedTableNameFromIdentifier(r.Context(), sourceName)
+	if err != nil {
+		return nil, err
+	}
 	restoreAtMillis := int64(0)
 	if req.RestoreDateTime != nil {
 		restoreAtMillis = int64(math.Round(*req.RestoreDateTime * 1000))
@@ -1445,13 +1459,13 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 
 	targetScopedTableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), req.TargetTableName)
 	tableToCreate, count, err := s.pitrService.RestoreTableToPointInTime(r.Context(), pitrapp.RestoreTableToPointInTimeInput{
-		SourceName:                sourceName,
+		SourceTableKey:            sourceTableKey,
 		TargetScopedTableKey:      targetScopedTableKey,
 		UseLatestRestorableTime:   req.UseLatestRestorableTime,
 		RestoreDateTimeMillis:     restoreAtMillis,
 		PITRLatestRestorableLagMs: s.pitrLatestRestorableLagMillis,
 		NowMillis:                 time.Now().UnixMilli(),
-	}, s.getTableWithLifecycleTxStore, func(source model.Table) (model.Table, error) {
+	}, func(source model.Table) (model.Table, error) {
 		table := source
 		table.Name = targetScopedTableKey
 		table.Status = model.TableStatusCreating
@@ -1511,8 +1525,7 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return table, nil
 	})
 	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
 		}
 		if errors.Is(err, pitrapp.ErrPointInTimeRecoveryUnavailable) {
@@ -3201,21 +3214,14 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 }
 
 func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
-	now := lifecycleNow()
-	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
-		if err := s.store.DeleteTable(ctx, tx, t.Name); err != nil {
-			return err
+	repo := sqlTxTableRepo{store: s.store, tx: tx}
+	if err := s.tableLifecycle.RefreshLifecycle(ctx, repo, t, lifecycleNow()); err != nil {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
+			return sql.ErrNoRows
 		}
-		return sql.ErrNoRows
+		return err
 	}
-	if t.Status == model.TableStatusCreating && t.StatusAt > 0 && now >= t.StatusAt {
-		t.Status = model.TableStatusActive
-		t.StatusAt = 0
-	}
-	if !advanceTableLifecycle(t, now) {
-		return nil
-	}
-	return s.store.UpdateTableIndexes(ctx, tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
+	return nil
 }
 
 func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
@@ -3223,54 +3229,10 @@ func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableNam
 	if err != nil {
 		return model.Table{}, err
 	}
-	t, err := s.store.GetTable(ctx, tx, scopedTableName)
+	repo := sqlTxTableRepo{store: s.store, tx: tx}
+	t, err := s.tableLifecycle.GetWithLifecycle(ctx, repo, scopedTableName, lifecycleNow())
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
-		return model.Table{}, err
-	}
-	if err := s.refreshTableLifecycle(ctx, tx, &t); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
-		return model.Table{}, err
-	}
-	return t, nil
-}
-
-func (s *Server) refreshTableLifecycleTxStore(ctx context.Context, tables uow.TableRepo, t *model.Table) error {
-	now := lifecycleNow()
-	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
-		if err := tables.DeleteTable(ctx, t.Name); err != nil {
-			return err
-		}
-		return sql.ErrNoRows
-	}
-	if t.Status == model.TableStatusCreating && t.StatusAt > 0 && now >= t.StatusAt {
-		t.Status = model.TableStatusActive
-		t.StatusAt = 0
-	}
-	if !advanceTableLifecycle(t, now) {
-		return nil
-	}
-	return tables.UpdateTableIndexes(ctx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
-}
-
-func (s *Server) getTableWithLifecycleTxStore(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error) {
-	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
-	if err != nil {
-		return model.Table{}, err
-	}
-	t, err := tables.GetTable(ctx, scopedTableName)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
-		return model.Table{}, err
-	}
-	if err := s.refreshTableLifecycleTxStore(ctx, tables, &t); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
 		return model.Table{}, err
@@ -3289,54 +3251,25 @@ func (s *Server) getActiveTable(ctx context.Context, tx *sql.Tx, tableName strin
 	return t, nil
 }
 
-func advanceTableLifecycle(t *model.Table, now int64) bool {
-	changed := false
-	updatedGSIs := make([]model.GlobalSecondaryIndex, 0, len(t.GSIs))
-	pending := false
+type sqlTxTableRepo struct {
+	store store.Store
+	tx    *sql.Tx
+}
 
-	for _, g := range t.GSIs {
-		status := strings.TrimSpace(g.Status)
-		if status == "" {
-			status = model.IndexStatusActive
-		}
-		if (status == model.IndexStatusCreating || status == model.IndexStatusDeleting) && g.StatusAt > 0 && now >= g.StatusAt {
-			if status == model.IndexStatusDeleting {
-				changed = true
-				continue
-			}
-			g.Status = model.IndexStatusActive
-			g.StatusAt = 0
-			changed = true
-		}
-		if g.Status == model.IndexStatusCreating || g.Status == model.IndexStatusDeleting {
-			pending = true
-		}
-		updatedGSIs = append(updatedGSIs, g)
-	}
-
-	if len(updatedGSIs) != len(t.GSIs) {
-		changed = true
-	}
-	t.GSIs = updatedGSIs
-
-	if pending {
-		if t.Status != model.TableStatusUpdating {
-			t.Status = model.TableStatusUpdating
-			changed = true
-		}
-	} else if t.Status != model.TableStatusActive {
-		t.Status = model.TableStatusActive
-		t.StatusAt = 0
-		changed = true
-	}
-
-	if t.Status == model.TableStatusUpdating && t.StatusAt > 0 && now >= t.StatusAt && !pending {
-		t.Status = model.TableStatusActive
-		t.StatusAt = 0
-		changed = true
-	}
-
-	return changed
+func (r sqlTxTableRepo) CreateTable(ctx context.Context, table model.Table) error {
+	return r.store.CreateTable(ctx, r.tx, table)
+}
+func (r sqlTxTableRepo) GetTable(ctx context.Context, tableKey string) (model.Table, error) {
+	return r.store.GetTable(ctx, r.tx, tableKey)
+}
+func (r sqlTxTableRepo) DeleteTable(ctx context.Context, tableKey string) error {
+	return r.store.DeleteTable(ctx, r.tx, tableKey)
+}
+func (r sqlTxTableRepo) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+	return r.store.UpdateTableIndexes(ctx, r.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
+}
+func (r sqlTxTableRepo) UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error {
+	return r.store.UpdatePointInTimeRecovery(ctx, r.tx, tableKey, pitr)
 }
 
 func validateUpdateTablePayload(body []byte) error {
