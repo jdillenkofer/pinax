@@ -52,7 +52,7 @@ func TestPITRHookAppendsAndPrunesHistory(t *testing.T) {
 	}
 
 	h := NewPITRHook(s)
-	if err := h.HandleMutation(ctx, tx, Event{
+	if err := h.HandleMutation(ctx, NewTxRepos(s, tx), Event{
 		Table:     table,
 		EventName: "MODIFY",
 		PK:        "S|a",

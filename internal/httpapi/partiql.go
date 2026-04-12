@@ -465,7 +465,7 @@ func (s *Server) runPartiQLInsert(ctx context.Context, repos uow.Repos, tableNam
 	if existed {
 		eventName = "MODIFY"
 	}
-	if err := s.emitMutationEventForWrite(ctx, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromItem(t, item), current, item, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
@@ -557,7 +557,7 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, repos uow.Repos, tableNam
 	if t.RangeKey != "" {
 		streamKey[t.RangeKey] = rangeValue
 	}
-	if err := s.emitMutationEventForWrite(ctx, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
+	if err := s.emitMutationEventForWrite(ctx, repos, t, eventName, keyAttributesFromKey(t, streamKey), oldForStream, updated, time.Now().UnixMilli()); err != nil {
 		return partiqlResult{}, err
 	}
 	return partiqlResult{Items: []map[string]any{}, WriteUnits: writeUnits, TableName: t.Name}, nil
@@ -630,7 +630,7 @@ func (s *Server) runPartiQLDelete(ctx context.Context, repos uow.Repos, tableNam
 		if t.RangeKey != "" {
 			streamKey[t.RangeKey] = rangeValue
 		}
-		if err := s.emitMutationEventForWrite(ctx, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
+		if err := s.emitMutationEventForWrite(ctx, repos, t, "REMOVE", keyAttributesFromKey(t, streamKey), current, nil, time.Now().UnixMilli()); err != nil {
 			return partiqlResult{}, err
 		}
 	}

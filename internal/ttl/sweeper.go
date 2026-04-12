@@ -163,7 +163,7 @@ func (s *Sweeper) deleteExpiredBatch(ctx context.Context, t model.Table, before 
 		if t.RangeKey != "" {
 			keys[t.RangeKey] = oldItem[t.RangeKey]
 		}
-		if err := s.mutationExecutor.Emit(ctx, tx, mutation.Event{
+		if err := s.mutationExecutor.Emit(ctx, mutation.NewTxRepos(s.store, tx), mutation.Event{
 			Table:     t,
 			EventName: "REMOVE",
 			PK:        key.PK,

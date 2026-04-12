@@ -22,9 +22,11 @@ type TableRepo interface {
 }
 
 type StreamRepo interface {
+	AppendStreamRecord(ctx context.Context, record model.StreamRecord) error
 	ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error)
 	GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error)
 	GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error)
+	DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error)
 }
 
 type ItemRepo interface {
@@ -83,14 +85,6 @@ type storeUnitOfWork struct {
 }
 
 type txStoreContextKey struct{}
-
-func TxFromContext(ctx context.Context) (*sql.Tx, bool) {
-	ambient, ok := ctx.Value(txStoreContextKey{}).(*txStore)
-	if !ok || ambient == nil || ambient.tx == nil {
-		return nil, false
-	}
-	return ambient.tx, true
-}
 
 func NewStoreUnitOfWork(s store.Store) UnitOfWork {
 	return &storeUnitOfWork{store: s}
@@ -219,6 +213,9 @@ func (t *txStore) CreatePITRCheckpointFromCurrentState(ctx context.Context, tabl
 func (t *txStore) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
 	return t.store.CompactItemChangesBefore(ctx, t.tx, tableKey, before)
 }
+func (t *txStore) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
+	return t.store.AppendStreamRecord(ctx, t.tx, record)
+}
 func (t *txStore) ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error) {
 	return t.store.ListStreamRecordsAfterSequence(ctx, t.tx, streamARN, sequence, limit)
 }
@@ -227,6 +224,9 @@ func (t *txStore) GetStreamSequenceBounds(ctx context.Context, streamARN string)
 }
 func (t *txStore) GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error) {
 	return t.store.GetStreamRecordChangedAt(ctx, t.tx, streamARN, sequence)
+}
+func (t *txStore) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
+	return t.store.DeleteStreamRecordsBefore(ctx, t.tx, streamARN, before)
 }
 func (t *txStore) CreateBackup(ctx context.Context, backup model.Backup) error {
 	return t.store.CreateBackup(ctx, t.tx, backup)

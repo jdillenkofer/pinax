@@ -2533,16 +2533,12 @@ func keyAttributesFromKey(t model.Table, key map[string]any) map[string]any {
 	return keys
 }
 
-func (s *Server) emitMutationEventForWrite(ctx context.Context, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
-	tx, ok := uow.TxFromContext(ctx)
-	if !ok {
-		return fmt.Errorf("missing transaction in unit of work context")
-	}
+func (s *Server) emitMutationEventForWrite(ctx context.Context, repos uow.Repos, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
 	pk, sk, err := primaryKeyStringsFromMutationKeys(t, keys)
 	if err != nil {
 		return err
 	}
-	return s.mutationExecutor.Emit(ctx, tx, mutation.Event{
+	return s.mutationExecutor.Emit(ctx, mutationReposAdapter{repos: repos}, mutation.Event{
 		Table:     t,
 		EventName: eventName,
 		PK:        pk,
@@ -2552,6 +2548,42 @@ func (s *Server) emitMutationEventForWrite(ctx context.Context, t model.Table, e
 		NewImage:  newImage,
 		ChangedAt: changedAt,
 	})
+}
+
+type mutationReposAdapter struct {
+	repos uow.Repos
+}
+
+type mutationStreamRepoAdapter struct {
+	streams uow.StreamRepo
+}
+
+type mutationPITRRepoAdapter struct {
+	pitr uow.PITRRepo
+}
+
+func (a mutationReposAdapter) Streams() mutation.StreamRepo {
+	return mutationStreamRepoAdapter{streams: a.repos.Streams()}
+}
+
+func (a mutationReposAdapter) PITR() mutation.PITRRepo {
+	return mutationPITRRepoAdapter{pitr: a.repos.PITR()}
+}
+
+func (a mutationStreamRepoAdapter) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
+	return a.streams.AppendStreamRecord(ctx, record)
+}
+
+func (a mutationStreamRepoAdapter) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
+	return a.streams.DeleteStreamRecordsBefore(ctx, streamARN, before)
+}
+
+func (a mutationPITRRepoAdapter) AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+	return a.pitr.AppendItemChange(ctx, tableKey, pk, sk, changeType, item, changedAt)
+}
+
+func (a mutationPITRRepoAdapter) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
+	return a.pitr.CompactItemChangesBefore(ctx, tableKey, before)
 }
 
 func primaryKeyStringsFromMutationKeys(t model.Table, keys map[string]any) (string, string, error) {
@@ -2651,7 +2683,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 		} else {
 			streamOld = nil
 		}
-		return s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt)
+		return s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt)
 	}); err != nil {
 		return nil, err
 	}
@@ -2800,7 +2832,7 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 			return txErr
 		}
 		if existed {
-			return s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt)
+			return s.emitMutationEventForWrite(txCtx, repos, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt)
 		}
 		return nil
 	}); err != nil {
@@ -2912,7 +2944,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		} else {
 			streamOld = nil
 		}
-		return s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt)
+		return s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt)
 	}); err != nil {
 		return nil, err
 	}
@@ -4023,7 +4055,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					} else {
 						streamOld = nil
 					}
-					if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
+					if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
 						return err
 					}
 					writeByTable[tableName] += writeUnits
@@ -4073,7 +4105,7 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 					}
 					if existed {
 						if len(current) > 0 {
-							if err := s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
+							if err := s.emitMutationEventForWrite(txCtx, repos, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
 								return err
 							}
 						}
@@ -4341,7 +4373,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				} else {
 					streamOld = nil
 				}
-				if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
@@ -4391,7 +4423,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 					return err
 				}
 				if itemExisted {
-					if err := s.emitMutationEventForWrite(txCtx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
+					if err := s.emitMutationEventForWrite(txCtx, repos, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
 						return err
 					}
 				}
@@ -4474,7 +4506,7 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 				} else {
 					streamOld = nil
 				}
-				if err := s.emitMutationEventForWrite(txCtx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
+				if err := s.emitMutationEventForWrite(txCtx, repos, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
 					return err
 				}
 				writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))

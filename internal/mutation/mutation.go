@@ -27,8 +27,23 @@ type Event struct {
 	ChangedAt int64
 }
 
+type StreamRepo interface {
+	AppendStreamRecord(ctx context.Context, record model.StreamRecord) error
+	DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error)
+}
+
+type PITRRepo interface {
+	AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error
+	CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error)
+}
+
+type Repos interface {
+	Streams() StreamRepo
+	PITR() PITRRepo
+}
+
 type Hook interface {
-	HandleMutation(ctx context.Context, tx *sql.Tx, event Event) error
+	HandleMutation(ctx context.Context, repos Repos, event Event) error
 }
 
 type Executor struct {
@@ -40,7 +55,7 @@ func NewExecutor(hooks ...Hook) *Executor {
 	return &Executor{hooks: hooksCopy}
 }
 
-func (e *Executor) Emit(ctx context.Context, tx *sql.Tx, event Event) error {
+func (e *Executor) Emit(ctx context.Context, repos Repos, event Event) error {
 	if e == nil {
 		return nil
 	}
@@ -48,7 +63,7 @@ func (e *Executor) Emit(ctx context.Context, tx *sql.Tx, event Event) error {
 		if hook == nil {
 			continue
 		}
-		if err := hook.HandleMutation(ctx, tx, event); err != nil {
+		if err := hook.HandleMutation(ctx, repos, event); err != nil {
 			return err
 		}
 	}
@@ -59,23 +74,21 @@ func DefaultHooks(s store.Store) []Hook {
 	return []Hook{NewStreamHook(s), NewPITRHook(s)}
 }
 
-type streamHook struct {
-	store store.Store
-}
+type streamHook struct{}
 
 func NewStreamHook(s store.Store) Hook {
 	if s == nil {
 		return nil
 	}
-	return &streamHook{store: s}
+	return &streamHook{}
 }
 
-func (h *streamHook) HandleMutation(ctx context.Context, tx *sql.Tx, event Event) error {
+func (h *streamHook) HandleMutation(ctx context.Context, repos Repos, event Event) error {
 	if !event.Table.Stream.Enabled || strings.TrimSpace(event.Table.Stream.ARN) == "" {
 		return nil
 	}
 	oldView, newView := filterStreamImages(event.Table.Stream.ViewType, event.OldImage, event.NewImage)
-	if err := h.store.AppendStreamRecord(ctx, tx, model.StreamRecord{
+	if err := repos.Streams().AppendStreamRecord(ctx, model.StreamRecord{
 		StreamARN: event.Table.Stream.ARN,
 		ShardID:   streamDefaultShardID,
 		EventName: event.EventName,
@@ -86,22 +99,20 @@ func (h *streamHook) HandleMutation(ctx context.Context, tx *sql.Tx, event Event
 	}); err != nil {
 		return err
 	}
-	_, err := h.store.DeleteStreamRecordsBefore(ctx, tx, event.Table.Stream.ARN, event.ChangedAt-streamRetentionMillis)
+	_, err := repos.Streams().DeleteStreamRecordsBefore(ctx, event.Table.Stream.ARN, event.ChangedAt-streamRetentionMillis)
 	return err
 }
 
-type pitrHook struct {
-	store store.Store
-}
+type pitrHook struct{}
 
 func NewPITRHook(s store.Store) Hook {
 	if s == nil {
 		return nil
 	}
-	return &pitrHook{store: s}
+	return &pitrHook{}
 }
 
-func (h *pitrHook) HandleMutation(ctx context.Context, tx *sql.Tx, event Event) error {
+func (h *pitrHook) HandleMutation(ctx context.Context, repos Repos, event Event) error {
 	if !event.Table.PITR.Enabled {
 		return nil
 	}
@@ -125,7 +136,7 @@ func (h *pitrHook) HandleMutation(ctx context.Context, tx *sql.Tx, event Event) 
 	if strings.EqualFold(pitrType, "DELETE") {
 		item = nil
 	}
-	if err := h.store.AppendItemChange(ctx, tx, event.Table.Name, pk, sk, pitrType, item, changedAt); err != nil {
+	if err := repos.PITR().AppendItemChange(ctx, event.Table.Name, pk, sk, pitrType, item, changedAt); err != nil {
 		return err
 	}
 	recoveryDays := event.Table.PITR.RecoveryPeriodInDays
@@ -136,8 +147,51 @@ func (h *pitrHook) HandleMutation(ctx context.Context, tx *sql.Tx, event Event) 
 	if cutoff <= 0 {
 		return nil
 	}
-	_, err := h.store.CompactItemChangesBefore(ctx, tx, event.Table.Name, cutoff)
+	_, err := repos.PITR().CompactItemChangesBefore(ctx, event.Table.Name, cutoff)
 	return err
+}
+
+type txRepos struct {
+	store store.Store
+	tx    *sql.Tx
+}
+
+type txStreamRepo struct {
+	store store.Store
+	tx    *sql.Tx
+}
+
+type txPITRRepo struct {
+	store store.Store
+	tx    *sql.Tx
+}
+
+func NewTxRepos(s store.Store, tx *sql.Tx) Repos {
+	return txRepos{store: s, tx: tx}
+}
+
+func (r txRepos) Streams() StreamRepo {
+	return txStreamRepo{store: r.store, tx: r.tx}
+}
+
+func (r txRepos) PITR() PITRRepo {
+	return txPITRRepo{store: r.store, tx: r.tx}
+}
+
+func (r txStreamRepo) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
+	return r.store.AppendStreamRecord(ctx, r.tx, record)
+}
+
+func (r txStreamRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
+	return r.store.DeleteStreamRecordsBefore(ctx, r.tx, streamARN, before)
+}
+
+func (r txPITRRepo) AppendItemChange(ctx context.Context, tableKey, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+	return r.store.AppendItemChange(ctx, r.tx, tableKey, pk, sk, changeType, item, changedAt)
+}
+
+func (r txPITRRepo) CompactItemChangesBefore(ctx context.Context, tableKey string, before int64) (int64, error) {
+	return r.store.CompactItemChangesBefore(ctx, r.tx, tableKey, before)
 }
 
 func pitrTypeFromMutationEventName(eventName string) string {
