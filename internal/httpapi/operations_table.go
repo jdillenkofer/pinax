@@ -964,25 +964,6 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	return map[string]any{"TableDescription": t.Description(count)}, nil
 }
 
-func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
-	repo := s.txReposFactory.Build(tx).Tables()
-	if err := s.tableLifecycle.RefreshLifecycle(ctx, repo, t, lifecycleNow()); err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return sql.ErrNoRows
-		}
-		return err
-	}
-	return nil
-}
-
-func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
-	scopedTableName, err := identity.ScopedTableKeyFromIdentifier(tableName, accountIDFromContext(ctx))
-	if err != nil {
-		return model.Table{}, mapIdentityRequestError(err)
-	}
-	return s.getTableWithLifecycleByKey(ctx, s.txReposFactory.Build(tx).Tables(), scopedTableName)
-}
-
 func (s *Server) getTableWithLifecycleByKey(ctx context.Context, tables uow.TableRepo, scopedTableName string) (model.Table, error) {
 	t, err := s.tableLifecycle.GetWithLifecycle(ctx, tables, scopedTableName, lifecycleNow())
 	if err != nil {
@@ -1000,14 +981,6 @@ func (s *Server) getTableWithLifecycleFromRepo(ctx context.Context, tables uow.T
 		return model.Table{}, mapIdentityRequestError(err)
 	}
 	return s.getTableWithLifecycleByKey(ctx, tables, scopedTableName)
-}
-
-func (s *Server) getActiveTable(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error) {
-	t, err := s.getTableWithLifecycle(ctx, tx, tableName)
-	if err != nil {
-		return model.Table{}, err
-	}
-	return ensureTableActive(t)
 }
 
 func (s *Server) getActiveTableFromRepo(ctx context.Context, tables uow.TableRepo, tableName string) (model.Table, error) {

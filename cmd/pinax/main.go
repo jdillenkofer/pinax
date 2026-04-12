@@ -79,8 +79,7 @@ func main() {
 	txReposFactory := reposqlite.NewFactory(backend)
 	unitOfWork := reposqlite.NewUnitOfWork(db, txReposFactory)
 	srv := httpapi.NewServer(
-		db,
-		txReposFactory,
+		unitOfWork,
 		requestAuthorizer,
 		httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()),
 		httpapi.WithMutationHooks(mutation.DefaultHooks()...),

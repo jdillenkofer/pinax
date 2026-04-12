@@ -35,7 +35,6 @@ import (
 	"github.com/jdillenkofer/pinax/internal/identity"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -99,7 +98,6 @@ var (
 )
 
 type Server struct {
-	txReposFactory                reposqlite.Factory
 	unitOfWork                    uow.UnitOfWork
 	tableLifecycle                *tableapp.LifecycleService
 	tableService                  *tableapp.Service
@@ -160,10 +158,8 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 	}
 }
 
-func NewServer(db *sql.DB, txReposFactory reposqlite.Factory, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
-	unitOfWork := reposqlite.NewUnitOfWork(db, txReposFactory)
+func NewServer(unitOfWork uow.UnitOfWork, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	s := &Server{
-		txReposFactory:                txReposFactory,
 		unitOfWork:                    unitOfWork,
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
