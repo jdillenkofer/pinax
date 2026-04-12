@@ -1,0 +1,84 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/benchmarks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark Comparison
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Run benchmarks on base commit
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git checkout "$BASE_SHA"
+          go test ./internal/httpapi -run '^$' -bench '^BenchmarkAPI' -benchmem -count=5 > /tmp/bench_base.txt
+
+      - name: Run benchmarks on head commit
+        run: |
+          git checkout "$GITHUB_SHA"
+          go test ./internal/httpapi -run '^$' -bench '^BenchmarkAPI' -benchmem -count=5 > /tmp/bench_head.txt
+
+      - name: Compare benchmark results
+        if: github.event_name == 'pull_request'
+        run: |
+          "$(go env GOPATH)/bin/benchstat" /tmp/bench_base.txt /tmp/bench_head.txt > /tmp/benchstat.txt
+
+      - name: Summarize benchmark results
+        run: |
+          {
+            echo "## Benchmark Results"
+            echo
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "### benchstat (base vs head)"
+              echo
+              echo '```'
+              cat /tmp/benchstat.txt
+              echo '```'
+            else
+              echo "### head run"
+              echo
+              echo '```'
+              cat /tmp/bench_head.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            /tmp/bench_base.txt
+            /tmp/bench_head.txt
+            /tmp/benchstat.txt
+          if-no-files-found: ignore
