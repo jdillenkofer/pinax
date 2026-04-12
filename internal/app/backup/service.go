@@ -6,8 +6,8 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
-	"github.com/jdillenkofer/pinax/internal/store"
 )
 
 var (
@@ -16,18 +16,18 @@ var (
 	ErrTargetTableInUse  = errors.New("target table in use")
 )
 
-type TableLoader func(ctx context.Context, tx *sql.Tx, tableName string) (model.Table, error)
+type TableLoader func(ctx context.Context, txs uow.TxStore, tableName string) (model.Table, error)
 
 type BackupBuilder func(table model.Table, itemCount int64, items []map[string]any) (model.Backup, error)
 
 type RestoreTableBuilder func(backup model.Backup) (model.Table, error)
 
 type Service struct {
-	store store.Store
+	uow uow.UnitOfWork
 }
 
-func NewService(store store.Store) *Service {
-	return &Service{store: store}
+func NewService(unitOfWork uow.UnitOfWork) *Service {
+	return &Service{uow: unitOfWork}
 }
 
 func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string, loadTable TableLoader, buildBackup BackupBuilder) (model.Backup, error) {
@@ -39,8 +39,8 @@ func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string
 	}
 
 	var backup model.Backup
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		t, err := loadTable(ctx, tx, tableName)
+	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
+		t, err := loadTable(ctx, txs, tableName)
 		if err != nil {
 			return err
 		}
@@ -48,17 +48,17 @@ func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string
 			return ErrTargetTableInUse
 		}
 
-		if _, err := s.store.GetBackupByName(ctx, tx, backupName); err == nil {
+		if _, err := txs.GetBackupByName(ctx, backupName); err == nil {
 			return ErrBackupExists
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 
-		count, err := s.store.CountItems(ctx, tx, t.Name)
+		count, err := txs.CountItems(ctx, t.Name)
 		if err != nil {
 			return err
 		}
-		items, err := s.store.Scan(ctx, tx, t.Name, "", "", 0)
+		items, err := txs.Scan(ctx, t.Name, "", "", 0)
 		if err != nil {
 			return err
 		}
@@ -66,7 +66,7 @@ func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string
 		if err != nil {
 			return err
 		}
-		if err := s.store.CreateBackup(ctx, tx, backup); err != nil {
+		if err := txs.CreateBackup(ctx, backup); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") {
 				return ErrBackupExists
 			}
@@ -79,9 +79,9 @@ func (s *Service) CreateBackup(ctx context.Context, tableName, backupName string
 
 func (s *Service) DescribeBackup(ctx context.Context, backupARN string) (model.Backup, error) {
 	var backup model.Backup
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
 		var err error
-		backup, err = s.store.GetBackup(ctx, tx, backupARN)
+		backup, err = txs.GetBackup(ctx, backupARN)
 		return err
 	})
 	return backup, err
@@ -89,14 +89,14 @@ func (s *Service) DescribeBackup(ctx context.Context, backupARN string) (model.B
 
 func (s *Service) DeleteBackup(ctx context.Context, backupARN string) (model.Backup, error) {
 	var deleted model.Backup
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		backup, err := s.store.GetBackup(ctx, tx, backupARN)
+	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
+		backup, err := txs.GetBackup(ctx, backupARN)
 		if err != nil {
 			return err
 		}
 		deleted = backup
 		deleted.BackupStatus = model.BackupStatusDeleted
-		if err := s.store.DeleteBackup(ctx, tx, backupARN); err != nil {
+		if err := txs.DeleteBackup(ctx, backupARN); err != nil {
 			return err
 		}
 		return nil
@@ -106,9 +106,9 @@ func (s *Service) DeleteBackup(ctx context.Context, backupARN string) (model.Bac
 
 func (s *Service) ListBackups(ctx context.Context) ([]model.Backup, error) {
 	var backups []model.Backup
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
 		var err error
-		backups, err = s.store.ListBackups(ctx, tx)
+		backups, err = txs.ListBackups(ctx)
 		return err
 	})
 	return backups, err
@@ -121,12 +121,12 @@ func (s *Service) RestoreTableFromBackup(ctx context.Context, backupARN, targetS
 
 	var tableToCreate model.Table
 	itemCount := 0
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		backup, err := s.store.GetBackup(ctx, tx, backupARN)
+	err := s.uow.Do(ctx, func(txs uow.TxStore) error {
+		backup, err := txs.GetBackup(ctx, backupARN)
 		if err != nil {
 			return err
 		}
-		if existing, err := s.store.GetTable(ctx, tx, targetScopedTableKey); err == nil {
+		if existing, err := txs.GetTable(ctx, targetScopedTableKey); err == nil {
 			if existing.Status == model.TableStatusCreating || existing.Status == model.TableStatusDeleting {
 				return ErrTargetTableInUse
 			}
@@ -139,7 +139,7 @@ func (s *Service) RestoreTableFromBackup(ctx context.Context, backupARN, targetS
 		if err != nil {
 			return err
 		}
-		if err := s.store.CreateTable(ctx, tx, tableToCreate); err != nil {
+		if err := txs.CreateTable(ctx, tableToCreate); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") {
 				return ErrTargetTableExists
 			}
@@ -150,7 +150,7 @@ func (s *Service) RestoreTableFromBackup(ctx context.Context, backupARN, targetS
 			if err != nil {
 				return err
 			}
-			if err := s.store.PutItem(ctx, tx, tableToCreate.Name, pk, sk, item); err != nil {
+			if err := txs.PutItem(ctx, tableToCreate.Name, pk, sk, item); err != nil {
 				return err
 			}
 		}
@@ -159,16 +159,4 @@ func (s *Service) RestoreTableFromBackup(ctx context.Context, backupARN, targetS
 	})
 
 	return tableToCreate, itemCount, err
-}
-
-func (s *Service) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
 }

@@ -30,6 +30,7 @@ import (
 
 	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/expr"
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
@@ -159,8 +160,8 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	s := &Server{
 		store:                         store,
-		backupService:                 backupapp.NewService(store),
-		pitrService:                   pitrapp.NewService(store),
+		backupService:                 backupapp.NewService(uow.NewStoreUnitOfWork(store)),
+		pitrService:                   pitrapp.NewService(uow.NewStoreUnitOfWork(store)),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -1004,7 +1005,7 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		r.Context(),
 		tableName,
 		req.BackupName,
-		s.getTableWithLifecycle,
+		s.getTableWithLifecycleTxStore,
 		func(t model.Table, count int64, items []map[string]any) (model.Backup, error) {
 			tableDesc := t.Description(count)
 			now := time.Now().Unix()
@@ -1381,7 +1382,7 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 		RecoveryPeriodInDays:  req.PointInTimeRecoverySpecification.RecoveryPeriodInDays,
 		NowMillis:             time.Now().UnixMilli(),
 		DefaultRecoveryWindow: 35,
-	}, s.getTableWithLifecycle)
+	}, s.getTableWithLifecycleTxStore)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1401,7 +1402,7 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 		return nil, awserr.Validation("TableName is required")
 	}
 
-	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), req.TableName, time.Now().UnixMilli(), s.getTableWithLifecycle)
+	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), req.TableName, time.Now().UnixMilli(), s.getTableWithLifecycleTxStore)
 	if err != nil {
 		var apiErr *awserr.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
@@ -1450,7 +1451,7 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		RestoreDateTimeMillis:     restoreAtMillis,
 		PITRLatestRestorableLagMs: s.pitrLatestRestorableLagMillis,
 		NowMillis:                 time.Now().UnixMilli(),
-	}, s.getTableWithLifecycle, func(source model.Table) (model.Table, error) {
+	}, s.getTableWithLifecycleTxStore, func(source model.Table) (model.Table, error) {
 		table := source
 		table.Name = targetScopedTableKey
 		table.Status = model.TableStatusCreating
@@ -3230,6 +3231,45 @@ func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableNam
 		return model.Table{}, err
 	}
 	if err := s.refreshTableLifecycle(ctx, tx, &t); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return model.Table{}, err
+	}
+	return t, nil
+}
+
+func (s *Server) refreshTableLifecycleTxStore(ctx context.Context, txs uow.TxStore, t *model.Table) error {
+	now := lifecycleNow()
+	if t.Status == model.TableStatusDeleting && t.StatusAt > 0 && now >= t.StatusAt {
+		if err := txs.DeleteTable(ctx, t.Name); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if t.Status == model.TableStatusCreating && t.StatusAt > 0 && now >= t.StatusAt {
+		t.Status = model.TableStatusActive
+		t.StatusAt = 0
+	}
+	if !advanceTableLifecycle(t, now) {
+		return nil
+	}
+	return txs.UpdateTableIndexes(ctx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs)
+}
+
+func (s *Server) getTableWithLifecycleTxStore(ctx context.Context, txs uow.TxStore, tableName string) (model.Table, error) {
+	scopedTableName, err := scopedTableNameFromIdentifier(ctx, tableName)
+	if err != nil {
+		return model.Table{}, err
+	}
+	t, err := txs.GetTable(ctx, scopedTableName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
+		}
+		return model.Table{}, err
+	}
+	if err := s.refreshTableLifecycleTxStore(ctx, txs, &t); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.Table{}, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
