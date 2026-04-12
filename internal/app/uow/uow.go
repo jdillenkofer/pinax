@@ -13,6 +13,8 @@ type TableRepo interface {
 	GetTable(ctx context.Context, tableKey string) (model.Table, error)
 	DeleteTable(ctx context.Context, tableKey string) error
 	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
+	UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
+	UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error
 	UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error
 }
 
@@ -40,11 +42,18 @@ type BackupRepo interface {
 	DeleteBackup(ctx context.Context, backupARN string) error
 }
 
+type ResourcePolicyRepo interface {
+	PutResourcePolicy(ctx context.Context, resourceARN string, policy string, revisionID string, updatedAt int64) error
+	GetResourcePolicy(ctx context.Context, resourceARN string) (string, string, error)
+	DeleteResourcePolicy(ctx context.Context, resourceARN string) (string, bool, error)
+}
+
 type Repos interface {
 	Tables() TableRepo
 	Items() ItemRepo
 	PITR() PITRRepo
 	Backups() BackupRepo
+	ResourcePolicies() ResourcePolicyRepo
 }
 
 type UnitOfWork interface {
@@ -90,6 +99,7 @@ func (r txRepos) PITR() PITRRepo    { return r.txs }
 func (r txRepos) Backups() BackupRepo {
 	return r.txs
 }
+func (r txRepos) ResourcePolicies() ResourcePolicyRepo { return r.txs }
 
 type txStore struct {
 	store store.Store
@@ -116,6 +126,12 @@ func (t *txStore) Scan(ctx context.Context, tableKey, startPK, startSK string, l
 }
 func (t *txStore) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	return t.store.UpdateTableIndexes(ctx, t.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
+}
+func (t *txStore) UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
+	return t.store.UpdateTableBilling(ctx, t.tx, tableKey, billingMode, readCapacityUnits, writeCapacityUnits)
+}
+func (t *txStore) UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
+	return t.store.UpdateTableOptions(ctx, t.tx, tableKey, tableClass, deletionProtection, stream, sse, tags)
 }
 func (t *txStore) UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error {
 	return t.store.UpdatePointInTimeRecovery(ctx, t.tx, tableKey, pitr)
@@ -155,4 +171,13 @@ func (t *txStore) ListBackups(ctx context.Context) ([]model.Backup, error) {
 }
 func (t *txStore) DeleteBackup(ctx context.Context, backupARN string) error {
 	return t.store.DeleteBackup(ctx, t.tx, backupARN)
+}
+func (t *txStore) PutResourcePolicy(ctx context.Context, resourceARN string, policy string, revisionID string, updatedAt int64) error {
+	return t.store.PutResourcePolicy(ctx, t.tx, resourceARN, policy, revisionID, updatedAt)
+}
+func (t *txStore) GetResourcePolicy(ctx context.Context, resourceARN string) (string, string, error) {
+	return t.store.GetResourcePolicy(ctx, t.tx, resourceARN)
+}
+func (t *txStore) DeleteResourcePolicy(ctx context.Context, resourceARN string) (string, bool, error) {
+	return t.store.DeleteResourcePolicy(ctx, t.tx, resourceARN)
 }

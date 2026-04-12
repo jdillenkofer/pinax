@@ -30,6 +30,7 @@ import (
 
 	backupapp "github.com/jdillenkofer/pinax/internal/app/backup"
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
+	resourcepolicyapp "github.com/jdillenkofer/pinax/internal/app/resourcepolicy"
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
@@ -106,8 +107,10 @@ var (
 type Server struct {
 	store                         store.Store
 	tableLifecycle                *tableapp.LifecycleService
+	tableService                  *tableapp.Service
 	backupService                 *backupapp.Service
 	pitrService                   *pitrapp.Service
+	resourcePolicyService         *resourcepolicyapp.Service
 	requestAuthorizer             authorization.RequestAuthorizer
 	mutationExecutor              *mutation.Executor
 	capMu                         sync.Mutex
@@ -165,8 +168,10 @@ func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthori
 	s := &Server{
 		store:                         store,
 		tableLifecycle:                tableLifecycle,
+		tableService:                  tableapp.NewService(unitOfWork, tableLifecycle),
 		backupService:                 backupapp.NewService(unitOfWork, tableLifecycle),
 		pitrService:                   pitrapp.NewService(unitOfWork, tableLifecycle),
+		resourcePolicyService:         resourcepolicyapp.NewService(unitOfWork, tableLifecycle),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -1569,32 +1574,14 @@ func (s *Server) tagResource(r *http.Request, body []byte) (map[string]any, erro
 	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
 		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
-	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	if err := s.tableService.TagTable(r.Context(), tableKey, tags, lifecycleNow()); err != nil {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, awserr.ResourceNotFound("Requested resource not found")
 		}
-		return nil, err
-	}
-
-	nextTags := mergeTags(t.Tags, tags)
-	if len(nextTags) > 50 {
-		return nil, awserr.Validation("Tags can have at most 50 items")
-	}
-
-	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, nextTags); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
+		if errors.Is(err, tableapp.ErrTooManyTags) {
+			return nil, awserr.Validation("Tags can have at most 50 items")
+		}
 		return nil, err
 	}
 	return map[string]any{}, nil
@@ -1623,28 +1610,11 @@ func (s *Server) untagResource(r *http.Request, body []byte) (map[string]any, er
 	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
 		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
-	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	if err := s.tableService.UntagTable(r.Context(), tableKey, keys, lifecycleNow()); err != nil {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, awserr.ResourceNotFound("Requested resource not found")
 		}
-		return nil, err
-	}
-
-	nextTags := removeTags(t.Tags, keys)
-	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, nextTags); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{}, nil
@@ -1666,30 +1636,15 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
 		return nil, &awserr.APIError{Code: "AccessDeniedException", Message: "Access denied", Status: http.StatusBadRequest}
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	sortedTags, err := s.tableService.ListTableTags(r.Context(), tableKey, lifecycleNow())
 	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getTableWithLifecycle(r.Context(), tx, tableName)
-	if err != nil {
-		var apiErr *awserr.APIError
-		if errors.As(err, &apiErr) && apiErr.Code == "ResourceNotFoundException" {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return nil, awserr.ResourceNotFound("Requested resource not found")
 		}
 		return nil, err
 	}
-
-	tags := make([]map[string]any, 0, len(t.Tags))
-	sortedTags := append([]model.Tag(nil), t.Tags...)
-	sort.Slice(sortedTags, func(i, j int) bool {
-		if sortedTags[i].Key == sortedTags[j].Key {
-			return sortedTags[i].Value < sortedTags[j].Value
-		}
-		return sortedTags[i].Key < sortedTags[j].Key
-	})
+	tags := make([]map[string]any, 0, len(sortedTags))
 	start, err := parseListTagsOfResourceStartToken(req.NextToken, len(sortedTags))
 	if err != nil {
 		return nil, awserr.Validation(err.Error())
@@ -1700,10 +1655,6 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 	}
 	for _, tag := range sortedTags[start:end] {
 		tags = append(tags, map[string]any{"Key": tag.Key, "Value": tag.Value})
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
 	}
 	resp := map[string]any{"Tags": tags}
 	if end < len(sortedTags) {
@@ -1763,47 +1714,26 @@ func (s *Server) putResourcePolicy(r *http.Request, body []byte) (map[string]any
 	if err := validateExpectedRevisionID(req.ExpectedRevisionID); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(resourceARN)
 	if err != nil {
-		return nil, err
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-	defer tx.Rollback()
-	if err := s.ensureResourcePolicyTarget(r.Context(), tx, resourceARN, isStream); err != nil {
-		return nil, err
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
+	}
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	if err := s.resourcePolicyService.EnsureTarget(r.Context(), tableKey, resourceARN, isStream, lifecycleNow()); err != nil {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
 
-	existingPolicy, existingRevision, err := s.store.GetResourcePolicy(r.Context(), tx, resourceARN)
-	hasExisting := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	expectedRevision := strings.TrimSpace(req.ExpectedRevisionID)
-	if expectedRevision != "" {
-		switch {
-		case expectedRevision == "NO_POLICY":
-			if hasExisting {
-				return nil, awserr.PolicyNotFound(policyNotFoundMessage)
-			}
-		case !hasExisting || existingRevision != expectedRevision:
+	revisionID, err := s.resourcePolicyService.Put(r.Context(), resourceARN, req.Policy, req.ExpectedRevisionID, req.ConfirmRemoveSelfResourceAccess, needsConfirmRemoveSelfResourceAccess)
+	if err != nil {
+		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
 			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
 		}
-	}
-	if !req.ConfirmRemoveSelfResourceAccess {
-		if needsConfirmRemoveSelfResourceAccess(resourceARN, req.Policy) {
+		if errors.Is(err, resourcepolicyapp.ErrConfirmRemoveSelfResourceAccessRequired) {
 			return nil, awserr.Validation("This policy contains a statement that may prevent future policy updates for this resource. Set ConfirmRemoveSelfResourceAccess to true to confirm this change")
 		}
-	}
-
-	revisionID := existingRevision
-	if !hasExisting || existingPolicy != req.Policy {
-		revisionID = resourcePolicyRevisionID(resourceARN, req.Policy)
-		if err := s.store.PutResourcePolicy(r.Context(), tx, resourceARN, req.Policy, revisionID, time.Now().UnixMilli()); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"RevisionId": revisionID}, nil
@@ -1819,23 +1749,22 @@ func (s *Server) getResourcePolicy(r *http.Request, body []byte) (map[string]any
 		return nil, awserr.Validation(err.Error())
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(resourceARN)
 	if err != nil {
-		return nil, err
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-	defer tx.Rollback()
-	if err := s.ensureResourcePolicyTarget(r.Context(), tx, resourceARN, isStream); err != nil {
-		return nil, err
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-	policy, revisionID, err := s.store.GetResourcePolicy(r.Context(), tx, resourceARN)
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	if err := s.resourcePolicyService.EnsureTarget(r.Context(), tableKey, resourceARN, isStream, lifecycleNow()); err != nil {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
+	}
+	policy, revisionID, err := s.resourcePolicyService.Get(r.Context(), resourceARN)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
 			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
 		}
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"Policy": policy, "RevisionId": revisionID}, nil
@@ -1854,38 +1783,22 @@ func (s *Server) deleteResourcePolicy(r *http.Request, body []byte) (map[string]
 		return nil, awserr.Validation(err.Error())
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(resourceARN)
 	if err != nil {
-		return nil, err
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-	defer tx.Rollback()
-	if err := s.ensureResourcePolicyTarget(r.Context(), tx, resourceARN, isStream); err != nil {
-		return nil, err
+	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(r.Context()) {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-
-	_, existingRevision, err := s.store.GetResourcePolicy(r.Context(), tx, resourceARN)
-	hasExisting := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
+	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
+	if err := s.resourcePolicyService.EnsureTarget(r.Context(), tableKey, resourceARN, isStream, lifecycleNow()); err != nil {
+		return nil, awserr.ResourceNotFound("Requested resource not found")
 	}
-	expectedRevision := strings.TrimSpace(req.ExpectedRevisionID)
-	if expectedRevision != "" {
-		if !hasExisting || existingRevision != expectedRevision {
+	revisionID, err := s.resourcePolicyService.Delete(r.Context(), resourceARN, req.ExpectedRevisionID)
+	if err != nil {
+		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
 			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
 		}
-	}
-	revisionID := ""
-	if hasExisting {
-		deletedRevision, found, err := s.store.DeleteResourcePolicy(r.Context(), tx, resourceARN)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			revisionID = deletedRevision
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return map[string]any{"RevisionId": revisionID}, nil
@@ -2141,31 +2054,6 @@ func containsPrincipal(principals []string, principal string) bool {
 func valueAsString(v any) string {
 	s, _ := v.(string)
 	return s
-}
-
-func resourcePolicyRevisionID(resourceARN, policy string) string {
-	h := sha256.Sum256([]byte(resourceARN + "\x00" + policy))
-	return hex.EncodeToString(h[:16])
-}
-
-func (s *Server) ensureResourcePolicyTarget(ctx context.Context, tx *sql.Tx, resourceARN string, isStream bool) error {
-	tableName, resourceAccountID, err := taggableTableNameFromResourceARN(resourceARN)
-	if err != nil {
-		return awserr.ResourceNotFound("Requested resource not found")
-	}
-	if resourceAccountID != "" && resourceAccountID != accountIDFromContext(ctx) {
-		return awserr.ResourceNotFound("Requested resource not found")
-	}
-	t, err := s.getTableWithLifecycle(ctx, tx, tableName)
-	if err != nil {
-		return awserr.ResourceNotFound("Requested resource not found")
-	}
-	if isStream {
-		if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" || t.Stream.ARN != resourceARN {
-			return awserr.ResourceNotFound("Requested resource not found")
-		}
-	}
-	return nil
 }
 
 type listStreamsRequest struct {
@@ -3145,68 +3033,64 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 	if strings.TrimSpace(req.TableName) == "" {
 		return nil, awserr.Validation("TableName is required")
 	}
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
+	tableKey, err := scopedTableNameFromIdentifier(r.Context(), req.TableName)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
 
-	t, err := s.getTableWithLifecycle(r.Context(), tx, req.TableName)
-	if err != nil {
-		return nil, err
-	}
-	if t.Status != model.TableStatusActive {
-		return nil, awserr.ResourceInUse("Table is currently " + t.Status)
-	}
 	if len(req.ReplicaUpdates) > 0 {
 		return nil, awserr.Validation("ReplicaUpdates is not supported")
 	}
+
+	var billing *tableapp.BillingUpdate
 	if strings.TrimSpace(req.BillingMode) != "" || req.ProvisionedThroughput != nil {
 		billingMode, readCapacityUnits, writeCapacityUnits, err := normalizeBillingConfig(req.BillingMode, req.ProvisionedThroughput)
 		if err != nil {
 			return nil, awserr.Validation(err.Error())
 		}
-		t.BillingMode = billingMode
-		t.ReadCapacityUnits = readCapacityUnits
-		t.WriteCapacityUnits = writeCapacityUnits
-		if err := s.store.UpdateTableBilling(r.Context(), tx, t.Name, billingMode, readCapacityUnits, writeCapacityUnits); err != nil {
-			return nil, err
+		billing = &tableapp.BillingUpdate{BillingMode: billingMode, ReadCapacityUnits: readCapacityUnits, WriteCapacityUnits: writeCapacityUnits}
+	}
+	attrTypes := map[string]string{}
+	for _, d := range req.AttributeDefinitions {
+		if strings.TrimSpace(d.AttributeName) != "" {
+			attrTypes[d.AttributeName] = d.AttributeType
 		}
 	}
-
-	if err := applyUpdateTableOptions(&t, req); err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	if err := s.store.UpdateTableOptions(r.Context(), tx, t.Name, t.TableClass, t.DeletionProtection, t.Stream, t.SSE, t.Tags); err != nil {
-		return nil, err
-	}
-
-	if len(req.GlobalSecondaryIndexUpdates) > 0 {
-		attrTypes := map[string]string{}
-		for _, d := range req.AttributeDefinitions {
-			if strings.TrimSpace(d.AttributeName) != "" {
-				attrTypes[d.AttributeName] = d.AttributeType
+	t, count, err := s.tableService.UpdateTable(r.Context(), tableapp.UpdateTableInput{
+		TableKey:  tableKey,
+		NowMillis: lifecycleNow(),
+		Billing:   billing,
+		ApplyOptions: func(t *model.Table) error {
+			return applyUpdateTableOptions(t, req)
+		},
+		ApplyGSI: func(table model.Table, now int64) ([]model.GlobalSecondaryIndex, error) {
+			if len(req.GlobalSecondaryIndexUpdates) == 0 {
+				return table.GSIs, nil
 			}
+			return applyGSIUpdates(table, req.GlobalSecondaryIndexUpdates, attrTypes, now, table.BillingMode)
+		},
+		SetTableState: func(t *model.Table, now int64) {
+			if len(req.GlobalSecondaryIndexUpdates) == 0 {
+				return
+			}
+			t.Status = model.TableStatusUpdating
+			t.StatusAt = now + lifecycleDelayMillis()
+		},
+	})
+	if err != nil {
+		if errors.Is(err, tableapp.ErrTableNotFound) {
+			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
 		}
-		now := lifecycleNow()
-		updatedGSIs, err := applyGSIUpdates(t, req.GlobalSecondaryIndexUpdates, attrTypes, now, t.BillingMode)
-		if err != nil {
+		var inUseErr *tableapp.TableInUseError
+		if errors.As(err, &inUseErr) {
+			return nil, awserr.ResourceInUse("Table is currently " + inUseErr.Status)
+		}
+		if strings.Contains(err.Error(), "GlobalSecondaryIndexUpdates") || strings.Contains(err.Error(), "index") || strings.Contains(err.Error(), "ProvisionedThroughput") {
 			return nil, awserr.Validation(err.Error())
 		}
-		t.GSIs = updatedGSIs
-		t.Status = model.TableStatusUpdating
-		t.StatusAt = now + lifecycleDelayMillis()
-		if err := s.store.UpdateTableIndexes(r.Context(), tx, t.Name, t.Status, t.StatusAt, t.GSIs, t.LSIs); err != nil {
-			return nil, err
+		if strings.Contains(err.Error(), "SSE") || strings.Contains(err.Error(), "TableClass") || strings.Contains(err.Error(), "Stream") || strings.Contains(err.Error(), "DeletionProtection") {
+			return nil, awserr.Validation(err.Error())
 		}
-	}
-
-	count, err := s.store.CountItems(r.Context(), tx, t.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -3267,6 +3151,12 @@ func (r sqlTxTableRepo) DeleteTable(ctx context.Context, tableKey string) error 
 }
 func (r sqlTxTableRepo) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	return r.store.UpdateTableIndexes(ctx, r.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
+}
+func (r sqlTxTableRepo) UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
+	return r.store.UpdateTableBilling(ctx, r.tx, tableKey, billingMode, readCapacityUnits, writeCapacityUnits)
+}
+func (r sqlTxTableRepo) UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
+	return r.store.UpdateTableOptions(ctx, r.tx, tableKey, tableClass, deletionProtection, stream, sse, tags)
 }
 func (r sqlTxTableRepo) UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error {
 	return r.store.UpdatePointInTimeRecovery(ctx, r.tx, tableKey, pitr)
