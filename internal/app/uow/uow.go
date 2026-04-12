@@ -11,7 +11,8 @@ type TableRepo interface {
 	GetTable(ctx context.Context, tableKey string) (model.Table, error)
 	ListTables(ctx context.Context, start string, limit int) ([]string, error)
 	DeleteTable(ctx context.Context, tableKey string) error
-	BackfillGSIEntries(ctx context.Context, tableKey string, gsi model.GlobalSecondaryIndex) error
+	DeleteGSIEntries(ctx context.Context, tableKey, indexName string) error
+	PutSecondaryIndexEntry(ctx context.Context, tableKey, indexName, indexPK, indexSK, basePK, baseSK string) error
 	UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error
 	UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error
 	UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error
@@ -30,7 +31,7 @@ type StreamRepo interface {
 type ItemRepo interface {
 	CountItems(ctx context.Context, tableKey string) (int64, error)
 	GetItem(ctx context.Context, tableKey, pk, sk string) (map[string]any, error)
-	PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error
+	PutItem(ctx context.Context, t model.Table, pk, sk string, item map[string]any) error
 	DeleteItem(ctx context.Context, tableKey, pk, sk string) error
 	QueryByPK(ctx context.Context, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
 	QueryByGSI(ctx context.Context, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)

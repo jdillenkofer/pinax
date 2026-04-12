@@ -50,7 +50,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 			"pk":  map[string]any{"S": fmt.Sprintf("e#%03d", i)},
 			"ttl": map[string]any{"N": "100"},
 		}
-		if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|"+fmt.Sprintf("e#%03d", i), model.NoSortKey, item); err != nil {
+		if err := repo.ItemRepo().PutItem(ctx, table, "S|"+fmt.Sprintf("e#%03d", i), model.NoSortKey, item); err != nil {
 			tx.Rollback()
 			t.Fatal(err)
 		}
@@ -59,7 +59,7 @@ func TestDeleteExpiredItemsBatched(t *testing.T) {
 		"pk":  map[string]any{"S": "valid"},
 		"ttl": map[string]any{"N": "9999999999"},
 	}
-	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|valid", model.NoSortKey, validItem); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table, "S|valid", model.NoSortKey, validItem); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}

@@ -250,7 +250,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 				if err := model.ValidateSecondaryIndexKeyTypes(t, put.Item); err != nil {
 					return input.Adapter.OnConditionEvalError(len(input.Items), i, err.Error())
 				}
-				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, put.Item); err != nil {
+				if err := repos.Items().PutItem(txCtx, t, pk, sk, put.Item); err != nil {
 					return err
 				}
 
@@ -379,7 +379,7 @@ func (s *Service) TransactWrite(ctx context.Context, input TransactWriteInput) (
 				if model.ItemTooLarge(updated) {
 					return invalid("Item size has exceeded the maximum allowed size")
 				}
-				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, updated); err != nil {
+				if err := repos.Items().PutItem(txCtx, t, pk, sk, updated); err != nil {
 					return err
 				}
 

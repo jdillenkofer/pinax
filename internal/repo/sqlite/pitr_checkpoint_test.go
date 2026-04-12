@@ -134,10 +134,10 @@ func TestCreatePITRCheckpointFromCurrentStateBootstrapsWithoutHistory(t *testing
 		t.Fatal(err)
 	}
 
-	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|a", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "a"}, "v": map[string]any{"S": "1"}}); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table, "S|a", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "a"}, "v": map[string]any{"S": "1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|b", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "b"}, "v": map[string]any{"S": "2"}}); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table, "S|b", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "b"}, "v": map[string]any{"S": "2"}}); err != nil {
 		t.Fatal(err)
 	}
 

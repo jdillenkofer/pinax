@@ -4,7 +4,7 @@ import (
 	"context"
 )
 
-func (r *ttlRepo) GetExpiredItems(ctx context.Context, tableName string, ttlAttr string, before int64, limit int) ([]struct {
+func (r ttlRepo) GetExpiredItems(ctx context.Context, tableName string, ttlAttr string, before int64, limit int) ([]struct {
 	PK string
 	SK string
 }, error) {
@@ -39,7 +39,7 @@ func (r *ttlRepo) GetExpiredItems(ctx context.Context, tableName string, ttlAttr
 	return expired, rows.Err()
 }
 
-func (r *ttlRepo) DeleteExpiredItem(ctx context.Context, tableName, pk, sk string) error {
+func (r ttlRepo) DeleteExpiredItem(ctx context.Context, tableName, pk, sk string) error {
 	_, err := r.tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
@@ -50,7 +50,7 @@ func (r *ttlRepo) DeleteExpiredItem(ctx context.Context, tableName, pk, sk strin
 	return nil
 }
 
-func (r *ttlRepo) DeleteExpiredItems(ctx context.Context, tableName string, before int64, limit int) (int64, error) {
+func (r ttlRepo) DeleteExpiredItems(ctx context.Context, tableName string, before int64, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 100
 	}

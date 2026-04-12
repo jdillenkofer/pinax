@@ -536,7 +536,7 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 			return txErr
 		}
 		changedAt := time.Now().UnixMilli()
-		if txErr := repos.Items().PutItem(txCtx, t.Name, pk, sk, req.Item); txErr != nil {
+		if txErr := repos.Items().PutItem(txCtx, t, pk, sk, req.Item); txErr != nil {
 			return txErr
 		}
 		eventName := "INSERT"
@@ -797,7 +797,7 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 			return txErr
 		}
 		changedAt := time.Now().UnixMilli()
-		if txErr := repos.Items().PutItem(txCtx, t.Name, pk, sk, updated); txErr != nil {
+		if txErr := repos.Items().PutItem(txCtx, t, pk, sk, updated); txErr != nil {
 			return txErr
 		}
 		eventName := "INSERT"

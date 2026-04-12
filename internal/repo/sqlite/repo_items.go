@@ -28,12 +28,7 @@ func (r itemRepo) GetItem(ctx context.Context, tableName, pk, sk string) (map[st
 	return decodeItem(raw)
 }
 
-func (r itemRepo) PutItem(ctx context.Context, tableName, pk, sk string, item map[string]any) error {
-	t, err := r.table().GetTable(ctx, tableName)
-	if err != nil {
-		return err
-	}
-
+func (r itemRepo) PutItem(ctx context.Context, t model.Table, pk, sk string, item map[string]any) error {
 	ttl, hasTTL := model.ExtractTTL(t, item)
 	var ttlVal any
 	if hasTTL {
@@ -49,12 +44,12 @@ func (r itemRepo) PutItem(ctx context.Context, tableName, pk, sk string, item ma
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(table_key, pk, sk)
 		DO UPDATE SET item_json = excluded.item_json, updated_at = excluded.updated_at, ttl = excluded.ttl
-	`, tableName, pk, sk, raw, time.Now().Unix(), ttlVal)
+	`, t.Name, pk, sk, raw, time.Now().Unix(), ttlVal)
 	if err != nil {
 		return err
 	}
 
-	_, err = r.tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND base_pk = ? AND base_sk = ?`, tableName, pk, sk)
+	_, err = r.tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND base_pk = ? AND base_sk = ?`, t.Name, pk, sk)
 	if err != nil {
 		return err
 	}
@@ -67,7 +62,7 @@ func (r itemRepo) PutItem(ctx context.Context, tableName, pk, sk string, item ma
 		_, err = r.tx.ExecContext(ctx, `
 			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`, tableName, gsi.IndexName, gpk, gsk, pk, sk)
+		`, t.Name, gsi.IndexName, gpk, gsk, pk, sk)
 		if err != nil {
 			return err
 		}
@@ -80,7 +75,7 @@ func (r itemRepo) PutItem(ctx context.Context, tableName, pk, sk string, item ma
 		_, err = r.tx.ExecContext(ctx, `
 			INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`, tableName, lsi.IndexName, pk, lsk, pk, sk)
+		`, t.Name, lsi.IndexName, pk, lsk, pk, sk)
 		if err != nil {
 			return err
 		}

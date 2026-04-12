@@ -235,7 +235,7 @@ func (s *Service) RestoreTableToPointInTime(ctx context.Context, input RestoreTa
 			if err != nil {
 				return err
 			}
-			if err := repos.Items().PutItem(txCtx, tableToCreate.Name, pk, sk, item); err != nil {
+			if err := repos.Items().PutItem(txCtx, tableToCreate, pk, sk, item); err != nil {
 				return err
 			}
 			count++

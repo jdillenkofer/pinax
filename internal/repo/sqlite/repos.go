@@ -32,20 +32,12 @@ func NewRepos(backend *Backend, tx *sql.Tx) uow.Repos {
 }
 
 func (f Factory) TTL(tx *sql.Tx) TTLRepo {
-	return &ttlRepo{backend: f.backend, tx: tx}
+	return ttlRepo{sqlTxRepo: sqlTxRepo{backend: f.backend, tx: tx}}
 }
 
 type sqlTxRepo struct {
 	backend *Backend
 	tx      *sql.Tx
-}
-
-func (r sqlTxRepo) table() tableRepo {
-	return tableRepo{sqlTxRepo: r}
-}
-
-func (r sqlTxRepo) item() itemRepo {
-	return itemRepo{sqlTxRepo: r}
 }
 
 type TxRepo struct {
@@ -55,6 +47,20 @@ type TxRepo struct {
 func NewTxRepo(backend *Backend, tx *sql.Tx) TxRepo {
 	return TxRepo{sqlTxRepo: sqlTxRepo{backend: backend, tx: tx}}
 }
+
+func (r TxRepo) Tables() uow.TableRepo   { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) Items() uow.ItemRepo     { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) Streams() uow.StreamRepo { return streamRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) PITR() uow.PITRRepo      { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) Backups() uow.BackupRepo { return backupRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) ResourcePolicies() uow.ResourcePolicyRepo {
+	return resourcePolicyRepo{sqlTxRepo: r.sqlTxRepo}
+}
+
+func (r TxRepo) PITRRepo() pitrRepo   { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) ItemRepo() itemRepo   { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) TableRepo() tableRepo { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
+func (r TxRepo) TTLRepo() ttlRepo     { return ttlRepo{sqlTxRepo: r.sqlTxRepo} }
 
 type txRepos struct {
 	tables   *tableRepo
@@ -109,20 +115,5 @@ type resourcePolicyRepo struct {
 }
 
 type ttlRepo struct {
-	backend *Backend
-	tx      *sql.Tx
+	sqlTxRepo
 }
-
-func (r TxRepo) Tables() uow.TableRepo   { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Items() uow.ItemRepo     { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Streams() uow.StreamRepo { return streamRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) PITR() uow.PITRRepo      { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) Backups() uow.BackupRepo { return backupRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) ResourcePolicies() uow.ResourcePolicyRepo {
-	return resourcePolicyRepo{sqlTxRepo: r.sqlTxRepo}
-}
-
-func (r TxRepo) PITRRepo() pitrRepo   { return pitrRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) ItemRepo() itemRepo   { return itemRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) TableRepo() tableRepo { return tableRepo{sqlTxRepo: r.sqlTxRepo} }
-func (r TxRepo) TTLRepo() *ttlRepo    { return &ttlRepo{backend: r.backend, tx: r.tx} }

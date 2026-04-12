@@ -107,7 +107,7 @@ func TestPutItemDoesNotWritePITRHistoryInline(t *testing.T) {
 		"pk": map[string]any{"S": "a"},
 		"v":  map[string]any{"S": "new"},
 	}
-	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|a", model.NoSortKey, item); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table, "S|a", model.NoSortKey, item); err != nil {
 		t.Fatal(err)
 	}
 

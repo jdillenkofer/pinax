@@ -196,7 +196,7 @@ func (s *Service) BatchWrite(ctx context.Context, input BatchWriteInput) (BatchW
 						result.Unprocessed[tableName] = append(result.Unprocessed[tableName], op.RawRequest)
 						continue
 					}
-					if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, op.PutItem); err != nil {
+					if err := repos.Items().PutItem(txCtx, t, pk, sk, op.PutItem); err != nil {
 						return err
 					}
 					eventName := "INSERT"

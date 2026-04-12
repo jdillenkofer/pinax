@@ -458,7 +458,7 @@ func (s *Server) runPartiQLInsert(ctx context.Context, repos uow.Repos, tableNam
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return partiqlResult{}, err
 	}
-	if err := repos.Items().PutItem(ctx, t.Name, pk, sk, item); err != nil {
+	if err := repos.Items().PutItem(ctx, t, pk, sk, item); err != nil {
 		return partiqlResult{}, err
 	}
 	eventName := "INSERT"
@@ -544,7 +544,7 @@ func (s *Server) runPartiQLUpdate(ctx context.Context, repos uow.Repos, tableNam
 	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
 		return partiqlResult{}, err
 	}
-	if err := repos.Items().PutItem(ctx, t.Name, hashKey, rangeKey, updated); err != nil {
+	if err := repos.Items().PutItem(ctx, t, hashKey, rangeKey, updated); err != nil {
 		return partiqlResult{}, err
 	}
 	eventName := "INSERT"

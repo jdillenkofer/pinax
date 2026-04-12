@@ -169,52 +169,17 @@ func (r tableRepo) DeleteTable(ctx context.Context, name string) error {
 	return nil
 }
 
-func (r tableRepo) BackfillGSIEntries(ctx context.Context, tableName string, gsi model.GlobalSecondaryIndex) error {
-	const backfillPageSize = 500
+func (r tableRepo) DeleteGSIEntries(ctx context.Context, tableKey, indexName string) error {
+	_, err := r.tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND index_name = ?`, tableKey, indexName)
+	return err
+}
 
-	t, err := r.GetTable(ctx, tableName)
-	if err != nil {
-		return err
-	}
-	if _, err := r.tx.ExecContext(ctx, `DELETE FROM secondary_index_entries WHERE table_key = ? AND index_name = ?`, tableName, gsi.IndexName); err != nil {
-		return err
-	}
-
-	startPK := ""
-	startSK := ""
-	for {
-		items, err := r.item().Scan(ctx, tableName, startPK, startSK, backfillPageSize)
-		if err != nil {
-			return err
-		}
-		if len(items) == 0 {
-			break
-		}
-
-		for _, item := range items {
-			pk, sk, err := model.ExtractItemKeys(t, item)
-			if err != nil {
-				return err
-			}
-			startPK, startSK = pk, sk
-
-			gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
-			if !ok {
-				continue
-			}
-			if _, err := r.tx.ExecContext(ctx, `
-				INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`, tableName, gsi.IndexName, gpk, gsk, pk, sk); err != nil {
-				return err
-			}
-		}
-
-		if len(items) < backfillPageSize {
-			break
-		}
-	}
-	return nil
+func (r tableRepo) PutSecondaryIndexEntry(ctx context.Context, tableKey, indexName, indexPK, indexSK, basePK, baseSK string) error {
+	_, err := r.tx.ExecContext(ctx, `
+		INSERT INTO secondary_index_entries(table_key, index_name, index_pk, index_sk, base_pk, base_sk)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, tableKey, indexName, indexPK, indexSK, basePK, baseSK)
+	return err
 }
 
 func (r tableRepo) loadSecondaryIndexes(ctx context.Context, tableName string) ([]model.GlobalSecondaryIndex, []model.LocalSecondaryIndex, error) {

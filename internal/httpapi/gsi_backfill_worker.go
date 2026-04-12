@@ -78,7 +78,7 @@ func (s *Server) backfillTableGSIs(ctx context.Context, tableName string) {
 			if t.GSIs[i].Status != model.IndexStatusCreating {
 				continue
 			}
-			if err := repos.Tables().BackfillGSIEntries(txCtx, t.Name, t.GSIs[i]); err != nil {
+			if err := backfillGSIForTable(txCtx, repos, t, t.GSIs[i]); err != nil {
 				slog.Error("gsi backfill worker failed to backfill index", "table", tableName, "index", t.GSIs[i].IndexName, "err", err)
 				return nil
 			}
@@ -110,4 +110,45 @@ func (s *Server) backfillTableGSIs(ctx context.Context, tableName string) {
 		slog.Error("gsi backfill worker failed to run backfill", "table", tableName, "err", err)
 		return
 	}
+}
+
+const backfillPageSize = 500
+
+func backfillGSIForTable(ctx context.Context, repos uow.Repos, t model.Table, gsi model.GlobalSecondaryIndex) error {
+	if err := repos.Tables().DeleteGSIEntries(ctx, t.Name, gsi.IndexName); err != nil {
+		return err
+	}
+
+	startPK := ""
+	startSK := ""
+	for {
+		items, err := repos.Items().Scan(ctx, t.Name, startPK, startSK, backfillPageSize)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			break
+		}
+
+		for _, item := range items {
+			pk, sk, err := model.ExtractItemKeys(t, item)
+			if err != nil {
+				return err
+			}
+			startPK, startSK = pk, sk
+
+			gpk, gsk, ok := model.ExtractGSIKeys(gsi, item)
+			if !ok {
+				continue
+			}
+			if err := repos.Tables().PutSecondaryIndexEntry(ctx, t.Name, gsi.IndexName, gpk, gsk, pk, sk); err != nil {
+				return err
+			}
+		}
+
+		if len(items) < backfillPageSize {
+			break
+		}
+	}
+	return nil
 }
