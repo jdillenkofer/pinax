@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -20,11 +20,11 @@ func TestAPIServerDoesNotServeMonitoringEndpoints(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	for _, path := range []string{"/health", "/metrics", "/healthz", "/ready", "/readyz"} {
@@ -46,11 +46,10 @@ func TestMonitoringServerEndpoints(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
-	if err != nil {
+	if _, err := sqlite.New(db); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewMonitoringHandler(store))
+	srv := httptest.NewServer(NewMonitoringHandler(db))
 	defer srv.Close()
 
 	for _, path := range []string{"/health", "/metrics"} {
@@ -88,15 +87,14 @@ func TestMonitoringHealthEndpointReturns503WhenDBUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := sqlite.New(db)
-	if err != nil {
+	if _, err := sqlite.New(db); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewMonitoringHandler(store))
+	srv := httptest.NewServer(NewMonitoringHandler(db))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/health")

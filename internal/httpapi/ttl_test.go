@@ -17,7 +17,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	"github.com/jdillenkofer/pinax/internal/ttl"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -31,7 +31,7 @@ func TestTTLUpdateAndDescribe(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ end
 		t.Fatal(err)
 	}
 
-	var h http.Handler = NewServer(store, authorizer)
+	var h http.Handler = newTestServer(backend, authorizer)
 	h = authentication.MakeSignatureMiddleware([]authentication.Credentials{{AccessKeyID: "test", SecretAccessKey: "test"}}, "eu-central-1", h)
 	h = middleware.MakeRequestContextMiddleware(h)
 
@@ -123,12 +123,12 @@ func TestTTLSweeper(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(srv.Close)
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -192,7 +192,7 @@ func TestTTLSweeper(t *testing.T) {
 	}
 
 	// Manual sweep
-	sweeper := ttl.NewSweeper(store, time.Hour, mutation.NewExecutor(mutation.NewPITRHook(store)))
+	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewFactory(backend), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
 	sweeper.RunOnce(ctx)
 
 	// Verify
@@ -227,12 +227,12 @@ func TestTTLDisableTransition(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(srv.Close)
 
 	cfg, err := config.LoadDefaultConfig(ctx,

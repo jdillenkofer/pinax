@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -25,11 +25,11 @@ func TestPutDeleteReturnValuesAllOld(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -100,11 +100,11 @@ func TestUpdateReturnValuesUpdatedNew(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,

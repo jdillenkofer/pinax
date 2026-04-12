@@ -27,7 +27,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authentication"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -40,13 +40,13 @@ func newStreamTestClients(t *testing.T, serverOpts ...ServerOption) (*dynamodb.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defaultOpts := []ServerOption{WithMutationHooks(mutation.DefaultHooks(store)...)}
+	defaultOpts := []ServerOption{WithMutationHooks(mutation.DefaultHooks()...)}
 	allOpts := append(defaultOpts, serverOpts...)
-	srv := httptest.NewServer(NewServer(store, nil, allOpts...))
+	srv := httptest.NewServer(newTestServer(backend, nil, allOpts...))
 
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("eu-central-1"),
@@ -541,11 +541,11 @@ func TestStreamsServiceSignatureAccepted(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var h http.Handler = NewServer(store, nil)
+	var h http.Handler = newTestServer(backend, nil)
 	h = authentication.MakeSignatureMiddleware([]authentication.Credentials{{AccessKeyID: "test", SecretAccessKey: "test"}}, "eu-central-1", h)
 	h = middleware.MakeRequestContextMiddleware(h)
 	srv := httptest.NewServer(h)

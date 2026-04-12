@@ -17,9 +17,9 @@ import (
 	authorizationLua "github.com/jdillenkofer/pinax/internal/httpapi/authorization/lua"
 	"github.com/jdillenkofer/pinax/internal/httpapi/middleware"
 	"github.com/jdillenkofer/pinax/internal/mutation"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
+	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	"github.com/jdillenkofer/pinax/internal/settings"
-	storepkg "github.com/jdillenkofer/pinax/internal/store"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
 	"github.com/jdillenkofer/pinax/internal/ttl"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -64,12 +64,11 @@ func main() {
 	}
 	defer db.Close()
 
-	baseStore, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		slog.Error("could not initialize storage", "err", err)
 		os.Exit(1)
 	}
-	store := storepkg.NewLoggingStore(baseStore)
 
 	requestAuthorizer, err := loadRequestAuthorizer(s.AuthorizerPath(), len(s.Credentials()) > 0, s.TrustForwardedHeaders(), s.TrustedProxyCIDRs())
 	if err != nil {
@@ -77,11 +76,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	txReposFactory := reposqlite.NewFactory(backend)
 	srv := httpapi.NewServer(
-		store,
+		db,
+		txReposFactory,
 		requestAuthorizer,
 		httpapi.WithPITRLatestRestorableLagMillis(s.PITRLatestRestorableLagMillis()),
-		httpapi.WithMutationHooks(mutation.DefaultHooks(store)...),
+		httpapi.WithMutationHooks(mutation.DefaultHooks()...),
 	)
 	go srv.StartGSIBackfillWorker(context.Background(), 200*time.Millisecond)
 
@@ -99,7 +100,7 @@ func main() {
 
 	var sweeper *ttl.Sweeper
 	if s.TTLSweeperEnabled() {
-		sweeper = ttl.NewSweeper(store, s.TTLSweeperInterval(), mutation.NewExecutor(mutation.NewPITRHook(store)))
+		sweeper = ttl.NewSweeper(db, txReposFactory, s.TTLSweeperInterval(), mutation.NewExecutor(mutation.NewPITRHook()))
 		go sweeper.Start(context.Background())
 		slog.Info("TTL sweeper started", "interval", s.TTLSweeperInterval())
 	}
@@ -120,7 +121,7 @@ func main() {
 		monitoringServer := &http.Server{
 			BaseContext:       func(net.Listener) context.Context { return context.Background() },
 			Addr:              monitoringAddr,
-			Handler:           httpapi.NewMonitoringHandler(store),
+			Handler:           httpapi.NewMonitoringHandler(db),
 			ReadHeaderTimeout: readHeaderTimeout,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,

@@ -39,7 +39,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/httpapi/authorization"
 	"github.com/jdillenkofer/pinax/internal/model"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	"github.com/jdillenkofer/pinax/internal/store"
+	reposqlite "github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -105,7 +105,7 @@ var (
 )
 
 type Server struct {
-	store                         store.Store
+	txReposFactory                reposqlite.Factory
 	unitOfWork                    uow.UnitOfWork
 	tableLifecycle                *tableapp.LifecycleService
 	tableService                  *tableapp.Service
@@ -163,11 +163,11 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 	}
 }
 
-func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
+func NewServer(db *sql.DB, txReposFactory reposqlite.Factory, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	tableLifecycle := tableapp.NewLifecycleService()
-	unitOfWork := uow.NewStoreUnitOfWork(store)
+	unitOfWork := reposqlite.NewUnitOfWork(db, txReposFactory)
 	s := &Server{
-		store:                         store,
+		txReposFactory:                txReposFactory,
 		unitOfWork:                    unitOfWork,
 		tableLifecycle:                tableLifecycle,
 		tableService:                  tableapp.NewService(unitOfWork, tableLifecycle),
@@ -312,12 +312,12 @@ func (w *instrumentedResponseWriter) WriteHeader(statusCode int) {
 }
 
 type monitoringHandler struct {
-	store          store.Store
+	db             *sql.DB
 	metricsHandler http.Handler
 }
 
-func NewMonitoringHandler(store store.Store) http.Handler {
-	return &monitoringHandler{store: store, metricsHandler: promhttp.Handler()}
+func NewMonitoringHandler(db *sql.DB) http.Handler {
+	return &monitoringHandler{db: db, metricsHandler: promhttp.Handler()}
 }
 
 func (h *monitoringHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +326,7 @@ func (h *monitoringHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" {
-		if err := h.store.DB().PingContext(r.Context()); err != nil {
+		if err := h.db.PingContext(r.Context()); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("Unhealthy"))
 			return
@@ -3079,7 +3079,7 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 }
 
 func (s *Server) refreshTableLifecycle(ctx context.Context, tx *sql.Tx, t *model.Table) error {
-	repo := sqlTxTableRepo{store: s.store, tx: tx}
+	repo := s.txReposFactory.Build(tx).Tables()
 	if err := s.tableLifecycle.RefreshLifecycle(ctx, repo, t, lifecycleNow()); err != nil {
 		if errors.Is(err, tableapp.ErrTableNotFound) {
 			return sql.ErrNoRows
@@ -3094,7 +3094,7 @@ func (s *Server) getTableWithLifecycle(ctx context.Context, tx *sql.Tx, tableNam
 	if err != nil {
 		return model.Table{}, err
 	}
-	return s.getTableWithLifecycleByKey(ctx, sqlTxTableRepo{store: s.store, tx: tx}, scopedTableName)
+	return s.getTableWithLifecycleByKey(ctx, s.txReposFactory.Build(tx).Tables(), scopedTableName)
 }
 
 func (s *Server) getTableWithLifecycleByKey(ctx context.Context, tables uow.TableRepo, scopedTableName string) (model.Table, error) {
@@ -3137,42 +3137,6 @@ func ensureTableActive(t model.Table) (model.Table, error) {
 		return model.Table{}, awserr.ResourceInUse("Table is currently " + t.Status)
 	}
 	return t, nil
-}
-
-type sqlTxTableRepo struct {
-	store store.Store
-	tx    *sql.Tx
-}
-
-func (r sqlTxTableRepo) CreateTable(ctx context.Context, table model.Table) error {
-	return r.store.CreateTable(ctx, r.tx, table)
-}
-func (r sqlTxTableRepo) GetTable(ctx context.Context, tableKey string) (model.Table, error) {
-	return r.store.GetTable(ctx, r.tx, tableKey)
-}
-func (r sqlTxTableRepo) ListTables(ctx context.Context, start string, limit int) ([]string, error) {
-	return r.store.ListTables(ctx, r.tx, start, limit)
-}
-func (r sqlTxTableRepo) DeleteTable(ctx context.Context, tableKey string) error {
-	return r.store.DeleteTable(ctx, r.tx, tableKey)
-}
-func (r sqlTxTableRepo) BackfillGSIEntries(ctx context.Context, tableKey string, gsi model.GlobalSecondaryIndex) error {
-	return r.store.BackfillGSIEntries(ctx, r.tx, tableKey, gsi)
-}
-func (r sqlTxTableRepo) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
-	return r.store.UpdateTableIndexes(ctx, r.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
-}
-func (r sqlTxTableRepo) UpdateTableBilling(ctx context.Context, tableKey string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
-	return r.store.UpdateTableBilling(ctx, r.tx, tableKey, billingMode, readCapacityUnits, writeCapacityUnits)
-}
-func (r sqlTxTableRepo) UpdateTableOptions(ctx context.Context, tableKey string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
-	return r.store.UpdateTableOptions(ctx, r.tx, tableKey, tableClass, deletionProtection, stream, sse, tags)
-}
-func (r sqlTxTableRepo) UpdateTimeToLive(ctx context.Context, tableKey string, ttl model.TimeToLive) error {
-	return r.store.UpdateTimeToLive(ctx, r.tx, tableKey, ttl)
-}
-func (r sqlTxTableRepo) UpdatePointInTimeRecovery(ctx context.Context, tableKey string, pitr model.PointInTimeRecovery) error {
-	return r.store.UpdatePointInTimeRecovery(ctx, r.tx, tableKey, pitr)
 }
 
 func validateUpdateTablePayload(body []byte) error {

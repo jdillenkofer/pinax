@@ -27,24 +27,25 @@ func TestListItemChangesUpToCursorUsesStableBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo := NewTxRepo(s, tx)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "cursor_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := s.CreateTable(ctx, tx, table); err != nil {
+	if err := repo.CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 1000); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|a", model.NoSortKey, "DELETE", nil, 1001); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "DELETE", nil, 1001); err != nil {
 		t.Fatal(err)
 	}
 
-	cursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, table.Name, 1000)
+	cursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +53,7 @@ func TestListItemChangesUpToCursorUsesStableBoundary(t *testing.T) {
 		t.Fatal("expected cursor to be found")
 	}
 
-	changes, err := s.ListItemChangesUpToCursor(ctx, tx, table.Name, cursor)
+	changes, err := repo.ListItemChangesUpToCursor(ctx, table.Name, cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,14 +85,15 @@ func TestResolveItemChangeCursorAtOrBeforeReturnsNotFoundWhenEmpty(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo := NewTxRepo(s, tx)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "empty_cursor_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := s.CreateTable(ctx, tx, table); err != nil {
+	if err := repo.CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	cursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, table.Name, 1000)
+	cursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestResolveItemChangeCursorAtOrBeforeReturnsNotFoundWhenEmpty(t *testing.T)
 		t.Fatalf("expected no cursor, got %+v", cursor)
 	}
 
-	changes, err := s.ListItemChangesUpToCursor(ctx, tx, table.Name, cursor)
+	changes, err := repo.ListItemChangesUpToCursor(ctx, table.Name, cursor)
 	if err != nil {
 		t.Fatal(err)
 	}

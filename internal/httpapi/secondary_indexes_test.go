@@ -13,7 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -26,11 +26,11 @@ func TestCreateTableWithGSIAndQueryByIndexName(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -106,11 +106,11 @@ func TestQueryGSIKeysOnlyProjectionReturnsOnlyKeys(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -208,11 +208,11 @@ func TestQueryGSIIncludeProjectionReturnsConfiguredNonKeyAttrs(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -317,11 +317,11 @@ func TestQueryLSIKeysOnlyProjectionAndOrdering(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -429,11 +429,11 @@ func TestCreateTableWithInvalidLSIHashKeyFails(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -481,11 +481,11 @@ func TestUpdateTableCreateAndDeleteGSI(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -619,11 +619,11 @@ func TestUpdateTableGSITransitionDelayCanBeConfigured(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewServer(store, nil)
+	h := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go h.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -708,11 +708,11 @@ func TestUpdateTableRejectsUnknownGSIDelete(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -761,11 +761,11 @@ func TestUpdateTableRejectsGSINameCollisionWithExistingLSI(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -822,11 +822,11 @@ func TestUpdateTableRejectsMultipleUpdatesForSameGSI(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -869,11 +869,11 @@ func TestQueryGSIPaginationUsesExclusiveStartKey(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -957,11 +957,11 @@ func TestQueryLSIPaginationUsesExclusiveStartKey(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -1045,11 +1045,11 @@ func TestQueryGSIRejectsConsistentRead(t *testing.T) {
 	}
 	defer db.Close()
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	defer srv.Close()
 
 	cfg, err := config.LoadDefaultConfig(ctx,

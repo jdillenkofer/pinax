@@ -28,27 +28,28 @@ func TestCompactItemChangesBeforeCreatesCheckpointAndPreservesRebuild(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo := NewTxRepo(s, tx)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "checkpoint_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := s.CreateTable(ctx, tx, table); err != nil {
+	if err := repo.CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "a1"}}, 1000); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "a1"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|b", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "b1"}}, 1200); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|b", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "b1"}}, 1200); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|b", model.NoSortKey, "DELETE", nil, 1300); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|b", model.NoSortKey, "DELETE", nil, 1300); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|c", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "c1"}}, 1600); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|c", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "c1"}}, 1600); err != nil {
 		t.Fatal(err)
 	}
 
-	deleted, err := s.CompactItemChangesBefore(ctx, tx, table.Name, 1500)
+	deleted, err := repo.CompactItemChangesBefore(ctx, table.Name, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,11 +57,11 @@ func TestCompactItemChangesBeforeCreatesCheckpointAndPreservesRebuild(t *testing
 		t.Fatalf("expected 3 rows deleted before cutoff, got %d", deleted)
 	}
 
-	boundaryCursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, table.Name, 1500)
+	boundaryCursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkpoint, err := s.GetLatestPITRCheckpointAtOrBefore(ctx, tx, table.Name, 1500)
+	checkpoint, err := repo.GetLatestPITRCheckpointAtOrBefore(ctx, table.Name, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestCompactItemChangesBeforeCreatesCheckpointAndPreservesRebuild(t *testing
 		t.Fatal("expected checkpoint to exist after compaction")
 	}
 
-	boundaryChanges, err := s.ListItemChangesAfterCursorUpToCursor(ctx, tx, table.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, boundaryCursor)
+	boundaryChanges, err := repo.ListItemChangesAfterCursorUpToCursor(ctx, table.Name, model.ItemChangeCursor{Found: checkpoint.Found, ChangedAt: checkpoint.ChangedAt, Sequence: checkpoint.Sequence}, boundaryCursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,15 +85,15 @@ func TestCompactItemChangesBeforeCreatesCheckpointAndPreservesRebuild(t *testing
 		t.Fatalf("expected key S|a to exist at boundary state, got keys=%v", keysOf(boundaryState))
 	}
 
-	laterCursor, err := s.ResolveItemChangeCursorAtOrBefore(ctx, tx, table.Name, 2000)
+	laterCursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	laterCheckpoint, err := s.GetLatestPITRCheckpointAtOrBefore(ctx, tx, table.Name, 2000)
+	laterCheckpoint, err := repo.GetLatestPITRCheckpointAtOrBefore(ctx, table.Name, 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	laterChanges, err := s.ListItemChangesAfterCursorUpToCursor(ctx, tx, table.Name, model.ItemChangeCursor{Found: laterCheckpoint.Found, ChangedAt: laterCheckpoint.ChangedAt, Sequence: laterCheckpoint.Sequence}, laterCursor)
+	laterChanges, err := repo.ListItemChangesAfterCursorUpToCursor(ctx, table.Name, model.ItemChangeCursor{Found: laterCheckpoint.Found, ChangedAt: laterCheckpoint.ChangedAt, Sequence: laterCheckpoint.Sequence}, laterCursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,25 +126,26 @@ func TestCreatePITRCheckpointFromCurrentStateBootstrapsWithoutHistory(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo := NewTxRepo(s, tx)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "bootstrap_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := s.CreateTable(ctx, tx, table); err != nil {
+	if err := repo.CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.PutItem(ctx, tx, table.Name, "S|a", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "a"}, "v": map[string]any{"S": "1"}}); err != nil {
+	if err := repo.PutItem(ctx, table.Name, "S|a", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "a"}, "v": map[string]any{"S": "1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutItem(ctx, tx, table.Name, "S|b", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "b"}, "v": map[string]any{"S": "2"}}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := s.CreatePITRCheckpointFromCurrentState(ctx, tx, table.Name, 5000); err != nil {
+	if err := repo.PutItem(ctx, table.Name, "S|b", model.NoSortKey, map[string]any{"pk": map[string]any{"S": "b"}, "v": map[string]any{"S": "2"}}); err != nil {
 		t.Fatal(err)
 	}
 
-	checkpoint, err := s.GetLatestPITRCheckpointAtOrBefore(ctx, tx, table.Name, 5000)
+	if err := repo.CreatePITRCheckpointFromCurrentState(ctx, table.Name, 5000); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint, err := repo.GetLatestPITRCheckpointAtOrBefore(ctx, table.Name, 5000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,33 +184,34 @@ func TestCompactItemChangesBeforeBuildsNextCheckpointFromPreviousCheckpoint(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo := NewTxRepo(s, tx)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "checkpoint_chain_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := s.CreateTable(ctx, tx, table); err != nil {
+	if err := repo.CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|steady", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "steady"}}, 1000); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|steady", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "steady"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|moving", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "v1"}}, 1100); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := s.CompactItemChangesBefore(ctx, tx, table.Name, 1500); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|moving", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "v1"}}, 1100); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.AppendItemChange(ctx, tx, table.Name, "S|moving", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "v2"}}, 2100); err != nil {
+	if _, err := repo.CompactItemChangesBefore(ctx, table.Name, 1500); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := s.CompactItemChangesBefore(ctx, tx, table.Name, 2500); err != nil {
+	if err := repo.AppendItemChange(ctx, table.Name, "S|moving", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "v2"}}, 2100); err != nil {
 		t.Fatal(err)
 	}
 
-	checkpoint, err := s.GetLatestPITRCheckpointAtOrBefore(ctx, tx, table.Name, 2500)
+	if _, err := repo.CompactItemChangesBefore(ctx, table.Name, 2500); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpoint, err := repo.GetLatestPITRCheckpointAtOrBefore(ctx, table.Name, 2500)
 	if err != nil {
 		t.Fatal(err)
 	}

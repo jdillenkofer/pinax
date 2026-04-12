@@ -23,7 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -121,12 +121,12 @@ func TestConformanceAgainstDynamoDBLocal(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pinaxHandler := NewServer(store, nil)
+	pinaxHandler := newTestServer(backend, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go pinaxHandler.StartGSIBackfillWorker(workerCtx, 25*time.Millisecond)
@@ -166,12 +166,12 @@ func TestOperationErrorParityAgainstDynamoDBLocal(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pinaxSrv := httptest.NewServer(NewServer(store, nil))
+	pinaxSrv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(pinaxSrv.Close)
 
 	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)
@@ -210,12 +210,12 @@ func TestConformanceStressAgainstDynamoDBLocal(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pinaxSrv := httptest.NewServer(NewServer(store, nil))
+	pinaxSrv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(pinaxSrv.Close)
 
 	pinaxClient := mustConformanceClient(ctx, t, pinaxSrv.URL)

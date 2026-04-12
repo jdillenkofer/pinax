@@ -19,7 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -34,14 +34,14 @@ func TestMetricsFailureCountersIncrement(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	apiSrv := httptest.NewServer(NewServer(store, nil))
+	apiSrv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(apiSrv.Close)
-	monitoringSrv := httptest.NewServer(NewMonitoringHandler(store))
+	monitoringSrv := httptest.NewServer(NewMonitoringHandler(db))
 	t.Cleanup(monitoringSrv.Close)
 
 	cfg, err := config.LoadDefaultConfig(ctx,

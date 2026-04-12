@@ -16,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 	"github.com/jdillenkofer/pinax/internal/mutation"
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 	testutils "github.com/jdillenkofer/pinax/internal/testing"
 	"github.com/jdillenkofer/pinax/internal/ttl"
 
@@ -271,12 +271,12 @@ func TestRestoreTableToPointInTimeHonorsTTLDeletes(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil, WithMutationHooks(mutation.DefaultHooks(store)...)))
+	srv := httptest.NewServer(newTestServer(backend, nil, WithMutationHooks(mutation.DefaultHooks()...)))
 	t.Cleanup(srv.Close)
 
 	cfg, err := config.LoadDefaultConfig(ctx,
@@ -334,7 +334,7 @@ func TestRestoreTableToPointInTimeHonorsTTLDeletes(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	sweeper := ttl.NewSweeper(store, time.Hour, mutation.NewExecutor(mutation.NewPITRHook(store)))
+	sweeper := ttl.NewSweeper(backend.DB(), sqlite.NewFactory(backend), time.Hour, mutation.NewExecutor(mutation.NewPITRHook()))
 	sweeper.RunOnce(ctx)
 
 	restoreAfterExpiry := time.Now().UTC()

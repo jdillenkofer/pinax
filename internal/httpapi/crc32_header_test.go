@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jdillenkofer/pinax/internal/store/sqlite"
+	"github.com/jdillenkofer/pinax/internal/repo/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -22,12 +22,12 @@ func TestDynamoResponsesIncludeCRC32Header(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(srv.Close)
 
 	body := `{"TableName":"crc_users","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"BillingMode":"PAY_PER_REQUEST"}`
@@ -55,12 +55,12 @@ func TestDynamoErrorResponsesIncludeCRC32Header(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	store, err := sqlite.New(db)
+	backend, err := sqlite.New(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(NewServer(store, nil))
+	srv := httptest.NewServer(newTestServer(backend, nil))
 	t.Cleanup(srv.Close)
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/", strings.NewReader("{}"))
