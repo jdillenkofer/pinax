@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"database/sql"
-	"errors"
 	"math"
 	"net/http"
 	"regexp"
@@ -188,16 +187,11 @@ func (s *Server) createBackup(r *http.Request, body []byte) (map[string]any, err
 		},
 	)
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, backupapp.ErrTargetTableInUse) {
-			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, backupapp.ErrBackupExists) {
-			return nil, &awserr.APIError{Code: "BackupInUseException", Message: "Backup with the requested name already exists", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, badRequestAPIError("TableNotFoundException", "Cannot do operations on a non-existent table")),
+			mapErr(backupapp.ErrTargetTableInUse, badRequestAPIError("TableInUseException", "A target table with the specified name is either being created or deleted.")),
+			mapErr(backupapp.ErrBackupExists, badRequestAPIError("BackupInUseException", "Backup with the requested name already exists")),
+		)
 	}
 	return map[string]any{"BackupDetails": backupDetailsMap(backup)}, nil
 }
@@ -216,10 +210,9 @@ func (s *Server) describeBackup(r *http.Request, body []byte) (map[string]any, e
 
 	backup, err := s.backupService.DescribeBackup(r.Context(), req.BackupArn)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(sql.ErrNoRows, badRequestAPIError("BackupNotFoundException", "Backup not found for the given BackupARN.")),
+		)
 	}
 	return map[string]any{"BackupDescription": backupDescriptionMap(backup)}, nil
 }
@@ -238,10 +231,9 @@ func (s *Server) deleteBackup(r *http.Request, body []byte) (map[string]any, err
 
 	deleted, err := s.backupService.DeleteBackup(r.Context(), req.BackupArn)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(sql.ErrNoRows, badRequestAPIError("BackupNotFoundException", "Backup not found for the given BackupARN.")),
+		)
 	}
 	return map[string]any{"BackupDescription": backupDescriptionMap(deleted)}, nil
 }
@@ -427,16 +419,11 @@ func (s *Server) restoreTableFromBackup(r *http.Request, body []byte) (map[strin
 		return t, nil
 	})
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &awserr.APIError{Code: "BackupNotFoundException", Message: "Backup not found for the given BackupARN.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, backupapp.ErrTargetTableInUse) {
-			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, backupapp.ErrTargetTableExists) {
-			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(sql.ErrNoRows, badRequestAPIError("BackupNotFoundException", "Backup not found for the given BackupARN.")),
+			mapErr(backupapp.ErrTargetTableInUse, badRequestAPIError("TableInUseException", "A target table with the specified name is either being created or deleted.")),
+			mapErr(backupapp.ErrTargetTableExists, badRequestAPIError("TableAlreadyExistsException", "A target table with the specified name already exists.")),
+		)
 	}
 
 	return map[string]any{"TableDescription": tableToCreate.Description(int64(restoredItems))}, nil
@@ -470,10 +457,9 @@ func (s *Server) updateContinuousBackups(r *http.Request, body []byte) (map[stri
 		DefaultRecoveryWindow: 35,
 	})
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, badRequestAPIError("TableNotFoundException", "Cannot do operations on a non-existent table")),
+		)
 	}
 	return map[string]any{"ContinuousBackupsDescription": pitrapp.ContinuousBackupsDescription(t, nowMs, s.pitrLatestRestorableLagMillis)}, nil
 }
@@ -493,10 +479,9 @@ func (s *Server) describeContinuousBackups(r *http.Request, body []byte) (map[st
 
 	t, nowMs, err := s.pitrService.DescribeContinuousBackups(r.Context(), tableKey, time.Now().UnixMilli())
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, badRequestAPIError("TableNotFoundException", "Cannot do operations on a non-existent table")),
+		)
 	}
 	return map[string]any{"ContinuousBackupsDescription": pitrapp.ContinuousBackupsDescription(t, nowMs, s.pitrLatestRestorableLagMillis)}, nil
 }
@@ -603,22 +588,13 @@ func (s *Server) restoreTableToPointInTime(r *http.Request, body []byte) (map[st
 		return table, nil
 	})
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, &awserr.APIError{Code: "TableNotFoundException", Message: "Cannot do operations on a non-existent table", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, pitrapp.ErrPointInTimeRecoveryUnavailable) {
-			return nil, &awserr.APIError{Code: "PointInTimeRecoveryUnavailableException", Message: "Point in time recovery has not yet been enabled for this source table.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, pitrapp.ErrInvalidRestoreTime) {
-			return nil, &awserr.APIError{Code: "InvalidRestoreTimeException", Message: "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, pitrapp.ErrTargetTableInUse) {
-			return nil, &awserr.APIError{Code: "TableInUseException", Message: "A target table with the specified name is either being created or deleted.", Status: http.StatusBadRequest}
-		}
-		if errors.Is(err, pitrapp.ErrTargetTableExists) {
-			return nil, &awserr.APIError{Code: "TableAlreadyExistsException", Message: "A target table with the specified name already exists.", Status: http.StatusBadRequest}
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, badRequestAPIError("TableNotFoundException", "Cannot do operations on a non-existent table")),
+			mapErr(pitrapp.ErrPointInTimeRecoveryUnavailable, badRequestAPIError("PointInTimeRecoveryUnavailableException", "Point in time recovery has not yet been enabled for this source table.")),
+			mapErr(pitrapp.ErrInvalidRestoreTime, badRequestAPIError("InvalidRestoreTimeException", "RestoreDateTime must be between EarliestRestorableDateTime and LatestRestorableDateTime.")),
+			mapErr(pitrapp.ErrTargetTableInUse, badRequestAPIError("TableInUseException", "A target table with the specified name is either being created or deleted.")),
+			mapErr(pitrapp.ErrTargetTableExists, badRequestAPIError("TableAlreadyExistsException", "A target table with the specified name already exists.")),
+		)
 	}
 
 	return map[string]any{"TableDescription": tableToCreate.Description(count)}, nil

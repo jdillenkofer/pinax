@@ -957,20 +957,7 @@ func (s *Server) updateTable(r *http.Request, body []byte) (map[string]any, erro
 		},
 	})
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, awserr.ResourceNotFound("Cannot do operations on a non-existent table")
-		}
-		var inUseErr *tableapp.TableInUseError
-		if errors.As(err, &inUseErr) {
-			return nil, awserr.ResourceInUse("Table is currently " + inUseErr.Status)
-		}
-		if strings.Contains(err.Error(), "GlobalSecondaryIndexUpdates") || strings.Contains(err.Error(), "index") || strings.Contains(err.Error(), "ProvisionedThroughput") {
-			return nil, awserr.Validation(err.Error())
-		}
-		if strings.Contains(err.Error(), "SSE") || strings.Contains(err.Error(), "TableClass") || strings.Contains(err.Error(), "Stream") || strings.Contains(err.Error(), "DeletionProtection") {
-			return nil, awserr.Validation(err.Error())
-		}
-		return nil, err
+		return nil, mapUpdateTableError(err)
 	}
 
 	return map[string]any{"TableDescription": t.Description(count)}, nil

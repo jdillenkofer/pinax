@@ -944,36 +944,15 @@ func decodePartiQLNextToken(token string) (map[string]any, string, string, error
 
 func batchStatementErrorResponse(statement string, err error) map[string]any {
 	tableName := parseTableNameFromStatement(statement)
-	code := "InternalServerError"
-	message := err.Error()
-	var apiErr *awserr.APIError
-	if errors.As(err, &apiErr) {
-		message = apiErr.Message
-		switch apiErr.Code {
-		case "ValidationException":
-			code = "ValidationError"
-		case "ResourceNotFoundException":
-			code = "ResourceNotFound"
-		case "ConditionalCheckFailedException":
-			code = "ConditionalCheckFailed"
-		case "ProvisionedThroughputExceededException":
-			code = "ProvisionedThroughputExceeded"
-		case "AccessDeniedException":
-			code = "AccessDenied"
-		default:
-			code = "InternalServerError"
-		}
-	}
+	code, message, item := mapPartiQLError(err)
 	out := map[string]any{
 		"Error": map[string]any{
 			"Code":    code,
 			"Message": message,
 		},
 	}
-	if errors.As(err, &apiErr) {
-		if item, ok := apiErr.Details["Item"].(map[string]any); ok && item != nil {
-			out["Error"].(map[string]any)["Item"] = item
-		}
+	if item != nil {
+		out["Error"].(map[string]any)["Item"] = item
 	}
 	if tableName != "" {
 		out["TableName"] = tableName
@@ -1087,31 +1066,6 @@ func transactionCancellationReasons(total int, failedIndex int, err error) []aws
 		reasons = append(reasons, mapPartiQLTransactionReason(err))
 	}
 	return reasons
-}
-
-func mapPartiQLTransactionReason(err error) awserr.CancellationReason {
-	var apiErr *awserr.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.Code {
-		case "ValidationException":
-			return awserr.CancellationReason{Code: "ValidationError", Message: apiErr.Message}
-		case "ConditionalCheckFailedException":
-			reason := awserr.CancellationReason{Code: "ConditionalCheckFailed", Message: apiErr.Message}
-			if item, ok := apiErr.Details["Item"].(map[string]any); ok {
-				reason.Item = item
-			}
-			return reason
-		case "ProvisionedThroughputExceededException":
-			return awserr.CancellationReason{Code: "ProvisionedThroughputExceeded", Message: apiErr.Message}
-		case "ResourceNotFoundException":
-			return awserr.CancellationReason{Code: "ResourceNotFound", Message: apiErr.Message}
-		case "AccessDeniedException":
-			return awserr.CancellationReason{Code: "AccessDenied", Message: apiErr.Message}
-		default:
-			return awserr.CancellationReason{Code: "ValidationError", Message: apiErr.Message}
-		}
-	}
-	return awserr.CancellationReason{Code: "ValidationError", Message: err.Error()}
 }
 
 func minInt(a, b int) int {

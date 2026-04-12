@@ -3,7 +3,6 @@ package httpapi
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -57,13 +56,10 @@ func (s *Server) tagResource(r *http.Request, body []byte) (map[string]any, erro
 	}
 	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
 	if err := s.tableService.TagTable(r.Context(), tableKey, tags, lifecycleNow()); err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, awserr.ResourceNotFound("Requested resource not found")
-		}
-		if errors.Is(err, tableapp.ErrTooManyTags) {
-			return nil, awserr.Validation("Tags can have at most 50 items")
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, awserr.ResourceNotFound("Requested resource not found")),
+			mapErr(tableapp.ErrTooManyTags, awserr.Validation("Tags can have at most 50 items")),
+		)
 	}
 	return map[string]any{}, nil
 }
@@ -93,10 +89,9 @@ func (s *Server) untagResource(r *http.Request, body []byte) (map[string]any, er
 	}
 	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
 	if err := s.tableService.UntagTable(r.Context(), tableKey, keys, lifecycleNow()); err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, awserr.ResourceNotFound("Requested resource not found")
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, awserr.ResourceNotFound("Requested resource not found")),
+		)
 	}
 	return map[string]any{}, nil
 }
@@ -120,10 +115,9 @@ func (s *Server) listTagsOfResource(r *http.Request, body []byte) (map[string]an
 	tableKey := scopedTableKeyFromAccountAndName(accountIDFromContext(r.Context()), tableName)
 	sortedTags, err := s.tableService.ListTableTags(r.Context(), tableKey, lifecycleNow())
 	if err != nil {
-		if errors.Is(err, tableapp.ErrTableNotFound) {
-			return nil, awserr.ResourceNotFound("Requested resource not found")
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(tableapp.ErrTableNotFound, awserr.ResourceNotFound("Requested resource not found")),
+		)
 	}
 	tags := make([]map[string]any, 0, len(sortedTags))
 	start, err := parseListTagsOfResourceStartToken(req.NextToken, len(sortedTags))
@@ -209,13 +203,10 @@ func (s *Server) putResourcePolicy(r *http.Request, body []byte) (map[string]any
 
 	revisionID, err := s.resourcePolicyService.Put(r.Context(), resourceARN, req.Policy, req.ExpectedRevisionID, req.ConfirmRemoveSelfResourceAccess, needsConfirmRemoveSelfResourceAccess)
 	if err != nil {
-		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
-			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
-		}
-		if errors.Is(err, resourcepolicyapp.ErrConfirmRemoveSelfResourceAccessRequired) {
-			return nil, awserr.Validation("This policy contains a statement that may prevent future policy updates for this resource. Set ConfirmRemoveSelfResourceAccess to true to confirm this change")
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(resourcepolicyapp.ErrPolicyNotFound, awserr.PolicyNotFound(policyNotFoundMessage)),
+			mapErr(resourcepolicyapp.ErrConfirmRemoveSelfResourceAccessRequired, awserr.Validation("This policy contains a statement that may prevent future policy updates for this resource. Set ConfirmRemoveSelfResourceAccess to true to confirm this change")),
+		)
 	}
 	return map[string]any{"RevisionId": revisionID}, nil
 }
@@ -243,10 +234,9 @@ func (s *Server) getResourcePolicy(r *http.Request, body []byte) (map[string]any
 	}
 	policy, revisionID, err := s.resourcePolicyService.Get(r.Context(), resourceARN)
 	if err != nil {
-		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
-			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(resourcepolicyapp.ErrPolicyNotFound, awserr.PolicyNotFound(policyNotFoundMessage)),
+		)
 	}
 	return map[string]any{"Policy": policy, "RevisionId": revisionID}, nil
 }
@@ -277,10 +267,9 @@ func (s *Server) deleteResourcePolicy(r *http.Request, body []byte) (map[string]
 	}
 	revisionID, err := s.resourcePolicyService.Delete(r.Context(), resourceARN, req.ExpectedRevisionID)
 	if err != nil {
-		if errors.Is(err, resourcepolicyapp.ErrPolicyNotFound) {
-			return nil, awserr.PolicyNotFound(policyNotFoundMessage)
-		}
-		return nil, err
+		return nil, mapAPIError(err,
+			mapErr(resourcepolicyapp.ErrPolicyNotFound, awserr.PolicyNotFound(policyNotFoundMessage)),
+		)
 	}
 	return map[string]any{"RevisionId": revisionID}, nil
 }
