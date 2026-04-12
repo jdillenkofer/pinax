@@ -101,6 +101,7 @@ var (
 type Server struct {
 	store                         store.Store
 	requestAuthorizer             authorization.RequestAuthorizer
+	mutationHooks                 []MutationHook
 	capMu                         sync.Mutex
 	capacityWindows               map[string]capacityWindow
 	pitrLatestRestorableLagMillis int64
@@ -144,10 +145,18 @@ func WithStreamIteratorSigningKey(key []byte) ServerOption {
 	}
 }
 
+func WithMutationHooks(hooks ...MutationHook) ServerOption {
+	hooksCopy := append([]MutationHook(nil), hooks...)
+	return func(s *Server) {
+		s.mutationHooks = hooksCopy
+	}
+}
+
 func NewServer(store store.Store, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
 	s := &Server{
 		store:                         store,
 		requestAuthorizer:             requestAuthorizer,
+		mutationHooks:                 []MutationHook{newStreamMutationHook(store)},
 		capacityWindows:               map[string]capacityWindow{},
 		pitrLatestRestorableLagMillis: pitrLatestRestorableLagMillisFromEnv(),
 		streamIteratorTTL:             defaultStreamIteratorTTL,
@@ -2840,39 +2849,15 @@ func keyAttributesFromKey(t model.Table, key map[string]any) map[string]any {
 	return keys
 }
 
-func filterStreamImages(viewType string, oldImage, newImage map[string]any) (map[string]any, map[string]any) {
-	switch viewType {
-	case "KEYS_ONLY":
-		return nil, nil
-	case "NEW_IMAGE":
-		return nil, newImage
-	case "OLD_IMAGE":
-		return oldImage, nil
-	case "NEW_AND_OLD_IMAGES":
-		return oldImage, newImage
-	default:
-		return nil, nil
-	}
-}
-
 func (s *Server) appendStreamRecordForMutation(ctx context.Context, tx *sql.Tx, t model.Table, eventName string, keys, oldImage, newImage map[string]any, changedAt int64) error {
-	if !t.Stream.Enabled || strings.TrimSpace(t.Stream.ARN) == "" {
-		return nil
-	}
-	oldView, newView := filterStreamImages(t.Stream.ViewType, oldImage, newImage)
-	if err := s.store.AppendStreamRecord(ctx, tx, model.StreamRecord{
-		StreamARN: t.Stream.ARN,
-		ShardID:   streamDefaultShardID,
+	return s.emitMutationHooks(ctx, tx, MutationEvent{
+		Table:     t,
 		EventName: eventName,
 		Keys:      keys,
-		OldImage:  oldView,
-		NewImage:  newView,
+		OldImage:  oldImage,
+		NewImage:  newImage,
 		ChangedAt: changedAt,
-	}); err != nil {
-		return err
-	}
-	_, err := s.store.DeleteStreamRecordsBefore(ctx, tx, t.Stream.ARN, changedAt-streamRetentionMillis)
-	return err
+	})
 }
 
 type putItemRequest struct {
