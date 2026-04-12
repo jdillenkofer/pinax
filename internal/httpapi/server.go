@@ -25,6 +25,7 @@ import (
 	pitrapp "github.com/jdillenkofer/pinax/internal/app/pitr"
 	queryapp "github.com/jdillenkofer/pinax/internal/app/query"
 	resourcepolicyapp "github.com/jdillenkofer/pinax/internal/app/resourcepolicy"
+	approot "github.com/jdillenkofer/pinax/internal/app/root"
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	transactionapp "github.com/jdillenkofer/pinax/internal/app/transaction"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
@@ -160,16 +161,10 @@ func WithMutationHooks(hooks ...mutation.Hook) ServerOption {
 }
 
 func NewServer(db *sql.DB, txReposFactory reposqlite.Factory, requestAuthorizer authorization.RequestAuthorizer, opts ...ServerOption) *Server {
-	tableLifecycle := tableapp.NewLifecycleService()
 	unitOfWork := reposqlite.NewUnitOfWork(db, txReposFactory)
 	s := &Server{
 		txReposFactory:                txReposFactory,
 		unitOfWork:                    unitOfWork,
-		tableLifecycle:                tableLifecycle,
-		tableService:                  tableapp.NewService(unitOfWork, tableLifecycle),
-		backupService:                 backupapp.NewService(unitOfWork, tableLifecycle),
-		pitrService:                   pitrapp.NewService(unitOfWork, tableLifecycle),
-		resourcePolicyService:         resourcepolicyapp.NewService(unitOfWork, tableLifecycle),
 		requestAuthorizer:             requestAuthorizer,
 		mutationExecutor:              mutation.NewExecutor(),
 		capacityWindows:               map[string]capacityWindow{},
@@ -177,9 +172,15 @@ func NewServer(db *sql.DB, txReposFactory reposqlite.Factory, requestAuthorizer 
 		streamIteratorTTL:             defaultStreamIteratorTTL,
 		streamIteratorSigningKey:      newStreamIteratorSigningKey(),
 	}
-	s.queryService = queryapp.NewService(unitOfWork, s.getActiveTableFromRepo)
-	s.itemOpsService = itemopsapp.NewService(unitOfWork, s.getActiveTableFromRepo)
-	s.transactionService = transactionapp.NewService(unitOfWork, s.getActiveTableFromRepo)
+	services := approot.NewServices(unitOfWork, s.getActiveTableFromRepo)
+	s.tableLifecycle = services.TableLifecycle
+	s.tableService = services.TableService
+	s.queryService = services.QueryService
+	s.itemOpsService = services.ItemOpsService
+	s.transactionService = services.TransactionService
+	s.backupService = services.BackupService
+	s.pitrService = services.PITRService
+	s.resourcePolicyService = services.ResourcePolicyService
 	for _, opt := range opts {
 		opt(s)
 	}
