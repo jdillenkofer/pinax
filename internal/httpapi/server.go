@@ -2594,63 +2594,64 @@ func (s *Server) putItem(r *http.Request, body []byte) (map[string]any, error) {
 	if err := validateReturnValuesOnConditionCheckFailure(req.ReturnValuesOnConditionCheckFailure); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
+	var (
+		t          model.Table
+		current    map[string]any
+		existed    bool
+		writeUnits float64
+	)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
+		}
+		var txErr error
+		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
+		if txErr != nil {
+			return txErr
+		}
+		pk, sk, txErr := model.ExtractItemKeys(t, req.Item)
+		if txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		if txErr := model.ValidateSecondaryIndexKeyTypes(t, req.Item); txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
-	if err != nil {
-		return nil, err
-	}
-	pk, sk, err := model.ExtractItemKeys(t, req.Item)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	if err := model.ValidateSecondaryIndexKeyTypes(t, req.Item); err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-
-	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-	existed := true
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		existed = false
-		current = map[string]any{}
-	}
-	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-	if err != nil {
-		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
-	}
-	if !ok {
-		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
-		return nil, awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
-	}
-	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item))
-	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
-		return nil, err
-	}
-	changedAt := time.Now().UnixMilli()
-
-	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, req.Item); err != nil {
-		return nil, err
-	}
-	eventName := "INSERT"
-	streamOld := current
-	if existed {
-		eventName = "MODIFY"
-	} else {
-		streamOld = nil
-	}
-	if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
+		current, txErr = repos.Items().GetItem(txCtx, t.Name, pk, sk)
+		existed = true
+		if txErr != nil && !errors.Is(txErr, sql.ErrNoRows) {
+			return txErr
+		}
+		if errors.Is(txErr, sql.ErrNoRows) {
+			existed = false
+			current = map[string]any{}
+		}
+		condOK, txErr := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if txErr != nil {
+			return awserr.Validation(conditionExpressionValidationMessage(txErr))
+		}
+		if !condOK {
+			item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
+			return awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
+		}
+		writeUnits = model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(req.Item))
+		if txErr := s.ensureWriteCapacity(t, writeUnits); txErr != nil {
+			return txErr
+		}
+		changedAt := time.Now().UnixMilli()
+		if txErr := repos.Items().PutItem(txCtx, t.Name, pk, sk, req.Item); txErr != nil {
+			return txErr
+		}
+		eventName := "INSERT"
+		streamOld := current
+		if existed {
+			eventName = "MODIFY"
+		} else {
+			streamOld = nil
+		}
+		return s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, req.Item), streamOld, req.Item, changedAt)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -2756,53 +2757,56 @@ func (s *Server) deleteItem(r *http.Request, body []byte) (map[string]any, error
 	if err := validateReturnValuesOnConditionCheckFailure(req.ReturnValuesOnConditionCheckFailure); err != nil {
 		return nil, awserr.Validation(err.Error())
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
-	if err != nil {
-		return nil, err
-	}
-	pk, sk, err := model.ExtractKey(t, req.Key)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-	existed := true
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		existed = false
-		current = map[string]any{}
-	}
-	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-	if err != nil {
-		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
-	}
-	if !ok {
-		item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
-		return nil, awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
-	}
-	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
-		return nil, err
-	}
-	changedAt := time.Now().UnixMilli()
-	if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
-		return nil, err
-	}
-	if existed {
-		if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt); err != nil {
-			return nil, err
+	var (
+		t          model.Table
+		current    map[string]any
+		existed    bool
+		writeUnits float64
+	)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
+		var txErr error
+		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
+		if txErr != nil {
+			return txErr
+		}
+		pk, sk, txErr := model.ExtractKey(t, req.Key)
+		if txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		current, txErr = repos.Items().GetItem(txCtx, t.Name, pk, sk)
+		existed = true
+		if txErr != nil && !errors.Is(txErr, sql.ErrNoRows) {
+			return txErr
+		}
+		if errors.Is(txErr, sql.ErrNoRows) {
+			existed = false
+			current = map[string]any{}
+		}
+		condOK, txErr := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if txErr != nil {
+			return awserr.Validation(conditionExpressionValidationMessage(txErr))
+		}
+		if !condOK {
+			item := itemForConditionFailure(req.ReturnValuesOnConditionCheckFailure, current, existed)
+			return awserr.ConditionalCheckFailedWithItem("The conditional request failed", item)
+		}
+		writeUnits = model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+		if txErr := s.ensureWriteCapacity(t, writeUnits); txErr != nil {
+			return txErr
+		}
+		changedAt := time.Now().UnixMilli()
+		if txErr := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); txErr != nil {
+			return txErr
+		}
+		if existed {
+			return s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromItem(t, current), current, nil, changedAt)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -2838,80 +2842,85 @@ func (s *Server) updateItem(r *http.Request, body []byte) (map[string]any, error
 		return nil, awserr.Validation(err.Error())
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	t, err := s.getActiveTable(r.Context(), tx, req.TableName)
-	if err != nil {
-		return nil, err
-	}
-	pk, sk, err := model.ExtractKey(t, req.Key)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-	oldItem := map[string]any{}
-	itemExisted := true
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			itemExisted = false
-			current = map[string]any{t.HashKey: req.Key[t.HashKey]}
-			if t.RangeKey != "" {
-				current[t.RangeKey] = req.Key[t.RangeKey]
-			}
-		} else {
-			return nil, err
+	var (
+		t           model.Table
+		oldItem     map[string]any
+		updated     map[string]any
+		plan        updatePlan
+		itemExisted bool
+		writeUnits  float64
+	)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-	}
-	if itemExisted {
-		oldItem = cloneItem(current)
-	}
+		var txErr error
+		t, txErr = s.getActiveTableFromRepo(txCtx, repos.Tables(), req.TableName)
+		if txErr != nil {
+			return txErr
+		}
+		pk, sk, txErr := model.ExtractKey(t, req.Key)
+		if txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		current, txErr := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+		oldItem = map[string]any{}
+		itemExisted = true
+		if txErr != nil {
+			if errors.Is(txErr, sql.ErrNoRows) {
+				itemExisted = false
+				current = map[string]any{t.HashKey: req.Key[t.HashKey]}
+				if t.RangeKey != "" {
+					current[t.RangeKey] = req.Key[t.RangeKey]
+				}
+			} else {
+				return txErr
+			}
+		}
+		if itemExisted {
+			oldItem = cloneItem(current)
+		}
 
-	ok, err := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-	if err != nil {
-		return nil, awserr.Validation(conditionExpressionValidationMessage(err))
-	}
-	if !ok {
-		return nil, awserr.ConditionalCheckFailed("The conditional request failed")
-	}
+		condOK, txErr := expr.Evaluate(req.ConditionExpression, current, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if txErr != nil {
+			return awserr.Validation(conditionExpressionValidationMessage(txErr))
+		}
+		if !condOK {
+			return awserr.ConditionalCheckFailed("The conditional request failed")
+		}
 
-	plan, err := parseUpdateExpression(req.UpdateExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	updated, _, err := applyUpdatePlan(current, plan)
-	if err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
-		return nil, awserr.Validation(err.Error())
-	}
-	if model.ItemTooLarge(updated) {
-		return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
-	}
-	writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
-	if err := s.ensureWriteCapacity(t, writeUnits); err != nil {
-		return nil, err
-	}
-	changedAt := time.Now().UnixMilli()
-	if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
-		return nil, err
-	}
-	eventName := "INSERT"
-	streamOld := oldItem
-	if itemExisted {
-		eventName = "MODIFY"
-	} else {
-		streamOld = nil
-	}
-	if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
+		plan, txErr = parseUpdateExpression(req.UpdateExpression, req.ExpressionAttributeNames, req.ExpressionAttributeValues)
+		if txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		updated, _, txErr = applyUpdatePlan(current, plan)
+		if txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		if txErr := model.ValidateSecondaryIndexKeyTypes(t, updated); txErr != nil {
+			return awserr.Validation(txErr.Error())
+		}
+		if model.ItemTooLarge(updated) {
+			return awserr.Validation("Item size has exceeded the maximum allowed size")
+		}
+		writeUnits = model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
+		if txErr := s.ensureWriteCapacity(t, writeUnits); txErr != nil {
+			return txErr
+		}
+		changedAt := time.Now().UnixMilli()
+		if txErr := repos.Items().PutItem(txCtx, t.Name, pk, sk, updated); txErr != nil {
+			return txErr
+		}
+		eventName := "INSERT"
+		streamOld := oldItem
+		if itemExisted {
+			eventName = "MODIFY"
+		} else {
+			streamOld = nil
+		}
+		return s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromKey(t, req.Key), streamOld, updated, changedAt)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -3936,12 +3945,6 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 		return nil, awserr.Validation("BatchWriteItem supports at most 25 operations")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	tableNames := make([]string, 0, len(req.RequestItems))
 	for tableName := range req.RequestItems {
 		tableNames = append(tableNames, tableName)
@@ -3953,151 +3956,155 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 	unprocessed := map[string]any{}
 	writeByTable := map[string]float64{}
 	itemCollectionMetrics := map[string][]map[string]any{}
-
-	for _, tableName := range tableNames {
-		ops := req.RequestItems[tableName]
-		if len(ops) == 0 {
-			return nil, awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-		t, err := s.getActiveTable(r.Context(), tx, tableName)
-		if err != nil {
-			return nil, err
-		}
-
-		seenKeys := map[string]struct{}{}
-		seenItemCollections := map[string]struct{}{}
-		for _, op := range ops {
-			if len(op.PutRequest.Item) == 0 && len(op.DeleteRequest.Key) == 0 {
-				return nil, awserr.Validation("write request must contain either PutRequest or DeleteRequest")
+		for _, tableName := range tableNames {
+			ops := req.RequestItems[tableName]
+			if len(ops) == 0 {
+				return awserr.Validation("BatchWriteItem request for table " + tableName + " must include at least one write request")
 			}
-			if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
-				return nil, awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
-			}
-			if batchWriteProcessLimit > 0 && processed >= batchWriteProcessLimit {
-				if unprocessed[tableName] == nil {
-					unprocessed[tableName] = make([]any, 0)
-				}
-				unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
-				continue
+			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
+			if err != nil {
+				return err
 			}
 
-			if len(op.PutRequest.Item) > 0 {
-				if model.ItemTooLarge(op.PutRequest.Item) {
-					return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
+			seenKeys := map[string]struct{}{}
+			seenItemCollections := map[string]struct{}{}
+			for _, op := range ops {
+				if len(op.PutRequest.Item) == 0 && len(op.DeleteRequest.Key) == 0 {
+					return awserr.Validation("write request must contain either PutRequest or DeleteRequest")
 				}
-				pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
-				if err != nil {
-					return nil, awserr.Validation(err.Error())
+				if len(op.PutRequest.Item) > 0 && len(op.DeleteRequest.Key) > 0 {
+					return awserr.Validation("write request cannot contain both PutRequest and DeleteRequest")
 				}
-				if err := model.ValidateSecondaryIndexKeyTypes(t, op.PutRequest.Item); err != nil {
-					return nil, awserr.Validation(err.Error())
-				}
-				k := tableName + "|" + pk + "|" + sk
-				if _, exists := seenKeys[k]; exists {
-					return nil, awserr.Validation("Provided list of item keys contains duplicates")
-				}
-				seenKeys[k] = struct{}{}
-				current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-				existed := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return nil, err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					existed = false
-					current = map[string]any{}
-				}
-				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
-				if !s.reserveWriteCapacity(t, writeUnits) {
+				if batchWriteProcessLimit > 0 && processed >= batchWriteProcessLimit {
 					if unprocessed[tableName] == nil {
 						unprocessed[tableName] = make([]any, 0)
 					}
 					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
 					continue
 				}
-				if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, op.PutRequest.Item); err != nil {
-					return nil, err
-				}
-				eventName := "INSERT"
-				streamOld := current
-				if existed {
-					eventName = "MODIFY"
-				} else {
-					streamOld = nil
-				}
-				if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
-					return nil, err
-				}
-				writeByTable[tableName] += writeUnits
-				if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
-					hashValue := op.PutRequest.Item[t.HashKey]
-					if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
-						if _, exists := seenItemCollections[keyToken]; !exists {
-							seenItemCollections[keyToken] = struct{}{}
-							itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
-								"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
-								"SizeEstimateRangeGB": []float64{0, 1},
-							})
+
+				if len(op.PutRequest.Item) > 0 {
+					if model.ItemTooLarge(op.PutRequest.Item) {
+						return awserr.Validation("Item size has exceeded the maximum allowed size")
+					}
+					pk, sk, err := model.ExtractItemKeys(t, op.PutRequest.Item)
+					if err != nil {
+						return awserr.Validation(err.Error())
+					}
+					if err := model.ValidateSecondaryIndexKeyTypes(t, op.PutRequest.Item); err != nil {
+						return awserr.Validation(err.Error())
+					}
+					k := tableName + "|" + pk + "|" + sk
+					if _, exists := seenKeys[k]; exists {
+						return awserr.Validation("Provided list of item keys contains duplicates")
+					}
+					seenKeys[k] = struct{}{}
+					current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+					existed := true
+					if err != nil && !errors.Is(err, sql.ErrNoRows) {
+						return err
+					}
+					if errors.Is(err, sql.ErrNoRows) {
+						existed = false
+						current = map[string]any{}
+					}
+					writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(op.PutRequest.Item))
+					if !s.reserveWriteCapacity(t, writeUnits) {
+						if unprocessed[tableName] == nil {
+							unprocessed[tableName] = make([]any, 0)
+						}
+						unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
+						continue
+					}
+					if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, op.PutRequest.Item); err != nil {
+						return err
+					}
+					eventName := "INSERT"
+					streamOld := current
+					if existed {
+						eventName = "MODIFY"
+					} else {
+						streamOld = nil
+					}
+					if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, op.PutRequest.Item), streamOld, op.PutRequest.Item, time.Now().UnixMilli()); err != nil {
+						return err
+					}
+					writeByTable[tableName] += writeUnits
+					if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
+						hashValue := op.PutRequest.Item[t.HashKey]
+						if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
+							if _, exists := seenItemCollections[keyToken]; !exists {
+								seenItemCollections[keyToken] = struct{}{}
+								itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
+									"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
+									"SizeEstimateRangeGB": []float64{0, 1},
+								})
+							}
 						}
 					}
+					processed++
 				}
-				processed++
-			}
-			if len(op.DeleteRequest.Key) > 0 {
-				pk, sk, err := model.ExtractKey(t, op.DeleteRequest.Key)
-				if err != nil {
-					return nil, awserr.Validation(err.Error())
-				}
-				k := tableName + "|" + pk + "|" + sk
-				if _, exists := seenKeys[k]; exists {
-					return nil, awserr.Validation("Provided list of item keys contains duplicates")
-				}
-				seenKeys[k] = struct{}{}
-				current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-				existed := true
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return nil, err
-				}
-				if errors.Is(err, sql.ErrNoRows) {
-					existed = false
-					current = op.DeleteRequest.Key
-				}
-				writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-				if !s.reserveWriteCapacity(t, writeUnits) {
-					if unprocessed[tableName] == nil {
-						unprocessed[tableName] = make([]any, 0)
+				if len(op.DeleteRequest.Key) > 0 {
+					pk, sk, err := model.ExtractKey(t, op.DeleteRequest.Key)
+					if err != nil {
+						return awserr.Validation(err.Error())
 					}
-					unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
-					continue
-				}
-				if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
-					return nil, err
-				}
-				if existed {
-					if len(current) > 0 {
-						if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
-							return nil, err
+					k := tableName + "|" + pk + "|" + sk
+					if _, exists := seenKeys[k]; exists {
+						return awserr.Validation("Provided list of item keys contains duplicates")
+					}
+					seenKeys[k] = struct{}{}
+					current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+					existed := true
+					if err != nil && !errors.Is(err, sql.ErrNoRows) {
+						return err
+					}
+					if errors.Is(err, sql.ErrNoRows) {
+						existed = false
+						current = op.DeleteRequest.Key
+					}
+					writeUnits := model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+					if !s.reserveWriteCapacity(t, writeUnits) {
+						if unprocessed[tableName] == nil {
+							unprocessed[tableName] = make([]any, 0)
+						}
+						unprocessed[tableName] = append(unprocessed[tableName].([]any), op)
+						continue
+					}
+					if err := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); err != nil {
+						return err
+					}
+					if existed {
+						if len(current) > 0 {
+							if err := s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromKey(t, op.DeleteRequest.Key), current, nil, time.Now().UnixMilli()); err != nil {
+								return err
+							}
 						}
 					}
-				}
-				writeByTable[tableName] += writeUnits
-				if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
-					hashValue := op.DeleteRequest.Key[t.HashKey]
-					if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
-						if _, exists := seenItemCollections[keyToken]; !exists {
-							seenItemCollections[keyToken] = struct{}{}
-							itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
-								"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
-								"SizeEstimateRangeGB": []float64{0, 1},
-							})
+					writeByTable[tableName] += writeUnits
+					if itemCollectionMode == "SIZE" && len(t.LSIs) > 0 {
+						hashValue := op.DeleteRequest.Key[t.HashKey]
+						if keyToken, err := model.SerializeKeyValue(hashValue); err == nil {
+							if _, exists := seenItemCollections[keyToken]; !exists {
+								seenItemCollections[keyToken] = struct{}{}
+								itemCollectionMetrics[tableName] = append(itemCollectionMetrics[tableName], map[string]any{
+									"ItemCollectionKey":   map[string]any{t.HashKey: hashValue},
+									"SizeEstimateRangeGB": []float64{0, 1},
+								})
+							}
 						}
 					}
+					processed++
 				}
-				processed++
 			}
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -4242,331 +4249,332 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 	if len(req.TransactItems) > 25 {
 		return nil, awserr.Validation("TransactWriteItems supports at most 25 actions")
 	}
-
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	nowMillis := time.Now().UnixMilli()
-	if strings.TrimSpace(req.ClientRequestToken) != "" {
-		if err := s.store.DeleteExpiredTransactWriteIdempotency(r.Context(), tx, nowMillis); err != nil {
-			return nil, err
+	var response map[string]any
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-		rec, err := s.store.GetTransactWriteIdempotency(r.Context(), tx, req.ClientRequestToken, nowMillis)
-		if err == nil {
+		nowMillis := time.Now().UnixMilli()
+		if strings.TrimSpace(req.ClientRequestToken) != "" {
+			if err := repos.Items().DeleteExpiredTransactWriteIdempotency(txCtx, nowMillis); err != nil {
+				return err
+			}
+			rec, err := repos.Items().GetTransactWriteIdempotency(txCtx, req.ClientRequestToken, nowMillis)
+			if err == nil {
+				hash, err := transactWriteRequestHash(req)
+				if err != nil {
+					return err
+				}
+				if rec.RequestHash != hash {
+					return awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
+				}
+				response = rec.Response
+				return nil
+			}
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+
+		seenTargets := map[string]struct{}{}
+		writeByTable := map[string]float64{}
+
+		for i, txItem := range req.TransactItems {
+			actions := 0
+			if len(txItem.Put.Item) > 0 {
+				actions++
+			}
+			if len(txItem.Delete.Key) > 0 {
+				actions++
+			}
+			if len(txItem.Update.Key) > 0 {
+				actions++
+			}
+			if len(txItem.ConditionCheck.Key) > 0 {
+				actions++
+			}
+			if actions != 1 {
+				return awserr.Validation("TransactItems can only contain one of Check, Put, Update or Delete")
+			}
+
+			if len(txItem.Put.Item) > 0 {
+				if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
+					return awserr.Validation(err.Error())
+				}
+				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Put.TableName)
+				if err != nil {
+					return err
+				}
+				pk, sk, err := model.ExtractItemKeys(t, txItem.Put.Item)
+				if err != nil {
+					return awserr.Validation(err.Error())
+				}
+				target := t.Name + "|" + pk + "|" + sk
+				if _, exists := seenTargets[target]; exists {
+					return awserr.Validation("Transaction request cannot include multiple operations on one item")
+				}
+				seenTargets[target] = struct{}{}
+
+				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+				itemExisted := true
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					itemExisted = false
+					current = map[string]any{}
+				}
+				ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
+				}
+				if !ok {
+					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+						Code:    "ConditionalCheckFailed",
+						Message: "The conditional request failed",
+						Item:    itemForConditionFailure(txItem.Put.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+					})
+					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+				}
+				if model.ItemTooLarge(txItem.Put.Item) {
+					return awserr.Validation("Item size has exceeded the maximum allowed size")
+				}
+				if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				}
+				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, txItem.Put.Item); err != nil {
+					return err
+				}
+				eventName := "INSERT"
+				streamOld := current
+				if itemExisted {
+					eventName = "MODIFY"
+				} else {
+					streamOld = nil
+				}
+				if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
+					return err
+				}
+				writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
+				continue
+			}
+
+			if len(txItem.Delete.Key) > 0 {
+				if err := validateReturnValuesOnConditionCheckFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure); err != nil {
+					return awserr.Validation(err.Error())
+				}
+				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Delete.TableName)
+				if err != nil {
+					return err
+				}
+				pk, sk, err := model.ExtractKey(t, txItem.Delete.Key)
+				if err != nil {
+					return awserr.Validation(err.Error())
+				}
+				target := t.Name + "|" + pk + "|" + sk
+				if _, exists := seenTargets[target]; exists {
+					return awserr.Validation("Transaction request cannot include multiple operations on one item")
+				}
+				seenTargets[target] = struct{}{}
+
+				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+				itemExisted := true
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					itemExisted = false
+					current = map[string]any{}
+				}
+				ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
+				}
+				if !ok {
+					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+						Code:    "ConditionalCheckFailed",
+						Message: "The conditional request failed",
+						Item:    itemForConditionFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+					})
+					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+				}
+				if err := repos.Items().DeleteItem(txCtx, t.Name, pk, sk); err != nil {
+					return err
+				}
+				if itemExisted {
+					if err := s.emitMutationEventForWrite(txCtx, tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
+						return err
+					}
+				}
+				writeByTable[txItem.Delete.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
+				continue
+			}
+
+			if len(txItem.Update.Key) > 0 {
+				if err := validateReturnValuesOnConditionCheckFailure(txItem.Update.ReturnValuesOnConditionCheckFailure); err != nil {
+					return awserr.Validation(err.Error())
+				}
+				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.Update.TableName)
+				if err != nil {
+					return err
+				}
+				pk, sk, err := model.ExtractKey(t, txItem.Update.Key)
+				if err != nil {
+					return awserr.Validation(err.Error())
+				}
+				target := t.Name + "|" + pk + "|" + sk
+				if _, exists := seenTargets[target]; exists {
+					return awserr.Validation("Transaction request cannot include multiple operations on one item")
+				}
+				seenTargets[target] = struct{}{}
+
+				existing, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+				itemExisted := true
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					itemExisted = false
+					existing = map[string]any{}
+				}
+
+				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						current = map[string]any{t.HashKey: txItem.Update.Key[t.HashKey]}
+						if t.RangeKey != "" {
+							current[t.RangeKey] = txItem.Update.Key[t.RangeKey]
+						}
+					} else {
+						return err
+					}
+				}
+				ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
+				}
+				if !ok {
+					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+						Code:    "ConditionalCheckFailed",
+						Message: "The conditional request failed",
+						Item:    itemForConditionFailure(txItem.Update.ReturnValuesOnConditionCheckFailure, existing, itemExisted),
+					})
+					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+				}
+				plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				}
+				updated, _, err := applyUpdatePlan(current, plan)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				}
+				if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, err.Error())
+				}
+				if model.ItemTooLarge(updated) {
+					return awserr.Validation("Item size has exceeded the maximum allowed size")
+				}
+				if err := repos.Items().PutItem(txCtx, t.Name, pk, sk, updated); err != nil {
+					return err
+				}
+				eventName := "INSERT"
+				streamOld := existing
+				if itemExisted {
+					eventName = "MODIFY"
+				} else {
+					streamOld = nil
+				}
+				if err := s.emitMutationEventForWrite(txCtx, tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
+					return err
+				}
+				writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
+				continue
+			}
+
+			if len(txItem.ConditionCheck.Key) > 0 {
+				if err := validateReturnValuesOnConditionCheckFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure); err != nil {
+					return awserr.Validation(err.Error())
+				}
+				t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), txItem.ConditionCheck.TableName)
+				if err != nil {
+					return err
+				}
+				pk, sk, err := model.ExtractKey(t, txItem.ConditionCheck.Key)
+				if err != nil {
+					return awserr.Validation(err.Error())
+				}
+				target := t.Name + "|" + pk + "|" + sk
+				if _, exists := seenTargets[target]; exists {
+					return awserr.Validation("Transaction request cannot include multiple operations on one item")
+				}
+				seenTargets[target] = struct{}{}
+
+				current, err := repos.Items().GetItem(txCtx, t.Name, pk, sk)
+				itemExisted := true
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					itemExisted = false
+					current = map[string]any{}
+				}
+				ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
+				if err != nil {
+					return transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
+				}
+				if !ok {
+					reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
+						Code:    "ConditionalCheckFailed",
+						Message: "The conditional request failed",
+						Item:    itemForConditionFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure, current, itemExisted),
+					})
+					return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
+				}
+				continue
+			}
+
+			return awserr.Validation("each transact item must contain one operation")
+		}
+		for tableName, units := range writeByTable {
+			t, err := s.getActiveTableFromRepo(txCtx, repos.Tables(), tableName)
+			if err != nil {
+				return err
+			}
+			if err := s.ensureWriteCapacity(t, units); err != nil {
+				return err
+			}
+		}
+
+		response = map[string]any{}
+		for tableName, units := range writeByTable {
+			addConsumedCapacity(response, req.ReturnConsumedCapacity, tableName, 0, units)
+		}
+		if strings.TrimSpace(req.ClientRequestToken) != "" {
 			hash, err := transactWriteRequestHash(req)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			if rec.RequestHash != hash {
-				return nil, awserr.IdempotentParameterMismatch("The provided client token is already in use with different parameters")
+			record := model.TransactWriteIdempotencyRecord{
+				Token:       req.ClientRequestToken,
+				RequestHash: hash,
+				Response:    response,
+				CreatedAt:   nowMillis,
+				ExpiresAt:   nowMillis + int64((10*time.Minute)/time.Millisecond),
 			}
-			if err := tx.Commit(); err != nil {
-				return nil, err
+			if err := repos.Items().PutTransactWriteIdempotency(txCtx, record); err != nil {
+				return err
 			}
-			return rec.Response, nil
 		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
-	}
-
-	seenTargets := map[string]struct{}{}
-	writeByTable := map[string]float64{}
-
-	for i, txItem := range req.TransactItems {
-		actions := 0
-		if len(txItem.Put.Item) > 0 {
-			actions++
-		}
-		if len(txItem.Delete.Key) > 0 {
-			actions++
-		}
-		if len(txItem.Update.Key) > 0 {
-			actions++
-		}
-		if len(txItem.ConditionCheck.Key) > 0 {
-			actions++
-		}
-		if actions != 1 {
-			return nil, awserr.Validation("TransactItems can only contain one of Check, Put, Update or Delete")
-		}
-
-		if len(txItem.Put.Item) > 0 {
-			if err := validateReturnValuesOnConditionCheckFailure(txItem.Put.ReturnValuesOnConditionCheckFailure); err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			t, err := s.getActiveTable(r.Context(), tx, txItem.Put.TableName)
-			if err != nil {
-				return nil, err
-			}
-			pk, sk, err := model.ExtractItemKeys(t, txItem.Put.Item)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
-			}
-			seenTargets[target] = struct{}{}
-
-			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-			itemExisted := true
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			if errors.Is(err, sql.ErrNoRows) {
-				itemExisted = false
-				current = map[string]any{}
-			}
-			ok, err := expr.Evaluate(txItem.Put.ConditionExpression, current, txItem.Put.ExpressionAttributeNames, txItem.Put.ExpressionAttributeValues)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-			}
-			if !ok {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "ConditionalCheckFailed",
-					Message: "The conditional request failed",
-					Item:    itemForConditionFailure(txItem.Put.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-			}
-			if model.ItemTooLarge(txItem.Put.Item) {
-				return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
-			}
-			if err := model.ValidateSecondaryIndexKeyTypes(t, txItem.Put.Item); err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-			}
-			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, txItem.Put.Item); err != nil {
-				return nil, err
-			}
-			eventName := "INSERT"
-			streamOld := current
-			if itemExisted {
-				eventName = "MODIFY"
-			} else {
-				streamOld = nil
-			}
-			if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromItem(t, txItem.Put.Item), streamOld, txItem.Put.Item, time.Now().UnixMilli()); err != nil {
-				return nil, err
-			}
-			writeByTable[txItem.Put.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(txItem.Put.Item))
-			continue
-		}
-
-		if len(txItem.Delete.Key) > 0 {
-			if err := validateReturnValuesOnConditionCheckFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure); err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			t, err := s.getActiveTable(r.Context(), tx, txItem.Delete.TableName)
-			if err != nil {
-				return nil, err
-			}
-			pk, sk, err := model.ExtractKey(t, txItem.Delete.Key)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
-			}
-			seenTargets[target] = struct{}{}
-
-			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-			itemExisted := true
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			if errors.Is(err, sql.ErrNoRows) {
-				itemExisted = false
-				current = map[string]any{}
-			}
-			ok, err := expr.Evaluate(txItem.Delete.ConditionExpression, current, txItem.Delete.ExpressionAttributeNames, txItem.Delete.ExpressionAttributeValues)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-			}
-			if !ok {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "ConditionalCheckFailed",
-					Message: "The conditional request failed",
-					Item:    itemForConditionFailure(txItem.Delete.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-			}
-			if err := s.store.DeleteItem(r.Context(), tx, t.Name, pk, sk); err != nil {
-				return nil, err
-			}
-			if itemExisted {
-				if err := s.emitMutationEventForWrite(r.Context(), tx, t, "REMOVE", keyAttributesFromKey(t, txItem.Delete.Key), current, nil, time.Now().UnixMilli()); err != nil {
-					return nil, err
-				}
-			}
-			writeByTable[txItem.Delete.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(current))
-			continue
-		}
-
-		if len(txItem.Update.Key) > 0 {
-			if err := validateReturnValuesOnConditionCheckFailure(txItem.Update.ReturnValuesOnConditionCheckFailure); err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			t, err := s.getActiveTable(r.Context(), tx, txItem.Update.TableName)
-			if err != nil {
-				return nil, err
-			}
-			pk, sk, err := model.ExtractKey(t, txItem.Update.Key)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
-			}
-			seenTargets[target] = struct{}{}
-
-			existing, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-			itemExisted := true
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			if errors.Is(err, sql.ErrNoRows) {
-				itemExisted = false
-				existing = map[string]any{}
-			}
-
-			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					current = map[string]any{t.HashKey: txItem.Update.Key[t.HashKey]}
-					if t.RangeKey != "" {
-						current[t.RangeKey] = txItem.Update.Key[t.RangeKey]
-					}
-				} else {
-					return nil, err
-				}
-			}
-			ok, err := expr.Evaluate(txItem.Update.ConditionExpression, current, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-			}
-			if !ok {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "ConditionalCheckFailed",
-					Message: "The conditional request failed",
-					Item:    itemForConditionFailure(txItem.Update.ReturnValuesOnConditionCheckFailure, existing, itemExisted),
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-			}
-			plan, err := parseUpdateExpression(txItem.Update.UpdateExpression, txItem.Update.ExpressionAttributeNames, txItem.Update.ExpressionAttributeValues)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-			}
-			updated, _, err := applyUpdatePlan(current, plan)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-			}
-			if err := model.ValidateSecondaryIndexKeyTypes(t, updated); err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, err.Error())
-			}
-			if model.ItemTooLarge(updated) {
-				return nil, awserr.Validation("Item size has exceeded the maximum allowed size")
-			}
-			if err := s.store.PutItem(r.Context(), tx, t.Name, pk, sk, updated); err != nil {
-				return nil, err
-			}
-			eventName := "INSERT"
-			streamOld := existing
-			if itemExisted {
-				eventName = "MODIFY"
-			} else {
-				streamOld = nil
-			}
-			if err := s.emitMutationEventForWrite(r.Context(), tx, t, eventName, keyAttributesFromKey(t, txItem.Update.Key), streamOld, updated, time.Now().UnixMilli()); err != nil {
-				return nil, err
-			}
-			writeByTable[txItem.Update.TableName] += model.CalculateWriteCapacityUnits(model.CalculateItemSizeBytes(updated))
-			continue
-		}
-
-		if len(txItem.ConditionCheck.Key) > 0 {
-			if err := validateReturnValuesOnConditionCheckFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure); err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			t, err := s.getActiveTable(r.Context(), tx, txItem.ConditionCheck.TableName)
-			if err != nil {
-				return nil, err
-			}
-			pk, sk, err := model.ExtractKey(t, txItem.ConditionCheck.Key)
-			if err != nil {
-				return nil, awserr.Validation(err.Error())
-			}
-			target := t.Name + "|" + pk + "|" + sk
-			if _, exists := seenTargets[target]; exists {
-				return nil, awserr.Validation("Transaction request cannot include multiple operations on one item")
-			}
-			seenTargets[target] = struct{}{}
-
-			current, err := s.store.GetItem(r.Context(), tx, t.Name, pk, sk)
-			itemExisted := true
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
-			if errors.Is(err, sql.ErrNoRows) {
-				itemExisted = false
-				current = map[string]any{}
-			}
-			ok, err := expr.Evaluate(txItem.ConditionCheck.ConditionExpression, current, txItem.ConditionCheck.ExpressionAttributeNames, txItem.ConditionCheck.ExpressionAttributeValues)
-			if err != nil {
-				return nil, transactionValidationCanceled(len(req.TransactItems), i, conditionExpressionValidationMessage(err))
-			}
-			if !ok {
-				reasons := buildTransactionCancellationReasons(len(req.TransactItems), i, awserr.CancellationReason{
-					Code:    "ConditionalCheckFailed",
-					Message: "The conditional request failed",
-					Item:    itemForConditionFailure(txItem.ConditionCheck.ReturnValuesOnConditionCheckFailure, current, itemExisted),
-				})
-				return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]", reasons)
-			}
-			continue
-		}
-
-		return nil, awserr.Validation("each transact item must contain one operation")
-	}
-	for tableName, units := range writeByTable {
-		t, err := s.getActiveTable(r.Context(), tx, tableName)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.ensureWriteCapacity(t, units); err != nil {
-			return nil, err
-		}
-	}
-
-	resp := map[string]any{}
-	for tableName, units := range writeByTable {
-		addConsumedCapacity(resp, req.ReturnConsumedCapacity, tableName, 0, units)
-	}
-	if strings.TrimSpace(req.ClientRequestToken) != "" {
-		hash, err := transactWriteRequestHash(req)
-		if err != nil {
-			return nil, err
-		}
-		record := model.TransactWriteIdempotencyRecord{
-			Token:       req.ClientRequestToken,
-			RequestHash: hash,
-			Response:    resp,
-			CreatedAt:   nowMillis,
-			ExpiresAt:   nowMillis + int64((10*time.Minute)/time.Millisecond),
-		}
-		if err := s.store.PutTransactWriteIdempotency(r.Context(), tx, record); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	return resp, nil
+	if response == nil {
+		response = map[string]any{}
+	}
+	return response, nil
 }
 
 func transactWriteRequestHash(req transactWriteRequest) (string, error) {

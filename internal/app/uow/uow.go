@@ -24,10 +24,14 @@ type ItemRepo interface {
 	CountItems(ctx context.Context, tableKey string) (int64, error)
 	GetItem(ctx context.Context, tableKey, pk, sk string) (map[string]any, error)
 	PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error
+	DeleteItem(ctx context.Context, tableKey, pk, sk string) error
 	QueryByPK(ctx context.Context, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
 	QueryByGSI(ctx context.Context, tableKey, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error)
 	QueryByPKSK(ctx context.Context, tableKey, pk, sk string) ([]map[string]any, error)
 	Scan(ctx context.Context, tableKey, startPK, startSK string, limit int) ([]map[string]any, error)
+	GetTransactWriteIdempotency(ctx context.Context, token string, now int64) (model.TransactWriteIdempotencyRecord, error)
+	PutTransactWriteIdempotency(ctx context.Context, record model.TransactWriteIdempotencyRecord) error
+	DeleteExpiredTransactWriteIdempotency(ctx context.Context, now int64) error
 }
 
 type PITRRepo interface {
@@ -71,6 +75,14 @@ type storeUnitOfWork struct {
 }
 
 type txStoreContextKey struct{}
+
+func TxFromContext(ctx context.Context) (*sql.Tx, bool) {
+	ambient, ok := ctx.Value(txStoreContextKey{}).(*txStore)
+	if !ok || ambient == nil || ambient.tx == nil {
+		return nil, false
+	}
+	return ambient.tx, true
+}
 
 func NewStoreUnitOfWork(s store.Store) UnitOfWork {
 	return &storeUnitOfWork{store: s}
@@ -133,6 +145,9 @@ func (t *txStore) GetItem(ctx context.Context, tableKey, pk, sk string) (map[str
 func (t *txStore) PutItem(ctx context.Context, tableKey, pk, sk string, item map[string]any) error {
 	return t.store.PutItem(ctx, t.tx, tableKey, pk, sk, item)
 }
+func (t *txStore) DeleteItem(ctx context.Context, tableKey, pk, sk string) error {
+	return t.store.DeleteItem(ctx, t.tx, tableKey, pk, sk)
+}
 func (t *txStore) QueryByPK(ctx context.Context, tableKey, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	return t.store.QueryByPK(ctx, t.tx, tableKey, pk, startSK, scanForward, limit)
 }
@@ -144,6 +159,15 @@ func (t *txStore) QueryByPKSK(ctx context.Context, tableKey, pk, sk string) ([]m
 }
 func (t *txStore) Scan(ctx context.Context, tableKey, startPK, startSK string, limit int) ([]map[string]any, error) {
 	return t.store.Scan(ctx, t.tx, tableKey, startPK, startSK, limit)
+}
+func (t *txStore) GetTransactWriteIdempotency(ctx context.Context, token string, now int64) (model.TransactWriteIdempotencyRecord, error) {
+	return t.store.GetTransactWriteIdempotency(ctx, t.tx, token, now)
+}
+func (t *txStore) PutTransactWriteIdempotency(ctx context.Context, record model.TransactWriteIdempotencyRecord) error {
+	return t.store.PutTransactWriteIdempotency(ctx, t.tx, record)
+}
+func (t *txStore) DeleteExpiredTransactWriteIdempotency(ctx context.Context, now int64) error {
+	return t.store.DeleteExpiredTransactWriteIdempotency(ctx, t.tx, now)
 }
 func (t *txStore) UpdateTableIndexes(ctx context.Context, tableKey string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	return t.store.UpdateTableIndexes(ctx, t.tx, tableKey, tableStatus, tableStatusAt, gsis, lsis)
