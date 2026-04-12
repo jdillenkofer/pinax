@@ -6,7 +6,7 @@ import (
 	"errors"
 )
 
-func (r sqlTxRepo) PutResourcePolicy(ctx context.Context, resourceARN string, policy string, revisionID string, updatedAt int64) error {
+func (r resourcePolicyRepo) PutResourcePolicy(ctx context.Context, resourceARN string, policy string, revisionID string, updatedAt int64) error {
 	_, err := r.tx.ExecContext(ctx, `
 		INSERT INTO resource_policies(resource_arn, policy_json, revision_id, updated_at)
 		VALUES (?, ?, ?, ?)
@@ -18,7 +18,7 @@ func (r sqlTxRepo) PutResourcePolicy(ctx context.Context, resourceARN string, po
 	return err
 }
 
-func (r sqlTxRepo) GetResourcePolicy(ctx context.Context, resourceARN string) (string, string, error) {
+func (r resourcePolicyRepo) GetResourcePolicy(ctx context.Context, resourceARN string) (string, string, error) {
 	var policy string
 	var revisionID string
 	err := r.tx.QueryRowContext(ctx, `SELECT policy_json, revision_id FROM resource_policies WHERE resource_arn = ?`, resourceARN).Scan(&policy, &revisionID)
@@ -28,7 +28,7 @@ func (r sqlTxRepo) GetResourcePolicy(ctx context.Context, resourceARN string) (s
 	return policy, revisionID, nil
 }
 
-func (r sqlTxRepo) DeleteResourcePolicy(ctx context.Context, resourceARN string) (string, bool, error) {
+func (r resourcePolicyRepo) DeleteResourcePolicy(ctx context.Context, resourceARN string) (string, bool, error) {
 	_, revisionID, err := r.GetResourcePolicy(ctx, resourceARN)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

@@ -46,7 +46,7 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 			AttrName: "ttl",
 		},
 	}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 			"pk":  map[string]any{"S": pk},
 			"ttl": map[string]any{"N": "100"},
 		}
-		if err := repo.PutItem(ctx, table.Name, "S|"+pk, model.NoSortKey, item); err != nil {
+		if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|"+pk, model.NoSortKey, item); err != nil {
 			tx.Rollback()
 			t.Fatal(err)
 		}
@@ -67,7 +67,7 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 		"pk":  map[string]any{"S": "valid"},
 		"ttl": map[string]any{"N": "9999999999"},
 	}
-	if err := repo.PutItem(ctx, table.Name, "S|valid", model.NoSortKey, valid); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|valid", model.NoSortKey, valid); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -85,14 +85,14 @@ func TestSweeperDeletesExpiredItemsInBatches(t *testing.T) {
 	defer tx.Rollback()
 	repo = sqlite.NewTxRepo(backend, tx)
 
-	count, err := repo.CountItems(ctx, table.Name)
+	count, err := repo.ItemRepo().CountItems(ctx, table.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
 		t.Fatalf("expected 1 non-expired item after sweep, got %d", count)
 	}
-	if _, err := repo.GetItem(ctx, table.Name, "S|valid", model.NoSortKey); err != nil {
+	if _, err := repo.ItemRepo().GetItem(ctx, table.Name, "S|valid", model.NoSortKey); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -126,17 +126,17 @@ func TestSweeperPrunesPITRHistoryWithoutTTL(t *testing.T) {
 		CreatedAt: 1,
 		PITR:      model.PointInTimeRecovery{Enabled: true, RecoveryPeriodInDays: 1, EnabledAt: nowMs},
 	}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
 
 	oldTs := nowMs - (2 * 24 * 60 * 60 * 1000)
-	if err := repo.AppendItemChange(ctx, table.Name, "S|old", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|old", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
-	if err := repo.AppendItemChange(ctx, table.Name, "S|new", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, nowMs); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|new", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, nowMs); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestSweeperPrunesPITRHistoryWithoutTTL(t *testing.T) {
 	defer tx.Rollback()
 	repo = sqlite.NewTxRepo(backend, tx)
 
-	changes, err := repo.ListItemChangesUpTo(ctx, table.Name, time.Now().UnixMilli())
+	changes, err := repo.PITRRepo().ListItemChangesUpTo(ctx, table.Name, time.Now().UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}

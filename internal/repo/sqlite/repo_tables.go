@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-func (r sqlTxRepo) CreateTable(ctx context.Context, t model.Table) error {
+func (r tableRepo) CreateTable(ctx context.Context, t model.Table) error {
 	ttlEnabled := 0
 	if t.TimeToLive.Enabled {
 		ttlEnabled = 1
@@ -55,7 +55,7 @@ func (r sqlTxRepo) CreateTable(ctx context.Context, t model.Table) error {
 	return nil
 }
 
-func (r sqlTxRepo) GetTable(ctx context.Context, name string) (model.Table, error) {
+func (r tableRepo) GetTable(ctx context.Context, name string) (model.Table, error) {
 	var t model.Table
 	var rangeKey sql.NullString
 	var rangeType sql.NullString
@@ -128,7 +128,7 @@ func (r sqlTxRepo) GetTable(ctx context.Context, name string) (model.Table, erro
 	return t, nil
 }
 
-func (r sqlTxRepo) ListTables(ctx context.Context, start string, limit int) ([]string, error) {
+func (r tableRepo) ListTables(ctx context.Context, start string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -154,7 +154,7 @@ func (r sqlTxRepo) ListTables(ctx context.Context, start string, limit int) ([]s
 	return out, rows.Err()
 }
 
-func (r sqlTxRepo) DeleteTable(ctx context.Context, name string) error {
+func (r tableRepo) DeleteTable(ctx context.Context, name string) error {
 	res, err := r.tx.ExecContext(ctx, `DELETE FROM tables WHERE "key" = ?`, name)
 	if err != nil {
 		return err
@@ -169,7 +169,7 @@ func (r sqlTxRepo) DeleteTable(ctx context.Context, name string) error {
 	return nil
 }
 
-func (r sqlTxRepo) BackfillGSIEntries(ctx context.Context, tableName string, gsi model.GlobalSecondaryIndex) error {
+func (r tableRepo) BackfillGSIEntries(ctx context.Context, tableName string, gsi model.GlobalSecondaryIndex) error {
 	const backfillPageSize = 500
 
 	t, err := r.GetTable(ctx, tableName)
@@ -183,7 +183,7 @@ func (r sqlTxRepo) BackfillGSIEntries(ctx context.Context, tableName string, gsi
 	startPK := ""
 	startSK := ""
 	for {
-		items, err := r.Scan(ctx, tableName, startPK, startSK, backfillPageSize)
+		items, err := r.item().Scan(ctx, tableName, startPK, startSK, backfillPageSize)
 		if err != nil {
 			return err
 		}
@@ -217,7 +217,7 @@ func (r sqlTxRepo) BackfillGSIEntries(ctx context.Context, tableName string, gsi
 	return nil
 }
 
-func (r sqlTxRepo) loadSecondaryIndexes(ctx context.Context, tableName string) ([]model.GlobalSecondaryIndex, []model.LocalSecondaryIndex, error) {
+func (r tableRepo) loadSecondaryIndexes(ctx context.Context, tableName string) ([]model.GlobalSecondaryIndex, []model.LocalSecondaryIndex, error) {
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT index_name, index_type, hash_key, hash_type, range_key, range_type, index_status, index_status_at, read_capacity_units, write_capacity_units, projection_type
 		FROM secondary_indexes
@@ -302,7 +302,7 @@ func (r sqlTxRepo) loadSecondaryIndexes(ctx context.Context, tableName string) (
 	return gsis, lsis, nil
 }
 
-func (r sqlTxRepo) replaceSecondaryIndexes(ctx context.Context, tableName string, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+func (r tableRepo) replaceSecondaryIndexes(ctx context.Context, tableName string, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	existingRows, err := r.tx.QueryContext(ctx, `SELECT index_name FROM secondary_indexes WHERE table_key = ?`, tableName)
 	if err != nil {
 		return err
@@ -381,7 +381,7 @@ func (r sqlTxRepo) replaceSecondaryIndexes(ctx context.Context, tableName string
 	return nil
 }
 
-func (r sqlTxRepo) UpdateTableIndexes(ctx context.Context, tableName string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
+func (r tableRepo) UpdateTableIndexes(ctx context.Context, tableName string, tableStatus string, tableStatusAt int64, gsis []model.GlobalSecondaryIndex, lsis []model.LocalSecondaryIndex) error {
 	if err := r.replaceSecondaryIndexes(ctx, tableName, gsis, lsis); err != nil {
 		return err
 	}
@@ -393,7 +393,7 @@ func (r sqlTxRepo) UpdateTableIndexes(ctx context.Context, tableName string, tab
 	return err
 }
 
-func (r sqlTxRepo) UpdateTableBilling(ctx context.Context, tableName string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
+func (r tableRepo) UpdateTableBilling(ctx context.Context, tableName string, billingMode string, readCapacityUnits, writeCapacityUnits int64) error {
 	_, err := r.tx.ExecContext(ctx, `
 		UPDATE tables
 		SET billing_mode = ?, read_capacity_units = ?, write_capacity_units = ?
@@ -402,7 +402,7 @@ func (r sqlTxRepo) UpdateTableBilling(ctx context.Context, tableName string, bil
 	return err
 }
 
-func (r sqlTxRepo) UpdateTableOptions(ctx context.Context, tableName string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
+func (r tableRepo) UpdateTableOptions(ctx context.Context, tableName string, tableClass string, deletionProtection bool, stream model.StreamSpecification, sse model.SSESpecification, tags []model.Tag) error {
 	deletionProtectionInt := 0
 	if deletionProtection {
 		deletionProtectionInt = 1
@@ -427,7 +427,7 @@ func (r sqlTxRepo) UpdateTableOptions(ctx context.Context, tableName string, tab
 	return err
 }
 
-func (r sqlTxRepo) UpdateTimeToLive(ctx context.Context, tableName string, ttl model.TimeToLive) error {
+func (r tableRepo) UpdateTimeToLive(ctx context.Context, tableName string, ttl model.TimeToLive) error {
 	ttlEnabled := 0
 	if ttl.Enabled {
 		ttlEnabled = 1
@@ -438,7 +438,7 @@ func (r sqlTxRepo) UpdateTimeToLive(ctx context.Context, tableName string, ttl m
 	return err
 }
 
-func (r sqlTxRepo) UpdatePointInTimeRecovery(ctx context.Context, tableName string, pitr model.PointInTimeRecovery) error {
+func (r tableRepo) UpdatePointInTimeRecovery(ctx context.Context, tableName string, pitr model.PointInTimeRecovery) error {
 	pitrEnabled := 0
 	if pitr.Enabled {
 		pitrEnabled = 1

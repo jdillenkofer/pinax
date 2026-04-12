@@ -31,21 +31,21 @@ func TestListItemChangesUpToCursorUsesStableBoundary(t *testing.T) {
 	defer tx.Rollback()
 
 	table := model.Table{Name: "cursor_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 1000); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "DELETE", nil, 1001); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "DELETE", nil, 1001); err != nil {
 		t.Fatal(err)
 	}
 
-	cursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
+	cursor, err := repo.PITRRepo().ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestListItemChangesUpToCursorUsesStableBoundary(t *testing.T) {
 		t.Fatal("expected cursor to be found")
 	}
 
-	changes, err := repo.ListItemChangesUpToCursor(ctx, table.Name, cursor)
+	changes, err := repo.PITRRepo().ListItemChangesUpToCursor(ctx, table.Name, cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,11 +89,11 @@ func TestResolveItemChangeCursorAtOrBeforeReturnsNotFoundWhenEmpty(t *testing.T)
 	defer tx.Rollback()
 
 	table := model.Table{Name: "empty_cursor_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	cursor, err := repo.ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
+	cursor, err := repo.PITRRepo().ResolveItemChangeCursorAtOrBefore(ctx, table.Name, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestResolveItemChangeCursorAtOrBeforeReturnsNotFoundWhenEmpty(t *testing.T)
 		t.Fatalf("expected no cursor, got %+v", cursor)
 	}
 
-	changes, err := repo.ListItemChangesUpToCursor(ctx, table.Name, cursor)
+	changes, err := repo.PITRRepo().ListItemChangesUpToCursor(ctx, table.Name, cursor)
 	if err != nil {
 		t.Fatal(err)
 	}

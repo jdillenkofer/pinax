@@ -11,7 +11,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/model"
 )
 
-func (r sqlTxRepo) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
+func (r streamRepo) AppendStreamRecord(ctx context.Context, record model.StreamRecord) error {
 	keysJSON, err := json.Marshal(record.Keys)
 	if err != nil {
 		return err
@@ -39,7 +39,7 @@ func (r sqlTxRepo) AppendStreamRecord(ctx context.Context, record model.StreamRe
 	return err
 }
 
-func (r sqlTxRepo) ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error) {
+func (r streamRepo) ListStreamRecordsAfterSequence(ctx context.Context, streamARN string, sequence int64, limit int) ([]model.StreamRecord, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -86,7 +86,7 @@ func (r sqlTxRepo) ListStreamRecordsAfterSequence(ctx context.Context, streamARN
 	return out, nil
 }
 
-func (r sqlTxRepo) GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error) {
+func (r streamRepo) GetStreamSequenceBounds(ctx context.Context, streamARN string) (int64, int64, bool, error) {
 	var first int64
 	err := r.tx.QueryRowContext(ctx, `SELECT id FROM stream_records WHERE stream_arn = ? ORDER BY id ASC LIMIT 1`, streamARN).Scan(&first)
 	if err != nil {
@@ -103,7 +103,7 @@ func (r sqlTxRepo) GetStreamSequenceBounds(ctx context.Context, streamARN string
 	return first, last, true, nil
 }
 
-func (r sqlTxRepo) GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error) {
+func (r streamRepo) GetStreamRecordChangedAt(ctx context.Context, streamARN string, sequence int64) (int64, bool, error) {
 	var changedAt int64
 	err := r.tx.QueryRowContext(ctx, `SELECT changed_at FROM stream_records WHERE stream_arn = ? AND id = ?`, streamARN, sequence).Scan(&changedAt)
 	if err != nil {
@@ -115,7 +115,7 @@ func (r sqlTxRepo) GetStreamRecordChangedAt(ctx context.Context, streamARN strin
 	return changedAt, true, nil
 }
 
-func (r sqlTxRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
+func (r streamRepo) DeleteStreamRecordsBefore(ctx context.Context, streamARN string, before int64) (int64, error) {
 	res, err := r.tx.ExecContext(ctx, `DELETE FROM stream_records WHERE stream_arn = ? AND changed_at < ?`, streamARN, before)
 	if err != nil {
 		return 0, err

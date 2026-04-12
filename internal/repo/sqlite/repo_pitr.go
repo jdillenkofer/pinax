@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func (r sqlTxRepo) ListItemChangesUpTo(ctx context.Context, tableName string, upTo int64) ([]model.ItemChange, error) {
+func (r pitrRepo) ListItemChangesUpTo(ctx context.Context, tableName string, upTo int64) ([]model.ItemChange, error) {
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT pk, sk, change_type, item_json, changed_at, id
 		FROM item_history
@@ -44,7 +44,7 @@ func (r sqlTxRepo) ListItemChangesUpTo(ctx context.Context, tableName string, up
 	return out, nil
 }
 
-func (r sqlTxRepo) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableName string, upTo int64) (model.ItemChangeCursor, error) {
+func (r pitrRepo) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableName string, upTo int64) (model.ItemChangeCursor, error) {
 	var cursor model.ItemChangeCursor
 	err := r.tx.QueryRowContext(ctx, `
 		SELECT changed_at, id
@@ -63,7 +63,7 @@ func (r sqlTxRepo) ResolveItemChangeCursorAtOrBefore(ctx context.Context, tableN
 	return cursor, nil
 }
 
-func (r sqlTxRepo) ListItemChangesUpToCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) ([]model.ItemChange, error) {
+func (r pitrRepo) ListItemChangesUpToCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) ([]model.ItemChange, error) {
 	if !cursor.Found {
 		return []model.ItemChange{}, nil
 	}
@@ -100,7 +100,7 @@ func (r sqlTxRepo) ListItemChangesUpToCursor(ctx context.Context, tableName stri
 	return out, nil
 }
 
-func (r sqlTxRepo) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tableName string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error) {
+func (r pitrRepo) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tableName string, after model.ItemChangeCursor, upTo model.ItemChangeCursor) ([]model.ItemChange, error) {
 	if !upTo.Found {
 		return []model.ItemChange{}, nil
 	}
@@ -141,7 +141,7 @@ func (r sqlTxRepo) ListItemChangesAfterCursorUpToCursor(ctx context.Context, tab
 	return out, nil
 }
 
-func (r sqlTxRepo) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableName string, upTo int64) (model.PITRCheckpoint, error) {
+func (r pitrRepo) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableName string, upTo int64) (model.PITRCheckpoint, error) {
 	if upTo <= 0 {
 		return model.PITRCheckpoint{}, nil
 	}
@@ -163,11 +163,11 @@ func (r sqlTxRepo) GetLatestPITRCheckpointAtOrBefore(ctx context.Context, tableN
 	return r.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tableName, cursor)
 }
 
-func (r sqlTxRepo) GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
+func (r pitrRepo) GetLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
 	return r.getLatestPITRCheckpointAtOrBeforeCursor(ctx, tableName, cursor)
 }
 
-func (r sqlTxRepo) CreatePITRCheckpointFromCurrentState(ctx context.Context, tableName string, changedAt int64) error {
+func (r pitrRepo) CreatePITRCheckpointFromCurrentState(ctx context.Context, tableName string, changedAt int64) error {
 	cursor, err := r.ResolveItemChangeCursorAtOrBefore(ctx, tableName, changedAt)
 	if err != nil {
 		return err
@@ -228,7 +228,7 @@ func (r sqlTxRepo) CreatePITRCheckpointFromCurrentState(ctx context.Context, tab
 	return r.insertPITRCheckpoint(ctx, tableName, changedAt, sequence, items)
 }
 
-func (r sqlTxRepo) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
+func (r pitrRepo) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) (model.PITRCheckpoint, error) {
 	if !cursor.Found {
 		return model.PITRCheckpoint{}, nil
 	}
@@ -257,7 +257,7 @@ func (r sqlTxRepo) getLatestPITRCheckpointAtOrBeforeCursor(ctx context.Context, 
 	return checkpoint, nil
 }
 
-func (r sqlTxRepo) listPITRCheckpointItems(ctx context.Context, checkpointID int64) ([]model.PITRCheckpointItem, error) {
+func (r pitrRepo) listPITRCheckpointItems(ctx context.Context, checkpointID int64) ([]model.PITRCheckpointItem, error) {
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT pk, sk, item_json
 		FROM pitr_checkpoint_items
@@ -290,7 +290,7 @@ func (r sqlTxRepo) listPITRCheckpointItems(ctx context.Context, checkpointID int
 	return items, nil
 }
 
-func (r sqlTxRepo) DeleteItemChangesBefore(ctx context.Context, tableName string, before int64) (int64, error) {
+func (r pitrRepo) DeleteItemChangesBefore(ctx context.Context, tableName string, before int64) (int64, error) {
 	res, err := r.tx.ExecContext(ctx, `
 		DELETE FROM item_history
 		WHERE table_key = ? AND changed_at < ?
@@ -305,7 +305,7 @@ func (r sqlTxRepo) DeleteItemChangesBefore(ctx context.Context, tableName string
 	return deleted, nil
 }
 
-func (r sqlTxRepo) CompactItemChangesBefore(ctx context.Context, tableName string, before int64) (int64, error) {
+func (r pitrRepo) CompactItemChangesBefore(ctx context.Context, tableName string, before int64) (int64, error) {
 	if before <= 0 {
 		return 0, nil
 	}
@@ -336,7 +336,7 @@ func (r sqlTxRepo) CompactItemChangesBefore(ctx context.Context, tableName strin
 	return r.DeleteItemChangesBefore(ctx, tableName, before)
 }
 
-func (r sqlTxRepo) createPITRCheckpointForCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) error {
+func (r pitrRepo) createPITRCheckpointForCursor(ctx context.Context, tableName string, cursor model.ItemChangeCursor) error {
 	if !cursor.Found {
 		return nil
 	}
@@ -407,7 +407,7 @@ func (r sqlTxRepo) createPITRCheckpointForCursor(ctx context.Context, tableName 
 	return r.insertPITRCheckpoint(ctx, tableName, cursor.ChangedAt, cursor.Sequence, items)
 }
 
-func (r sqlTxRepo) insertPITRCheckpoint(ctx context.Context, tableName string, changedAt int64, sequence int64, items []model.PITRCheckpointItem) error {
+func (r pitrRepo) insertPITRCheckpoint(ctx context.Context, tableName string, changedAt int64, sequence int64, items []model.PITRCheckpointItem) error {
 	res, err := r.tx.ExecContext(ctx, `
 		INSERT INTO pitr_checkpoints(table_key, changed_at, history_sequence, created_at)
 		VALUES (?, ?, ?, ?)
@@ -437,7 +437,7 @@ func (r sqlTxRepo) insertPITRCheckpoint(ctx context.Context, tableName string, c
 	return nil
 }
 
-func (r sqlTxRepo) pruneItemHistoryByRetention(ctx context.Context, table model.Table, nowMs int64) error {
+func (r pitrRepo) pruneItemHistoryByRetention(ctx context.Context, table model.Table, nowMs int64) error {
 	if !table.PITR.Enabled {
 		return nil
 	}
@@ -453,11 +453,11 @@ func (r sqlTxRepo) pruneItemHistoryByRetention(ctx context.Context, table model.
 	return err
 }
 
-func (r sqlTxRepo) AppendItemChange(ctx context.Context, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+func (r pitrRepo) AppendItemChange(ctx context.Context, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
 	return r.appendItemHistory(ctx, tableName, pk, sk, changeType, item, changedAt)
 }
 
-func (r sqlTxRepo) appendItemHistory(ctx context.Context, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
+func (r pitrRepo) appendItemHistory(ctx context.Context, tableName, pk, sk, changeType string, item map[string]any, changedAt int64) error {
 	var raw any
 	if item != nil {
 		payload, err := json.Marshal(item)

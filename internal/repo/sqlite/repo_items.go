@@ -10,13 +10,13 @@ import (
 	"time"
 )
 
-func (r sqlTxRepo) CountItems(ctx context.Context, tableName string) (int64, error) {
+func (r itemRepo) CountItems(ctx context.Context, tableName string) (int64, error) {
 	var n int64
 	err := r.tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM items WHERE table_key = ?`, tableName).Scan(&n)
 	return n, err
 }
 
-func (r sqlTxRepo) GetItem(ctx context.Context, tableName, pk, sk string) (map[string]any, error) {
+func (r itemRepo) GetItem(ctx context.Context, tableName, pk, sk string) (map[string]any, error) {
 	var raw []byte
 	err := r.tx.QueryRowContext(ctx, `
 		SELECT item_json FROM items
@@ -28,8 +28,8 @@ func (r sqlTxRepo) GetItem(ctx context.Context, tableName, pk, sk string) (map[s
 	return decodeItem(raw)
 }
 
-func (r sqlTxRepo) PutItem(ctx context.Context, tableName, pk, sk string, item map[string]any) error {
-	t, err := r.GetTable(ctx, tableName)
+func (r itemRepo) PutItem(ctx context.Context, tableName, pk, sk string, item map[string]any) error {
+	t, err := r.table().GetTable(ctx, tableName)
 	if err != nil {
 		return err
 	}
@@ -88,7 +88,7 @@ func (r sqlTxRepo) PutItem(ctx context.Context, tableName, pk, sk string, item m
 	return nil
 }
 
-func (r sqlTxRepo) DeleteItem(ctx context.Context, tableName, pk, sk string) error {
+func (r itemRepo) DeleteItem(ctx context.Context, tableName, pk, sk string) error {
 	_, err := r.tx.ExecContext(ctx, `
 		DELETE FROM items WHERE table_key = ? AND pk = ? AND sk = ?
 	`, tableName, pk, sk)
@@ -98,7 +98,7 @@ func (r sqlTxRepo) DeleteItem(ctx context.Context, tableName, pk, sk string) err
 	return nil
 }
 
-func (r sqlTxRepo) QueryByPK(ctx context.Context, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+func (r itemRepo) QueryByPK(ctx context.Context, tableName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	order := "ASC"
 	comp := ">"
 	if !scanForward {
@@ -136,7 +136,7 @@ func (r sqlTxRepo) QueryByPK(ctx context.Context, tableName, pk, startSK string,
 	return items, rows.Err()
 }
 
-func (r sqlTxRepo) QueryByGSI(ctx context.Context, tableName, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
+func (r itemRepo) QueryByGSI(ctx context.Context, tableName, indexName, pk, startSK string, scanForward bool, limit int) ([]map[string]any, error) {
 	order := "ASC"
 	comp := ">"
 	if !scanForward {
@@ -175,7 +175,7 @@ func (r sqlTxRepo) QueryByGSI(ctx context.Context, tableName, indexName, pk, sta
 	return items, rows.Err()
 }
 
-func (r sqlTxRepo) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]map[string]any, error) {
+func (r itemRepo) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([]map[string]any, error) {
 	item, err := r.GetItem(ctx, tableName, pk, sk)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -186,7 +186,7 @@ func (r sqlTxRepo) QueryByPKSK(ctx context.Context, tableName, pk, sk string) ([
 	return []map[string]any{item}, nil
 }
 
-func (r sqlTxRepo) Scan(ctx context.Context, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
+func (r itemRepo) Scan(ctx context.Context, tableName, startPK, startSK string, limit int) ([]map[string]any, error) {
 	q := `
 		SELECT item_json FROM items
 		WHERE table_key = ? AND (pk > ? OR (pk = ? AND sk > ?))
@@ -218,7 +218,7 @@ func (r sqlTxRepo) Scan(ctx context.Context, tableName, startPK, startSK string,
 	return items, rows.Err()
 }
 
-func (r sqlTxRepo) GetTransactWriteIdempotency(ctx context.Context, token string, now int64) (model.TransactWriteIdempotencyRecord, error) {
+func (r itemRepo) GetTransactWriteIdempotency(ctx context.Context, token string, now int64) (model.TransactWriteIdempotencyRecord, error) {
 	var rec model.TransactWriteIdempotencyRecord
 	var responseJSON []byte
 	err := r.tx.QueryRowContext(ctx, `
@@ -235,7 +235,7 @@ func (r sqlTxRepo) GetTransactWriteIdempotency(ctx context.Context, token string
 	return rec, nil
 }
 
-func (r sqlTxRepo) PutTransactWriteIdempotency(ctx context.Context, record model.TransactWriteIdempotencyRecord) error {
+func (r itemRepo) PutTransactWriteIdempotency(ctx context.Context, record model.TransactWriteIdempotencyRecord) error {
 	responseJSON, err := json.Marshal(record.Response)
 	if err != nil {
 		return err
@@ -248,7 +248,7 @@ func (r sqlTxRepo) PutTransactWriteIdempotency(ctx context.Context, record model
 	return err
 }
 
-func (r sqlTxRepo) DeleteExpiredTransactWriteIdempotency(ctx context.Context, now int64) error {
+func (r itemRepo) DeleteExpiredTransactWriteIdempotency(ctx context.Context, now int64) error {
 	_, err := r.tx.ExecContext(ctx, `DELETE FROM transact_write_idempotency WHERE expires_at <= ?`, now)
 	return err
 }

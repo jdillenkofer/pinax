@@ -7,7 +7,7 @@ import (
 	"github.com/jdillenkofer/pinax/internal/model"
 )
 
-func (r sqlTxRepo) CreateBackup(ctx context.Context, backup model.Backup) error {
+func (r backupRepo) CreateBackup(ctx context.Context, backup model.Backup) error {
 	sourceTableDetailsJSON, err := json.Marshal(backup.SourceTableDetails)
 	if err != nil {
 		return err
@@ -55,7 +55,7 @@ func (r sqlTxRepo) CreateBackup(ctx context.Context, backup model.Backup) error 
 	return nil
 }
 
-func (r sqlTxRepo) GetBackup(ctx context.Context, backupARN string) (model.Backup, error) {
+func (r backupRepo) GetBackup(ctx context.Context, backupARN string) (model.Backup, error) {
 	row := r.tx.QueryRowContext(ctx, `
 		SELECT
 			backup_arn,
@@ -85,7 +85,7 @@ func (r sqlTxRepo) GetBackup(ctx context.Context, backupARN string) (model.Backu
 	return backup, nil
 }
 
-func (r sqlTxRepo) GetBackupByName(ctx context.Context, backupName string) (model.Backup, error) {
+func (r backupRepo) GetBackupByName(ctx context.Context, backupName string) (model.Backup, error) {
 	row := r.tx.QueryRowContext(ctx, `
 		SELECT
 			backup_arn,
@@ -115,7 +115,7 @@ func (r sqlTxRepo) GetBackupByName(ctx context.Context, backupName string) (mode
 	return backup, nil
 }
 
-func (r sqlTxRepo) ListBackups(ctx context.Context) ([]model.Backup, error) {
+func (r backupRepo) ListBackups(ctx context.Context) ([]model.Backup, error) {
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT
 			backup_arn,
@@ -151,7 +151,7 @@ func (r sqlTxRepo) ListBackups(ctx context.Context) ([]model.Backup, error) {
 	return out, nil
 }
 
-func (r sqlTxRepo) DeleteBackup(ctx context.Context, backupARN string) error {
+func (r backupRepo) DeleteBackup(ctx context.Context, backupARN string) error {
 	res, err := r.tx.ExecContext(ctx, `DELETE FROM backups WHERE backup_arn = ?`, backupARN)
 	if err != nil {
 		return err
@@ -203,7 +203,7 @@ func scanBackupMetadata(scanner backupScanner) (model.Backup, error) {
 	return backup, nil
 }
 
-func (r sqlTxRepo) loadBackupItems(ctx context.Context, backupARN string) ([]map[string]any, error) {
+func (r backupRepo) loadBackupItems(ctx context.Context, backupARN string) ([]map[string]any, error) {
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT item_json
 		FROM backup_items

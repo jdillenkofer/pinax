@@ -32,21 +32,21 @@ func TestDeleteItemChangesBeforePrunesOlderHistory(t *testing.T) {
 	defer tx.Rollback()
 
 	table := model.Table{Name: "retention_table", HashKey: "pk", HashType: "S", CreatedAt: 1}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "mid"}}, 2000); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "mid"}}, 2000); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 3000); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "new"}}, 3000); err != nil {
 		t.Fatal(err)
 	}
 
-	deleted, err := repo.DeleteItemChangesBefore(ctx, table.Name, 2500)
+	deleted, err := repo.PITRRepo().DeleteItemChangesBefore(ctx, table.Name, 2500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestDeleteItemChangesBeforePrunesOlderHistory(t *testing.T) {
 		t.Fatalf("expected 2 deleted history rows, got %d", deleted)
 	}
 
-	changes, err := repo.ListItemChangesUpTo(ctx, table.Name, 5000)
+	changes, err := repo.PITRRepo().ListItemChangesUpTo(ctx, table.Name, 5000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +94,12 @@ func TestPutItemDoesNotWritePITRHistoryInline(t *testing.T) {
 		CreatedAt: 1,
 		PITR:      model.PointInTimeRecovery{Enabled: true, RecoveryPeriodInDays: 1},
 	}
-	if err := repo.CreateTable(ctx, table); err != nil {
+	if err := repo.TableRepo().CreateTable(ctx, table); err != nil {
 		t.Fatal(err)
 	}
 
 	oldTs := nowMs - (2 * 24 * 60 * 60 * 1000)
-	if err := repo.AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
+	if err := repo.PITRRepo().AppendItemChange(ctx, table.Name, "S|a", model.NoSortKey, "PUT", map[string]any{"v": map[string]any{"S": "old"}}, oldTs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,11 +107,11 @@ func TestPutItemDoesNotWritePITRHistoryInline(t *testing.T) {
 		"pk": map[string]any{"S": "a"},
 		"v":  map[string]any{"S": "new"},
 	}
-	if err := repo.PutItem(ctx, table.Name, "S|a", model.NoSortKey, item); err != nil {
+	if err := repo.ItemRepo().PutItem(ctx, table.Name, "S|a", model.NoSortKey, item); err != nil {
 		t.Fatal(err)
 	}
 
-	changes, err := repo.ListItemChangesUpTo(ctx, table.Name, time.Now().UnixMilli())
+	changes, err := repo.PITRRepo().ListItemChangesUpTo(ctx, table.Name, time.Now().UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
