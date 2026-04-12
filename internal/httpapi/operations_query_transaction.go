@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -122,16 +121,9 @@ func (s *Server) query(r *http.Request, body []byte) (map[string]any, error) {
 		ConsistentRead: req.ConsistentRead,
 	})
 	if err != nil {
-		var unknownIndexErr queryapp.ErrUnknownIndex
-		if errors.As(err, &unknownIndexErr) {
-			return nil, awserr.Validation("unknown index " + strings.TrimSpace(req.IndexName))
-		}
-		var indexNotActiveErr queryapp.ErrIndexNotActive
-		if errors.As(err, &indexNotActiveErr) {
-			return nil, awserr.ResourceInUse("Index " + strings.TrimSpace(req.IndexName) + " is not ACTIVE")
-		}
-		if errors.Is(err, queryapp.ErrConsistentReadOnGSI{}) {
-			return nil, awserr.Validation("ConsistentRead is not supported on global secondary indexes")
+		mapped := mapAppError(err)
+		if mapped != err {
+			return nil, mapped
 		}
 		return nil, err
 	}
@@ -405,9 +397,9 @@ func (s *Server) batchGetItem(r *http.Request, body []byte) (map[string]any, err
 
 	result, err := s.itemOpsService.BatchGet(r.Context(), input)
 	if err != nil {
-		var validationErr itemopsapp.ValidationError
-		if errors.As(err, &validationErr) {
-			return nil, awserr.Validation(validationErr.Message)
+		mapped := mapAppError(err)
+		if mapped != err {
+			return nil, mapped
 		}
 		return nil, err
 	}
@@ -505,9 +497,9 @@ func (s *Server) batchWriteItem(r *http.Request, body []byte) (map[string]any, e
 
 	result, err := s.itemOpsService.BatchWrite(r.Context(), input)
 	if err != nil {
-		var validationErr itemopsapp.ValidationError
-		if errors.As(err, &validationErr) {
-			return nil, awserr.Validation(validationErr.Message)
+		mapped := mapAppError(err)
+		if mapped != err {
+			return nil, mapped
 		}
 		return nil, err
 	}
@@ -576,9 +568,9 @@ func (s *Server) transactGetItems(r *http.Request, body []byte) (map[string]any,
 	}
 	result, err := s.transactionService.TransactGet(r.Context(), input)
 	if err != nil {
-		var validationErr transactionapp.ValidationError
-		if errors.As(err, &validationErr) {
-			return nil, awserr.Validation(validationErr.Message)
+		mapped := mapAppError(err)
+		if mapped != err {
+			return nil, mapped
 		}
 		return nil, err
 	}
@@ -729,9 +721,9 @@ func (s *Server) transactWriteItems(r *http.Request, body []byte) (map[string]an
 
 	result, err := s.transactionService.TransactWrite(r.Context(), input)
 	if err != nil {
-		var validationErr transactionapp.ValidationError
-		if errors.As(err, &validationErr) {
-			return nil, awserr.Validation(validationErr.Message)
+		mapped := mapAppError(err)
+		if mapped != err {
+			return nil, mapped
 		}
 		return nil, err
 	}

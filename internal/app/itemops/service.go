@@ -7,20 +7,13 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/app/apperr"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
 
-type ValidationError struct {
-	Message string
-}
-
-func (e ValidationError) Error() string {
-	return e.Message
-}
-
 func invalid(message string) error {
-	return ValidationError{Message: message}
+	return apperr.Validation(message)
 }
 
 type Service struct {

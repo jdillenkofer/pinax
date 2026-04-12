@@ -2,33 +2,11 @@ package query
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/jdillenkofer/pinax/internal/app/apperr"
 	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
-
-type ErrUnknownIndex struct {
-	IndexName string
-}
-
-func (e ErrUnknownIndex) Error() string {
-	return fmt.Sprintf("unknown index %s", e.IndexName)
-}
-
-type ErrConsistentReadOnGSI struct{}
-
-func (ErrConsistentReadOnGSI) Error() string {
-	return "consistent read on gsi"
-}
-
-type ErrIndexNotActive struct {
-	IndexName string
-}
-
-func (e ErrIndexNotActive) Error() string {
-	return fmt.Sprintf("index %s is not active", e.IndexName)
-}
 
 type Service struct {
 	unitOfWork     uow.UnitOfWork
@@ -80,10 +58,10 @@ func (s *Service) ResolveQueryTarget(ctx context.Context, input ResolveQueryTarg
 	}
 	if gsi, ok := target.Table.GetGSI(input.IndexName); ok {
 		if gsi.Status != "" && gsi.Status != model.IndexStatusActive {
-			return QueryTarget{}, ErrIndexNotActive{IndexName: input.IndexName}
+			return QueryTarget{}, apperr.Conflict("Index " + input.IndexName + " is not ACTIVE")
 		}
 		if input.ConsistentRead {
-			return QueryTarget{}, ErrConsistentReadOnGSI{}
+			return QueryTarget{}, apperr.Validation("ConsistentRead is not supported on global secondary indexes")
 		}
 		target.QueryGSI = &gsi
 		target.TargetHashKey = gsi.HashKey
@@ -100,7 +78,7 @@ func (s *Service) ResolveQueryTarget(ctx context.Context, input ResolveQueryTarg
 		target.TargetRangeType = lsi.RangeType
 		return target, nil
 	}
-	return QueryTarget{}, ErrUnknownIndex{IndexName: input.IndexName}
+	return QueryTarget{}, apperr.Validation("unknown index " + input.IndexName)
 }
 
 type QueryItemsInput struct {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jdillenkofer/pinax/internal/app/apperr"
 	tableapp "github.com/jdillenkofer/pinax/internal/app/table"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/identity"
@@ -117,4 +118,24 @@ func mapPartiQLTransactionReason(err error) awserr.CancellationReason {
 		reason.Item = item
 	}
 	return reason
+}
+
+func mapAppError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) {
+		return err
+	}
+	switch appErr.Kind {
+	case apperr.KindValidation:
+		return awserr.Validation(appErr.Message)
+	case apperr.KindConflict:
+		return awserr.ResourceInUse(appErr.Message)
+	case apperr.KindNotFound:
+		return awserr.ResourceNotFound(appErr.Message)
+	default:
+		return err
+	}
 }
