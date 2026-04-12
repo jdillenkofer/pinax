@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/awserr"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
@@ -118,18 +119,16 @@ func (s *Server) executeStatement(r *http.Request, body []byte) (map[string]any,
 		return nil, awserr.Validation("ReturnValuesOnConditionCheckFailure is not supported for SELECT statements")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	res, err := s.runPartiQLStatement(r.Context(), tx, req.Statement, req.Parameters, req.ConsistentRead, req.Limit, req.NextToken, req.ReturnValuesOnConditionCheckFailure)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
+	var res partiqlResult
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
+		}
+		var err error
+		res, err = s.runPartiQLStatement(txCtx, tx, req.Statement, req.Parameters, req.ConsistentRead, req.Limit, req.NextToken, req.ReturnValuesOnConditionCheckFailure)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 
@@ -156,47 +155,50 @@ func (s *Server) batchExecuteStatement(r *http.Request, body []byte) (map[string
 		return nil, awserr.Validation("BatchExecuteStatement supports at most 25 statements")
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	responses := make([]map[string]any, 0, len(req.Statements))
 	readByTable := map[string]float64{}
 	writeByTable := map[string]float64{}
-	for _, stmt := range req.Statements {
-		if strings.TrimSpace(stmt.Statement) == "" {
-			responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "Statement is required"}})
-			continue
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-		if err := validateReturnValuesOnConditionCheckFailure(stmt.ReturnValuesOnConditionCheckFailure); err != nil {
-			responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": err.Error()}, "TableName": parseTableNameFromStatement(stmt.Statement)})
-			continue
+		for _, stmt := range req.Statements {
+			if strings.TrimSpace(stmt.Statement) == "" {
+				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "Statement is required"}})
+				continue
+			}
+			if err := validateReturnValuesOnConditionCheckFailure(stmt.ReturnValuesOnConditionCheckFailure); err != nil {
+				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": err.Error()}, "TableName": parseTableNameFromStatement(stmt.Statement)})
+				continue
+			}
+			op := partiQLOperation(stmt.Statement)
+			if op == "UNKNOWN" {
+				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "Unsupported PartiQL statement"}, "TableName": parseTableNameFromStatement(stmt.Statement)})
+				continue
+			}
+			if stmt.ConsistentRead && op != "SELECT" {
+				responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "ConsistentRead is only supported for SELECT statements"}, "TableName": parseTableNameFromStatement(stmt.Statement)})
+				continue
+			}
+			res, err := s.runPartiQLStatement(txCtx, tx, stmt.Statement, stmt.Parameters, stmt.ConsistentRead, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
+			if err != nil {
+				responses = append(responses, batchStatementErrorResponse(stmt.Statement, err))
+				continue
+			}
+			entry := map[string]any{}
+			if len(res.Items) > 0 {
+				entry["Item"] = res.Items[0]
+			}
+			responses = append(responses, entry)
+			if res.TableName != "" {
+				readByTable[res.TableName] += res.ReadUnits
+				writeByTable[res.TableName] += res.WriteUnits
+			}
 		}
-		op := partiQLOperation(stmt.Statement)
-		if op == "UNKNOWN" {
-			responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "Unsupported PartiQL statement"}, "TableName": parseTableNameFromStatement(stmt.Statement)})
-			continue
-		}
-		if stmt.ConsistentRead && op != "SELECT" {
-			responses = append(responses, map[string]any{"Error": map[string]any{"Code": "ValidationError", "Message": "ConsistentRead is only supported for SELECT statements"}, "TableName": parseTableNameFromStatement(stmt.Statement)})
-			continue
-		}
-		res, err := s.runPartiQLStatement(r.Context(), tx, stmt.Statement, stmt.Parameters, stmt.ConsistentRead, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
-		if err != nil {
-			responses = append(responses, batchStatementErrorResponse(stmt.Statement, err))
-			continue
-		}
-		entry := map[string]any{}
-		if len(res.Items) > 0 {
-			entry["Item"] = res.Items[0]
-		}
-		responses = append(responses, entry)
-		if res.TableName != "" {
-			readByTable[res.TableName] += res.ReadUnits
-			writeByTable[res.TableName] += res.WriteUnits
-		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	resp := map[string]any{"Responses": responses}
@@ -239,44 +241,42 @@ func (s *Server) executeTransaction(r *http.Request, body []byte) (map[string]an
 		}
 	}
 
-	tx, err := s.store.DB().BeginTx(r.Context(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	responses := make([]map[string]any, 0, len(req.TransactStatements))
 	readByTable := map[string]float64{}
 	writeByTable := map[string]float64{}
 	nowMillis := time.Now().UnixMilli()
-
-	for idx, stmt := range req.TransactStatements {
-		if err := validateReturnValuesOnConditionCheckFailure(stmt.ReturnValuesOnConditionCheckFailure); err != nil {
-			reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation(err.Error()))
-			return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]", reasons)
+	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return fmt.Errorf("missing transaction in unit of work context")
 		}
-		op := partiQLOperation(stmt.Statement)
-		if op == "UNKNOWN" {
-			reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation("Unsupported PartiQL statement"))
-			return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
+		for idx, stmt := range req.TransactStatements {
+			if err := validateReturnValuesOnConditionCheckFailure(stmt.ReturnValuesOnConditionCheckFailure); err != nil {
+				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation(err.Error()))
+				return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]", reasons)
+			}
+			op := partiQLOperation(stmt.Statement)
+			if op == "UNKNOWN" {
+				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, awserr.Validation("Unsupported PartiQL statement"))
+				return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
+			}
+			res, err := s.runPartiQLStatement(txCtx, tx, stmt.Statement, stmt.Parameters, false, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
+			if err != nil {
+				reasons := transactionCancellationReasons(len(req.TransactStatements), idx, err)
+				return awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
+			}
+			entry := map[string]any{}
+			if len(res.Items) > 0 {
+				entry["Item"] = res.Items[0]
+			}
+			responses = append(responses, entry)
+			if res.TableName != "" {
+				readByTable[res.TableName] += res.ReadUnits
+				writeByTable[res.TableName] += res.WriteUnits
+			}
 		}
-		res, err := s.runPartiQLStatement(r.Context(), tx, stmt.Statement, stmt.Parameters, false, 0, "", stmt.ReturnValuesOnConditionCheckFailure)
-		if err != nil {
-			reasons := transactionCancellationReasons(len(req.TransactStatements), idx, err)
-			return nil, awserr.TransactionCanceled("Transaction cancelled, please refer cancellation reasons for specific reasons [None]", reasons)
-		}
-		entry := map[string]any{}
-		if len(res.Items) > 0 {
-			entry["Item"] = res.Items[0]
-		}
-		responses = append(responses, entry)
-		if res.TableName != "" {
-			readByTable[res.TableName] += res.ReadUnits
-			writeByTable[res.TableName] += res.WriteUnits
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	resp := map[string]any{"Responses": responses}
@@ -293,9 +293,6 @@ func (s *Server) executeTransaction(r *http.Request, body []byte) (map[string]an
 		if err := s.storeExecuteTransactionIdempotency(r.Context(), req, resp, nowMillis); err != nil {
 			return nil, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
 	}
 	return resp, nil
 }
@@ -1036,24 +1033,28 @@ func (s *Server) lookupExecuteTransactionIdempotency(ctx context.Context, req ex
 	if err != nil {
 		return nil, false, err
 	}
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
+	nowMillis := time.Now().UnixMilli()
+	var rec model.TransactWriteIdempotencyRecord
+	found := false
+	if err := s.unitOfWork.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		var err error
+		rec, err = repos.Items().GetTransactWriteIdempotency(txCtx, req.ClientRequestToken, nowMillis)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		found = true
+		return nil
+	}); err != nil {
 		return nil, false, err
 	}
-	defer tx.Rollback()
-	nowMillis := time.Now().UnixMilli()
-	rec, err := s.store.GetTransactWriteIdempotency(ctx, tx, req.ClientRequestToken, nowMillis)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, false, nil
-		}
-		return nil, false, err
+	if !found {
+		return nil, false, nil
 	}
 	if rec.RequestHash != hash {
 		return nil, true, nil
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
 	}
 	if rec.Response == nil {
 		return map[string]any{}, false, nil
@@ -1066,11 +1067,6 @@ func (s *Server) storeExecuteTransactionIdempotency(ctx context.Context, req exe
 	if err != nil {
 		return err
 	}
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	record := model.TransactWriteIdempotencyRecord{
 		Token:       req.ClientRequestToken,
 		RequestHash: hash,
@@ -1078,10 +1074,9 @@ func (s *Server) storeExecuteTransactionIdempotency(ctx context.Context, req exe
 		CreatedAt:   nowMillis,
 		ExpiresAt:   nowMillis + int64((10*time.Minute)/time.Millisecond),
 	}
-	if err := s.store.PutTransactWriteIdempotency(ctx, tx, record); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.unitOfWork.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		return repos.Items().PutTransactWriteIdempotency(txCtx, record)
+	})
 }
 
 func executeTransactionRequestHash(req executeTransactionRequest) (string, error) {

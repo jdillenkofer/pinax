@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jdillenkofer/pinax/internal/app/uow"
 	"github.com/jdillenkofer/pinax/internal/model"
 )
 
@@ -51,71 +52,67 @@ func (s *Server) runGSIBackfillOnce(ctx context.Context) {
 }
 
 func (s *Server) listTablesPageForBackfill(ctx context.Context, start string) ([]string, error) {
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	tables, err := s.store.ListTables(ctx, tx, start, gsiBackfillTablePageSize)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
+	var tables []string
+	if err := s.unitOfWork.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		var err error
+		tables, err = repos.Tables().ListTables(txCtx, start, gsiBackfillTablePageSize)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	return tables, nil
 }
 
 func (s *Server) backfillTableGSIs(ctx context.Context, tableName string) {
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		slog.Error("gsi backfill worker failed to start transaction", "table", tableName, "err", err)
-		return
-	}
-	defer tx.Rollback()
+	if err := s.unitOfWork.Do(ctx, func(txCtx context.Context, repos uow.Repos) error {
+		tx, ok := uow.TxFromContext(txCtx)
+		if !ok {
+			return errors.New("missing transaction in unit of work context")
+		}
 
-	t, err := s.store.GetTable(ctx, tx, tableName)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			slog.Error("gsi backfill worker failed to load table", "table", tableName, "err", err)
+		t, err := repos.Tables().GetTable(txCtx, tableName)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				slog.Error("gsi backfill worker failed to load table", "table", tableName, "err", err)
+			}
+			return nil
 		}
-		return
-	}
 
-	updated := false
-	for i := range t.GSIs {
-		if t.GSIs[i].Status != model.IndexStatusCreating {
-			continue
+		updated := false
+		for i := range t.GSIs {
+			if t.GSIs[i].Status != model.IndexStatusCreating {
+				continue
+			}
+			if err := s.store.BackfillGSIEntries(txCtx, tx, t.Name, t.GSIs[i]); err != nil {
+				slog.Error("gsi backfill worker failed to backfill index", "table", tableName, "index", t.GSIs[i].IndexName, "err", err)
+				return nil
+			}
+			t.GSIs[i].Status = model.IndexStatusActive
+			t.GSIs[i].StatusAt = 0
+			updated = true
 		}
-		if err := s.store.BackfillGSIEntries(ctx, tx, t.Name, t.GSIs[i]); err != nil {
-			slog.Error("gsi backfill worker failed to backfill index", "table", tableName, "index", t.GSIs[i].IndexName, "err", err)
-			return
-		}
-		t.GSIs[i].Status = model.IndexStatusActive
-		t.GSIs[i].StatusAt = 0
-		updated = true
-	}
 
-	if !updated {
-		return
-	}
-	tableStatus := model.TableStatusActive
-	for _, g := range t.GSIs {
-		if g.Status == model.IndexStatusCreating || g.Status == model.IndexStatusDeleting {
-			tableStatus = model.TableStatusUpdating
-			break
+		if !updated {
+			return nil
 		}
-	}
-	tableStatusAt := int64(0)
-	if tableStatus == model.TableStatusUpdating {
-		tableStatusAt = t.StatusAt
-	}
-	if err := s.store.UpdateTableIndexes(ctx, tx, t.Name, tableStatus, tableStatusAt, t.GSIs, t.LSIs); err != nil {
-		slog.Error("gsi backfill worker failed to persist table index status", "table", tableName, "err", err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		slog.Error("gsi backfill worker failed to commit backfill", "table", tableName, "err", err)
+		tableStatus := model.TableStatusActive
+		for _, g := range t.GSIs {
+			if g.Status == model.IndexStatusCreating || g.Status == model.IndexStatusDeleting {
+				tableStatus = model.TableStatusUpdating
+				break
+			}
+		}
+		tableStatusAt := int64(0)
+		if tableStatus == model.TableStatusUpdating {
+			tableStatusAt = t.StatusAt
+		}
+		if err := repos.Tables().UpdateTableIndexes(txCtx, t.Name, tableStatus, tableStatusAt, t.GSIs, t.LSIs); err != nil {
+			slog.Error("gsi backfill worker failed to persist table index status", "table", tableName, "err", err)
+			return nil
+		}
+		return nil
+	}); err != nil {
+		slog.Error("gsi backfill worker failed to run backfill", "table", tableName, "err", err)
 		return
 	}
 }
