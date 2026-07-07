@@ -413,6 +413,13 @@ func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
 	if out.TableDescription == nil || out.TableDescription.TableStatus != types.TableStatusDeleting {
 		t.Fatalf("expected DELETING status from DeleteTable, got %+v", out.TableDescription)
 	}
+	desc, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("dellife")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Table == nil || desc.Table.TableStatus != types.TableStatusDeleting {
+		t.Fatalf("expected table to remain DELETING before deletion deadline, got %+v", desc.Table)
+	}
 	time.Sleep(1100 * time.Millisecond)
 	_, err = client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("dellife")})
 	if err == nil {
@@ -427,6 +434,50 @@ func TestDeleteTableTransitionsAndFinalRemoval(t *testing.T) {
 		if name == "dellife" {
 			t.Fatal("did not expect deleted table in ListTables response")
 		}
+	}
+}
+
+func TestDeleteTableRecreateDoesNotRequireListTablesAndDropsItems(t *testing.T) {
+	testutils.SkipIfIntegration(t)
+	t.Setenv("PINAX_LIFECYCLE_DELAY_MS", "0")
+	client, cleanup := newTestClient(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	createInput := &dynamodb.CreateTableInput{
+		TableName:            aws.String("delrecreate"),
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash}},
+		BillingMode:          types.BillingModePayPerRequest,
+	}
+	if _, err := client.CreateTable(ctx, createInput); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("delrecreate"),
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "old"},
+			"v":  &types.AttributeValueMemberS{Value: "stale"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String("delrecreate")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CreateTable(ctx, createInput); err != nil {
+		t.Fatalf("expected recreate without ListTables to succeed: %v", err)
+	}
+
+	out, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("delrecreate"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "old"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Item) != 0 {
+		t.Fatalf("expected recreated table to be empty, got stale item %+v", out.Item)
 	}
 }
 

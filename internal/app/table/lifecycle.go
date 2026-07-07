@@ -42,6 +42,9 @@ func (s *LifecycleService) RefreshLifecycle(ctx context.Context, tables uow.Tabl
 		}
 		return sql.ErrNoRows
 	}
+	if t.Status == model.TableStatusDeleting {
+		return nil
+	}
 	if t.Status == model.TableStatusCreating && t.StatusAt > 0 && now >= t.StatusAt {
 		t.Status = model.TableStatusActive
 		t.StatusAt = 0

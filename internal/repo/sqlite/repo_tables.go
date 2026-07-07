@@ -155,6 +155,25 @@ func (r tableRepo) ListTables(ctx context.Context, start string, limit int) ([]s
 }
 
 func (r tableRepo) DeleteTable(ctx context.Context, name string) error {
+	if _, err := r.tx.ExecContext(ctx, `
+		DELETE FROM pitr_checkpoint_items
+		WHERE checkpoint_id IN (SELECT id FROM pitr_checkpoints WHERE table_key = ?)
+	`, name); err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM secondary_index_entries WHERE table_key = ?`,
+		`DELETE FROM secondary_index_non_key_attrs WHERE table_key = ?`,
+		`DELETE FROM secondary_indexes WHERE table_key = ?`,
+		`DELETE FROM item_history WHERE table_key = ?`,
+		`DELETE FROM pitr_checkpoints WHERE table_key = ?`,
+		`DELETE FROM stream_records WHERE table_key = ?`,
+		`DELETE FROM items WHERE table_key = ?`,
+	} {
+		if _, err := r.tx.ExecContext(ctx, stmt, name); err != nil {
+			return err
+		}
+	}
 	res, err := r.tx.ExecContext(ctx, `DELETE FROM tables WHERE "key" = ?`, name)
 	if err != nil {
 		return err

@@ -247,6 +247,11 @@ func (s *Server) createTable(r *http.Request, body []byte) (map[string]any, erro
 		})
 	}
 	if err := s.unitOfWork.Do(r.Context(), func(txCtx context.Context, repos uow.Repos) error {
+		if _, err := s.tableLifecycle.GetWithLifecycle(txCtx, repos.Tables(), scopedTableKey, now); err == nil {
+			return awserr.ResourceInUse("Table already exists: " + req.TableName)
+		} else if !errors.Is(err, tableapp.ErrTableNotFound) {
+			return err
+		}
 		if err := repos.Tables().CreateTable(txCtx, t); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") {
 				return awserr.ResourceInUse("Table already exists: " + req.TableName)
